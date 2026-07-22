@@ -13,6 +13,9 @@ use crate::user_input::UserInput;
 pub enum Mode {
     Plan,
     Build,
+    /// Like Build, but with no filesystem sandbox: the agent gets full disk
+    /// access (writes outside the workspace, deletes, etc.). Dangerous.
+    Danger,
 }
 
 impl Mode {
@@ -21,6 +24,7 @@ impl Mode {
         match self {
             Self::Plan => "read-only",
             Self::Build => "workspace-write",
+            Self::Danger => "danger-full-access",
         }
     }
 }

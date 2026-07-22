@@ -1360,6 +1360,7 @@ pub fn map_mode_to_sandbox(mode: Mode) -> codex_codes::SandboxPolicy {
             network_access: Some(true),
             writable_roots: None,
         },
+        Mode::Danger => codex_codes::SandboxPolicy::DangerFullAccess,
     }
 }
 
@@ -1367,6 +1368,7 @@ pub fn map_mode_to_collaboration_mode(mode: Mode) -> codex_codes::ModeKind {
     match mode {
         Mode::Plan => codex_codes::ModeKind::Plan,
         Mode::Build => codex_codes::ModeKind::Default,
+        Mode::Danger => codex_codes::ModeKind::Default,
     }
 }
 

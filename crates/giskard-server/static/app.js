@@ -2094,7 +2094,9 @@ function resetTranscriptForAuthoritativeSnapshot() {
   if (keepFirstTurnActive) updateComposerControls();
   else setTurnActive(false);
 }
-const MODE_LABELS = { build:"Build", plan:"Plan" };
+const MODE_LABELS = { build:"Build", plan:"Plan", danger:"Danger" };
+const VALID_MODES = { build:1, plan:1, danger:1 };
+function coerceMode(m) { return VALID_MODES[m] ? m : "build"; }
 const APPROVAL_LABELS = { ask:"Ask first", auto:"Auto approve", read_only:"Read only" };
 // Summarise "mode · approvals" on the turn chip below the composer.
 function updateTurnButton() {
@@ -2104,7 +2106,7 @@ function updateTurnButton() {
   btn.querySelector(".mp-label").textContent = `${mode} · ${appr}`;
 }
 function setMode(mode) {
-  state.mode = mode === "plan" ? "plan" : "build";
+  state.mode = coerceMode(mode);
   $("modeSel").value = state.mode;
   updateTurnButton();
 }
@@ -5802,7 +5804,7 @@ function compactContext() {
 
 $("modeSel").onchange = () => {
   const previous = state.mode || "build";
-  const mode = $("modeSel").value === "plan" ? "plan" : "build";
+  const mode = coerceMode($("modeSel").value);
   if (isDraftThread()) {
     setMode(mode);
     return;
