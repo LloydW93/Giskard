@@ -1281,6 +1281,14 @@ async fn index_page_is_served_and_public() {
         "UI renders source line numbers in the code overlay"
     );
     assert!(
+        body.contains(".code-table")
+            && between(&body, ".code-table {", "}").contains("min-width:max-content")
+            && between(&body, ".code-table {", "}").contains("background:#0b0e13"),
+        "the code table grows to the widest line and carries the background, so long lines that \
+         scroll horizontally stay on the dark background (a scroll-container background alone does \
+         not cover scrolled content on mobile Safari)"
+    );
+    assert!(
         body.contains("scrollToCodeLine"),
         "UI scrolls the code overlay to a requested line"
     );
