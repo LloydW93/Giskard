@@ -24,6 +24,8 @@ use giskard_core::user_input::UserInput;
 /// the UI adapts accordingly (§13.5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HarnessCapabilities {
+    /// Additional input can be delivered to a specific active turn.
+    pub turn_steering: bool,
     /// Server-initiated, per-action approval requests (accept/decline while a turn is live).
     pub live_approvals: bool,
     /// Distinct read-only (plan) vs read-write (build) sandbox modes switchable per turn.
@@ -622,6 +624,20 @@ pub trait AgentHarness: Send + Sync {
             "context compaction is not supported for thread {}",
             thread.harness_thread_id
         )))
+    }
+
+    /// Deliver input only if the expected turn is still active. Never starts a turn.
+    /// Providers echo `client_message_id` on the resulting user item for exact receipt correlation.
+    async fn steer_turn(
+        &self,
+        _thread: &ThreadHandle,
+        _expected_turn: TurnId,
+        _input: UserInput,
+        _client_message_id: Option<String>,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(
+            "turn steering is not supported".into(),
+        ))
     }
 
     /// Interrupt the active turn of a thread.

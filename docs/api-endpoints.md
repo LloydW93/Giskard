@@ -161,8 +161,9 @@ Agent-owned sub-agent threads are independently and permanently read-only. Their
 model/mode/permission controls, rename, archive, direct delete, and workspace writes such as
 `SavePlan` are disabled or rejected with `thread_read_only` before harness I/O. This restriction is
 not recoverable through
-a provider switch. Matched approval/server-request responses, interrupting active work, command
-termination, transcript/history reads, and navigation remain supported.
+a provider switch. Matched approval/server-request responses, matched active asynchronous-question
+answers, interrupting active work, command termination, transcript/history reads, and navigation
+remain supported.
 
 `DELETE /api/projects/{id}/threads/{thread_id}` refuses with `409` when the thread — or any linked
 child it cascades to — has a Git worktree holding work that exists nowhere else: uncommitted
@@ -247,3 +248,26 @@ worktree, so a path that is both staged and modified again can be diffed one sid
 other value is rejected. The path is lexical workspace-relative only: absolute paths and `..`
 escapes are rejected, so deleted files can still be diffed without allowing access outside the
 workspace.
+
+### Steering an active turn
+
+On subscription, `thread_capabilities` reports `thread_id` and `turn_steering`.
+A browser may send `steer_input` with `thread_id`, `expected_turn_id`, `request_id`,
+and nonempty `text`. The expected ID comes from `turn_started` or `live_turn_snapshot`.
+The server checks the writable thread and existing live turn before delivery. Codex also
+checks the exact native `expectedTurnId`, so a turn ending during delivery cannot redirect
+input into a replacement turn. Steering does not admit or reserve a new turn.
+
+Success returns `steer_input_accepted` with the same `request_id`, `thread_id`, and `turn_id`.
+Failures return the usual `error` with `action: "steer_input"` and the same `request_id`.
+A timeout means delivery is unknown; clients must not retry automatically. Attachments are
+not accepted by this initial text steering operation. Agent-owned threads remain read-only
+for generic steering. A response to an active async question supplies optional
+`question_item_id`; the server verifies the item belongs to this exact thread and live turn
+and carries nonempty structured questions before permitting a child-thread response.
+Wrong or stale question identities are rejected on primary threads as well. Accepted input is
+recorded through provider user-message events. The server supplies native `clientUserMessageId`
+`giskard-steer:<request_id>` and preserves its `clientId` echo as `client_id` on wire user-message
+payloads. Clients can therefore confirm exact delivery without mistaking another identical message
+for a receipt. The namespace also distinguishes steering from initial input sent by other native
+clients, which may carry their own client IDs.

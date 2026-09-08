@@ -57,6 +57,14 @@ pub enum ClientMessage {
     Unsubscribe {
         thread_id: ThreadId,
     },
+    SteerInput {
+        thread_id: ThreadId,
+        expected_turn_id: TurnId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question_item_id: Option<ItemId>,
+        request_id: String,
+        text: String,
+    },
     SendInput {
         thread_id: ThreadId,
         text: String,
@@ -321,6 +329,15 @@ pub struct ErrorInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    ThreadCapabilities {
+        thread_id: ThreadId,
+        turn_steering: bool,
+    },
+    SteerInputAccepted {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        request_id: String,
+    },
     Event {
         thread_id: ThreadId,
         agent_event: Box<WireAgentEvent>,
@@ -742,6 +759,34 @@ pub struct MkdirResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steering_wire_requires_expected_turn_and_preserves_correlation() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let question = ItemId::new();
+        let request = serde_json::json!({"type":"steer_input", "thread_id":thread,
+            "expected_turn_id":turn, "question_item_id":question, "request_id":"steer-1", "text":"answer"});
+        assert!(
+            matches!(serde_json::from_value::<ClientMessage>(request.clone()).unwrap(),
+            ClientMessage::SteerInput { expected_turn_id, question_item_id: Some(item), request_id, .. }
+            if expected_turn_id == turn && item == question && request_id == "steer-1")
+        );
+        let mut missing_turn = request;
+        missing_turn
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_turn_id");
+        assert!(serde_json::from_value::<ClientMessage>(missing_turn).is_err());
+        let accepted = serde_json::to_value(ServerMessage::SteerInputAccepted {
+            thread_id: thread,
+            turn_id: turn,
+            request_id: "steer-1".into(),
+        })
+        .unwrap();
+        assert_eq!(accepted["type"], "steer_input_accepted");
+        assert_eq!(accepted["request_id"], "steer-1");
+    }
 
     #[test]
     fn client_message_send_input_serde() {

@@ -9,7 +9,13 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.90
+**Version:** 1.91
+
+> **Amendment — asynchronous questions and steering (1.91).** Preserve structured questions on
+> ordinary agent messages, expose explicit choice/free-text answers, and allow guarded text
+> steering of active turns. Matched active child questions may receive answers without enabling
+> general child input. Native client message IDs correlate exact reply delivery; uncertain replies
+> are never retried automatically. Native external-clock requests receive host responses.
 
 > **Amendment — pasted attachments (1.90).** Files pasted into the focused composer use the same
 > attachment ingestion, validation, limits, and pending tray as files selected with the attachment
@@ -2807,6 +2813,28 @@ Auto-generate an initial title from the first user message (truncated); user-edi
   copy button still yields the whole note (RN1, RN2).
 - Each item ends with `ItemCompleted` carrying its final, canonical form (this is what gets
   persisted; deltas are transient).
+
+### 7.3.1 Asynchronous questions and steering
+
+Agent-message payloads may include harness-neutral asynchronous questions, each with a title and
+optional string choices. Preserve them in turn payloads and wire history/live replay; omitted
+questions default to an empty collection. A questions-only message remains visible. These are
+ordinary message items rather than pending server requests or approvals. Never auto-submit a
+preselected option. Always offer free text and require explicit submission.
+
+A harness advertising `turn_steering` accepts text input into an existing active turn. The client
+supplies its expected Giskard turn identity; the adapter validates it and passes the corresponding
+native expected-turn guard. Acceptance is acknowledged without inventing a new `TurnStarted`,
+reserving another turn lease, changing turn overrides, or interrupting work. Failed/stale steering
+preserves the browser draft. Lost acknowledgment produces uncertain delivery and no automatic retry.
+A primary-thread answer after the turn finishes is ordinary new input.
+
+Managed child threads remain read-only for general messages. An active question may receive a
+matched answer only after validating its source item and active turn against authoritative runtime
+state. That exception never starts an idle child or permits unrestricted child steering.
+
+See [Astra interactions](../docs/astra-interactions.md) for protocol provenance and the native
+capability audit.
 
 ### 7.4 Plan / Build modes
 

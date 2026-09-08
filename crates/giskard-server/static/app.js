@@ -160,6 +160,7 @@ let state = {
   // streamed); `newestPersistedTurnId` is the id of the newest turn known to have completed — the
   // high-water mark a future resync will use as its "give me turns after this" cursor.
   currentRenderTurnId:null, newestPersistedTurnId:null,
+  turnSteering:false, pendingComposerSteer:null, questionAnswers:new Map(),
   models:[], modelsProject:null, modelsLoadingProject:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(), requestStates:new Map(), runtimeOverviewRevision:-1,
@@ -2514,6 +2515,7 @@ function openDraftThread(pid) {
     try { oldWs.close(); } catch {}
   }
 
+  markQuestionDeliveryUncertain();
   setActiveViewIdentity(pid, null);
   renderParentThreadButton();
   // `modelLoading` until the project's default arrives; `currentModel` stays null until then so a
@@ -2546,6 +2548,7 @@ function openDraftThread(pid) {
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
+  state.turnSteering = false;
   state.currentRenderTurnId = null; state.newestPersistedTurnId = null;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
@@ -2600,6 +2603,7 @@ async function openThread(pid, tid, title, opts) {
   // a notification click can even land in another project. Close it rather than leave it showing
   // one workspace's file while the app is somewhere else.
   closeCodeOverlay();
+  markQuestionDeliveryUncertain();
   setActiveViewIdentity(pid, tid);
   state.pendingUserEl = null; state.pendingUserText = null;
   renderParentThreadButton();
@@ -2627,6 +2631,7 @@ async function openThread(pid, tid, title, opts) {
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
+  state.turnSteering = false;
   state.currentRenderTurnId = null; state.newestPersistedTurnId = null;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
@@ -2866,6 +2871,7 @@ async function connectWs(opts) {
     clearWsProbeTimer();
     state.ws = null;
     clearPendingMetadataActions();
+    markQuestionDeliveryUncertain();
     if (ws._giskardExpectedClose) return;
     const reason = ev.reason ? ` ${ev.reason}` : "";
     const code = ev.code ? ` (${ev.code})` : "";
@@ -2954,6 +2960,7 @@ function updateReadOnlyBanner() {
 
 function updateComposerControls() {
   updateReadOnlyBanner();
+  refreshQuestionControls();
   const ready = state.wsStatus==="open";
   const draft = isDraftThread();
   const hasThreadSurface = !!state.threadId || draft;
@@ -2968,17 +2975,18 @@ function updateComposerControls() {
   // read as a dead button. Disabling it puts the state on screen instead.
   const nothingToSend = !$("input").value.trim() && state.pendingAttachments.length === 0;
   $("sendBtn").disabled =
-    readOnly || state.activeTurn || state.updateRequired || state.uiVersionCheckPending ||
+    readOnly || (state.activeTurn && !canSteerTurn()) || !!state.pendingComposerSteer || state.updateRequired || state.uiVersionCheckPending ||
     attachmentsLoading || modelUnresolved || nothingToSend ||
     !hasThreadSurface || (!ready && !draft);
-  // The send arrow and the stop square share one slot: hide the arrow while a turn is running so
-  // only the red stop square is visible (no disabled send button alongside it).
-  $("sendBtn").hidden = state.activeTurn && !draft;
+  // A steering harness keeps Send alongside Stop so the user can speak while the agent works.
+  // Other harnesses show only Stop until the turn finishes.
+  $("sendBtn").hidden = state.activeTurn && !draft && !canSteerTurn();
   $("sendBtn").title = managedReadOnly ? "Agent-owned threads are read-only." :
     readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." :
     attachmentsLoading ? "Wait for attached files to finish loading." :
     modelUnresolved ? draftModelUnavailableReason() :
-    nothingToSend ? "Type a message, or attach a file, to send." : "Send";
+    nothingToSend ? "Type a message, or attach a file, to send." :
+    state.activeTurn ? "Send to the running turn" : "Send";
   $("stopBtn").hidden = !state.activeTurn || draft;
   $("stopBtn").disabled = !ready || state.interruptPending;
   // The stop button shows a Unicode black square (■) glyph; the "stopping" state is conveyed via
@@ -3003,7 +3011,7 @@ function updateComposerControls() {
   $("input").placeholder =
     managedReadOnly ? "Agent-owned threads are read-only." :
     readOnly ? "Read-only thread — pick a model above to reactivate it." :
-    state.activeTurn ? "Draft your next message…" :
+    state.activeTurn ? (canSteerTurn() ? "Message the agent…" : "Draft your next message…") :
     draft ? `Ask Giskard…  (${COMPOSER_HINT})` :
     state.wsStatus==="open" ? `Ask Giskard…  (${COMPOSER_HINT})` :
     state.wsStatus==="connecting" ? "Connecting to agent…" :
@@ -3130,6 +3138,8 @@ function serverMessageThreadId(msg) {
 function isThreadScopedServerMessage(msg) {
   if (!msg) return false;
   switch (msg.type) {
+    case "thread_capabilities":
+    case "steer_input_accepted":
     case "thread_state":
     case "thread_metadata_result":
     case "history_delta":
@@ -3171,6 +3181,13 @@ function handleServer(msg, ws) {
   const renderStartedAtMs = browserNowMs();
   recordReconnectMessageReceived(ws, messageType);
   switch (msg.type) {
+    case "thread_capabilities":
+      state.turnSteering = msg.turn_steering === true;
+      updateComposerControls();
+      break;
+    case "steer_input_accepted":
+      settleSteering(msg, true);
+      break;
     case "thread_state": renderThreadState(msg, msg.active_turn); break;
     case "thread_metadata_result":
       applyThreadMetadata(msg);
@@ -3190,6 +3207,8 @@ function handleServer(msg, ws) {
     case "request_state": handleRequestState(msg); break;
     case "error":
       finishMetadataAction(msg.request_id);
+      if (msg.action === "steer_input") settleSteering(msg, false);
+      if (msg.action === "send_input") settleIdleQuestion(false, msg);
       if (msg.code === "thread_read_only") {
         state.threadReadOnly = true;
         state.readOnlyMessage = msg.message || state.readOnlyMessage || "This thread is read-only.";
@@ -4237,16 +4256,17 @@ function renderPersistedTurn(turn) {
   const prevRenderTurnId = state.currentRenderTurnId;
   state.currentRenderTurnId = turn.id;
   const items = turn.items || [];
-  const hasUserItem = items.some(it => ((it.payload||it).kind) === "user_message");
+  const hasUserItem = items.some(it => ((it.payload||it).kind) === "user_message" && !isSteeredUserMessage(it.payload||it));
   const inputText = persistedUserInputDisplayText(turn.user_input);
   const hasAttachments = !!(turn.user_input && (turn.user_input.attachments || []).length);
+  if (inputText) confirmQuestionEcho(turn.user_input.text || "", turn.id);
   if (!hasUserItem && inputText) {
     renderItemBody(bubble("user","you"), { kind:"user_message", text: inputText });
   }
   let replacedUserItem = false;
   for (const it of items) {
     const payload = it.payload || it;
-    if (hasAttachments && !replacedUserItem && payload.kind === "user_message") {
+    if (hasAttachments && !replacedUserItem && payload.kind === "user_message" && !isSteeredUserMessage(payload)) {
       addItem(userMessageItemWithText(it, inputText), turn.id, true);
       replacedUserItem = true;
     } else {
@@ -4512,21 +4532,39 @@ function outstandingServerRequests(snap) {
 function renderLiveTurnUserInput(turnId, userInput) {
   const text = persistedUserInputDisplayText(userInput);
   if (!turnId || !text) return;
+  confirmQuestionEcho(text, turnId);
   const exists = Array.from(document.querySelectorAll(".msg.user")).some(
     row => row.dataset && String(row.dataset.turn || "") === String(turnId)
   );
   if (exists) return;
   const body = bubble("user","you");
   body.parentElement.dataset.liveUserInput = "true";
+  body.parentElement.dataset.liveUserText = userInput.text || "";
   markAttachmentUserInput(body.parentElement, userInput && userInput.attachments);
   renderItemBody(body, { kind:"user_message", text });
 }
 
-function provisionalUserBodyForTurn(turnId) {
+function provisionalUserBodyForTurn(turnId, text) {
   const target = renderTarget();
   return Array.from(target.querySelectorAll(".msg.user[data-live-user-input='true'] .body")).find(
-    body => body.parentElement && String(body.parentElement.dataset.turn || "") === String(turnId || "")
+    body => body.parentElement && String(body.parentElement.dataset.turn || "") === String(turnId || "") &&
+      (text === undefined || provisionalInputMatches(body.parentElement, text))
   ) || null;
+}
+
+function provisionalInputMatches(row, text) {
+  const original = row.dataset.liveUserText || "";
+  if (original === text) return true;
+  // The Codex file adapter appends a host-file manifest to the native prompt. Keep the original
+  // attachment display while distinguishing subsequent, independent user messages in the turn.
+  const manifestPrefix = (original ? original + "\n\n" : "") + "Attached files available on the harness host:\n";
+  return preservesUserInputDisplay(row) && String(text || "").startsWith(manifestPrefix);
+}
+
+function isSteeredUserMessage(payload) {
+  // Native clients may also identify initial turn/start inputs. Only our steering namespace marks
+  // an additional user message that must never replace the turn's original prompt display.
+  return typeof payload.client_id === "string" && payload.client_id.startsWith("giskard-steer:");
 }
 
 function isSyntheticSubagentPrompt(item) {
@@ -7172,9 +7210,10 @@ function addItem(item, turnId, fromHistory) {
     return;
   }
   const key = scopedItemKey(turnId, item && item.id);
-  const hasPreservedUserDisplay = p.kind === "user_message" &&
+  if (p.kind === "user_message") confirmQuestionEcho(p.text, turnId, p.client_id);
+  const hasPreservedUserDisplay = p.kind === "user_message" && !isSteeredUserMessage(p) &&
     ((state.pendingUserEl && preservesUserInputDisplay(state.pendingUserEl)) ||
-     !!provisionalUserBodyForTurn(turnId));
+     !!provisionalUserBodyForTurn(turnId, p.text));
   const visible = hasVisiblePayload(p) || hasPreservedUserDisplay;
   if (isRenderedItem(item, turnId)) {
     // Upsert: a repeated item id within the same turn refreshes the existing row.
@@ -7227,7 +7266,7 @@ function addItem(item, turnId, fromHistory) {
       state.pendingUserEl = null;
       state.pendingUserText = null;
     }
-    if (state.pendingUserEl &&
+    if (!isSteeredUserMessage(p) && state.pendingUserEl &&
         (p.text===state.pendingUserText || preservesUserInputDisplay(state.pendingUserEl))) {
       state.pendingUserEl.classList.remove("pending");
       const pendingBody = state.pendingUserEl.querySelector(".body");
@@ -7240,7 +7279,7 @@ function addItem(item, turnId, fromHistory) {
       markRenderedItem(item, turnId);
       return;
     }
-    const provisionalBody = provisionalUserBodyForTurn(turnId);
+    const provisionalBody = !isSteeredUserMessage(p) && provisionalUserBodyForTurn(turnId, p.text);
     if (provisionalBody) {
       delete provisionalBody.parentElement.dataset.liveUserInput;
       if (!preservesUserInputDisplay(provisionalBody)) {
@@ -7410,6 +7449,7 @@ function hasVisiblePayload(p) {
     const descriptor = commandOutputDescriptor(p.output);
     return Boolean((p.command||"").trim() || (descriptor ? descriptor.preview : p.output || ""));
   }
+  if (p.kind==="agent_message" && Array.isArray(p.questions) && p.questions.length) return true;
   if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") return Boolean((p.text||"").trim());
   if (p.kind==="file_change") return Boolean((p.path||"").trim() || (p.changes||[]).length || p.status);
   if (p.kind==="tool_call") return Boolean((p.name||"").trim() || (p.server||"").trim() || p.status || p.error || p.input || p.output);
@@ -7470,7 +7510,11 @@ function renderItemBody(body, p) {
   } else if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") {
     // User messages get the same server-rendered, sanitized Markdown as agent text, so pasted code
     // fences, lists and emphasis format the same on both sides of the conversation.
-    renderMarkdown(body, p.text || "");
+    if (p.kind === "agent_message" && p.questions && p.questions.length) {
+      const prose = document.createElement("div");
+      body.append(prose);
+      renderMarkdown(prose, p.text || "");
+    } else renderMarkdown(body, p.text || "");
   } else if (p.kind==="file_change") {
     renderFileChange(body, p);
   } else if (p.kind==="tool_call") {
@@ -7499,6 +7543,188 @@ function renderItemBodyForItem(body, item, turnId) {
     return;
   }
   renderItemBody(body, p);
+  if (p && p.kind === "agent_message" && p.questions && p.questions.length) {
+    renderAgentQuestions(body, p.questions, item, turnId);
+  }
+  if (p && p.kind === "user_message") confirmQuestionEcho(p.text, turnId, p.client_id);
+}
+// Async questions are ordinary agent messages, not blocking server requests. Keep browser-local
+// delivery receipts through replay/reload; they are not a claim that another client has answered.
+function canSteerTurn() {
+  return state.turnSteering && state.activeTurn && !!state.currentRenderTurnId;
+}
+function questionStorageKey(key) { return "giskard.questionAnswer." + key; }
+function questionAnswer(key) {
+  if (state.questionAnswers.has(key)) return state.questionAnswers.get(key);
+  let saved = {};
+  try { saved = JSON.parse(sessionStorage.getItem(questionStorageKey(key)) || "{}"); } catch {}
+  if (saved.status === "pending") saved.status = "uncertain";
+  state.questionAnswers.set(key, saved);
+  return saved;
+}
+function saveQuestionAnswer(key, answer) {
+  state.questionAnswers.set(key, answer);
+  try { sessionStorage.setItem(questionStorageKey(key), JSON.stringify(answer)); }
+  catch (error) { console.warn("Question answer receipt could not be saved for reload", error); }
+}
+function questionWritable(form) {
+  if (!state.threadId || state.threadReadOnly || threadMetadataPending()) return false;
+  if (!managedThreadReadOnly()) return true;
+  // A child may receive an answer only to its own question in its current active turn.
+  return !!form && canSteerTurn() && form.dataset.questionTurn === String(state.currentRenderTurnId);
+}
+function refreshQuestionControls(root = document) {
+  root.querySelectorAll(".agent-questions").forEach(form => {
+    const answer = questionAnswer(form.dataset.questionKey);
+    const delivered = answer.status === "accepted";
+    const waiting = answer.status === "pending" || answer.status === "uncertain";
+    const writable = questionWritable(form);
+    const transportReady = wsCanSend() && !state.updateRequired && !state.uiVersionCheckPending;
+    form.querySelectorAll("input, textarea").forEach(el => { el.disabled = delivered || waiting || !writable; });
+    const retry = form.querySelector(".question-retry");
+    retry.hidden = answer.status !== "uncertain";
+    retry.disabled = !writable;
+    form.querySelector("button[type=submit]").disabled = delivered || waiting || !writable || !transportReady || (state.activeTurn && !canSteerTurn());
+    form.querySelector(".question-delivery").textContent = delivered ? "Answer sent from this browser." :
+      answer.status === "uncertain" ? "Delivery is uncertain. Check the transcript before sending another answer." :
+      waiting ? "Sending answer…" : !writable ? "This thread is read-only; answers cannot be sent here." :
+      !transportReady ? "Reconnect to send your answer." :
+      state.activeTurn && !canSteerTurn() ? "You can answer when the current turn finishes." :
+      "The agent can continue working while you choose. Submit to send your answer.";
+  });
+}
+function renderAgentQuestions(body, questions, item, turnId) {
+  const key = [state.threadId, turnId, item.harness_item_id || item.id].map(idKey).join(":");
+  const answer = questionAnswer(key);
+  const form = document.createElement("form");
+  form.className = "agent-questions";
+  form.dataset.questionKey = key;
+  form.dataset.questionTurn = String(turnId);
+  const fields = questions.map((question, index) => {
+    const field = document.createElement("fieldset");
+    const legend = document.createElement("legend");
+    legend.textContent = question.title || "Question";
+    field.append(legend);
+    const saved = (answer.drafts || [])[index] || {};
+    const options = Array.isArray(question.options) ? question.options : [];
+    options.forEach((option, optionIndex) => {
+      const label = document.createElement("label");
+      label.className = "question-option";
+      const input = document.createElement("input");
+      input.type = "radio";
+      input.name = key + ":" + index;
+      input.value = String(option);
+      input.checked = saved.choice === undefined ? optionIndex === 0 : saved.choice === String(option);
+      label.append(input, document.createTextNode(String(option)));
+      field.append(label);
+    });
+    const label = document.createElement("label");
+    label.className = "question-free-text";
+    label.textContent = options.length ? "Or write your own answer" : "Your answer";
+    const free = document.createElement("textarea");
+    free.rows = 2;
+    free.value = saved.free || "";
+    label.append(free);
+    field.append(label);
+    form.append(field);
+    return { field, free, title:question.title || "Question" };
+  });
+  const drafts = () => fields.map(({field, free}) => ({ choice:field.querySelector("input:checked")?.value, free:free.value }));
+  form.addEventListener("input", () => saveQuestionAnswer(key, { ...questionAnswer(key), drafts:drafts() }));
+  const status = document.createElement("p");
+  status.className = "question-delivery meta";
+  status.setAttribute("role", "status");
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.textContent = "Send answer";
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "question-retry";
+  retry.textContent = "I checked the transcript — edit and retry";
+  retry.hidden = true;
+  retry.onclick = () => {
+    if (!questionWritable(form) || questionAnswer(key).status !== "uncertain") return;
+    saveQuestionAnswer(key, { ...questionAnswer(key), status:"draft" });
+    refreshQuestionControls();
+  };
+  form.append(status, submit, retry);
+  form.onsubmit = event => {
+    event.preventDefault();
+    const previous = questionAnswer(key);
+    if (["pending", "accepted", "uncertain"].includes(previous.status)) return;
+    if (!questionWritable(form) || !wsCanSend() || state.updateRequired || state.uiVersionCheckPending) return;
+    if (state.activeTurn && !canSteerTurn()) return;
+    const values = fields.map(({field, free}) => free.value.trim() || field.querySelector("input:checked")?.value || "");
+    if (values.some(value => !value)) { notice("Answer each question before submitting.", "warning"); return; }
+    const text = fields.map(({title}, index) => title + "\n" + values[index]).join("\n\n");
+    const steering = state.activeTurn;
+    const requestId = crypto.randomUUID();
+    const message = steering
+      ? { type:"steer_input", thread_id:state.threadId, expected_turn_id:state.currentRenderTurnId, request_id:requestId, text,
+          question_item_id:String(turnId) === String(state.currentRenderTurnId) ? item.id : null }
+      : { type:"send_input", thread_id:state.threadId, text, attachments:[] };
+    if (!send(message)) { notice("Answer not sent. Your choices are preserved.", "warning"); return; }
+    saveQuestionAnswer(key, { status:"pending", requestId, threadId:state.threadId, text, steering, expectedTurnId:String(state.currentRenderTurnId || ""),
+      afterTurnId:String(state.newestPersistedTurnId || turnId), drafts:drafts() });
+    if (!steering) {
+      const pendingBody = bubble("user pending", "you");
+      pendingBody.textContent = text;
+      state.pendingUserEl = pendingBody.parentElement;
+      state.pendingUserText = text;
+      setTurnActive(true);
+    }
+    refreshQuestionControls();
+  };
+  body.append(form);
+  refreshQuestionControls(body);
+}
+function settleSteering(message, accepted) {
+  for (const [key, answer] of state.questionAnswers) {
+    if (answer.requestId !== message.request_id || answer.threadId !== message.thread_id) continue;
+    if (!accepted && answer.status === "accepted") continue;
+    const uncertain = ["harness_timeout", "harness_transport_error", "harness_protocol_error"].includes(message.code);
+    saveQuestionAnswer(key, { ...answer, status:accepted ? "accepted" : uncertain ? "uncertain" : "draft" });
+  }
+  const pending = state.pendingComposerSteer;
+  if (pending && pending.requestId === message.request_id && pending.threadId === message.thread_id) {
+    if (accepted && composerDraftKey() === pending.draftKey && $("input").value === pending.value) clearComposerDraft(pending.draftKey);
+    state.pendingComposerSteer = null;
+  }
+  updateComposerControls();
+}
+function settleIdleQuestion(accepted, message = {}) {
+  for (const [key, answer] of state.questionAnswers) {
+    if (answer.threadId !== state.threadId || answer.steering || answer.status !== "pending") continue;
+    const uncertain = ["harness_timeout", "harness_transport_error", "harness_protocol_error"].includes(message.code);
+    saveQuestionAnswer(key, { ...answer, status:accepted ? "accepted" : uncertain ? "uncertain" : "draft" });
+  }
+  refreshQuestionControls();
+}
+function confirmQuestionEcho(text, turnId, clientId) {
+  const pending = state.pendingComposerSteer;
+  if (pending && pending.threadId === state.threadId && "giskard-steer:" + pending.requestId === clientId && pending.expectedTurnId === String(turnId)) {
+    settleSteering({ thread_id:state.threadId, request_id:pending.requestId }, true);
+  }
+  for (const [key, answer] of state.questionAnswers) {
+    if (answer.threadId !== state.threadId || answer.text !== text || !["pending", "uncertain"].includes(answer.status)) continue;
+    // Turn IDs are ULIDs. Idle replies must belong to a turn admitted after submission's history
+    // cursor; an old identical answer replayed during reconnect must not acknowledge this send.
+    if (!turnId || (answer.steering
+      ? String(turnId) !== answer.expectedTurnId || clientId !== "giskard-steer:" + answer.requestId
+      : String(turnId) <= answer.afterTurnId)) continue;
+    saveQuestionAnswer(key, { ...answer, status:"accepted" });
+  }
+  refreshQuestionControls();
+}
+function markQuestionDeliveryUncertain() {
+  for (const [key, answer] of state.questionAnswers) {
+    if (answer.threadId === state.threadId && answer.status === "pending") saveQuestionAnswer(key, { ...answer, status:"uncertain" });
+  }
+  if (state.pendingComposerSteer && state.pendingComposerSteer.threadId === state.threadId) {
+    notice("Message delivery is uncertain. Your draft is preserved; check the transcript before sending it again.", "warning");
+    state.pendingComposerSteer = null;
+  }
+  refreshQuestionControls();
 }
 function normalizeCommandDuration(durationMs, startedAtMs) {
   const provided = Number(durationMs);
@@ -9420,7 +9646,14 @@ function sendInput() {
   if (!state.threadId && !isDraftThread()) return;
   if (state.updateRequired || state.uiVersionCheckPending) return;
   if (state.activeTurn) {
-    notice("Wait for the current turn to finish, or stop it first.", "warning");
+    if (attachments.length) { notice("Attachments cannot be sent to a running turn. Remove them or wait for the turn to finish.", "warning"); return; }
+    if (!canSteerTurn()) { notice("Wait for the current turn to finish, or stop it first.", "warning"); return; }
+    if (state.pendingComposerSteer) { notice("The previous message is awaiting confirmation. Your draft is preserved.", "warning"); return; }
+    const requestId = crypto.randomUUID();
+    if (send({ type:"steer_input", thread_id:state.threadId, expected_turn_id:state.currentRenderTurnId, request_id:requestId, text })) {
+      state.pendingComposerSteer = { requestId, threadId:state.threadId, expectedTurnId:String(state.currentRenderTurnId), draftKey:composerDraftKey(), value:ta.value };
+      updateComposerControls();
+    } else notice("Message not sent. Reconnect and try again; your draft is preserved.", "warning");
     return;
   }
   if (isDraftThread()) {

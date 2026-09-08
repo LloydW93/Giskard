@@ -292,6 +292,7 @@ mod tests {
                     id: completed_item_id,
                     harness_item_id: "native-completed-item".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: "complete".into(),
                     },
                     created_at: chrono::Utc::now(),

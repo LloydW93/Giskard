@@ -1119,6 +1119,84 @@ impl HarnessRegistry {
             .await;
     }
 
+    pub async fn turn_steering_supported(&self, thread_id: ThreadId) -> bool {
+        let Some(binding) = self.loaded_thread_binding(thread_id).await else {
+            return false;
+        };
+        self.shared
+            .active_harness(binding.project_id)
+            .await
+            .is_some_and(|harness| harness.capabilities().turn_steering)
+    }
+
+    /// Controls an existing turn; it never acquires a turn lease or admits a new turn.
+    pub async fn steer_turn(
+        &self,
+        thread_id: ThreadId,
+        expected_turn: TurnId,
+        question_item: Option<ItemId>,
+        input: UserInput,
+        client_message_id: Option<String>,
+    ) -> Result<(), HarnessError> {
+        let binding = self
+            .loaded_thread_binding(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let project_id = binding.project_id;
+        let _lifecycle = self.lock_project_lifecycle(project_id).await;
+        let binding = self
+            .loaded_thread_binding(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let runtime = self
+            .thread_runtime(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let snapshot = runtime.live_snapshot();
+        if snapshot.as_ref().map(|snapshot| snapshot.turn_id) != Some(expected_turn) {
+            return Err(HarnessError::Protocol(
+                "the expected turn is no longer active; steering was not sent".into(),
+            ));
+        }
+        if let Some(question_item) = question_item {
+            let matches_question = snapshot.as_ref().is_some_and(|snapshot| snapshot.accumulated.iter().any(|event| {
+                matches!(event, giskard_proto::WireAgentEvent::ItemCompleted { thread, turn, item }
+                    if *thread == thread_id && *turn == expected_turn && item.id == question_item
+                    && matches!(&item.payload, giskard_proto::WireItemPayload::AgentMessage { questions, .. } if !questions.is_empty()))
+            }));
+            if !matches_question {
+                return Err(HarnessError::Protocol(
+                    "the async question does not belong to this active turn".into(),
+                ));
+            }
+        } else {
+            self.ensure_thread_writable(project_id, thread_id).await?;
+        }
+        let harness = self
+            .shared
+            .active_harness(project_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        if !harness.capabilities().turn_steering {
+            return Err(HarnessError::Unsupported(
+                "turn steering is not supported".into(),
+            ));
+        }
+        info!(%project_id, %thread_id, turn_id = %expected_turn, action = "steer_turn", "sending steering input to harness");
+        let result = harness
+            .steer_turn(&binding.handle, expected_turn, input, client_message_id)
+            .await;
+        match &result {
+            Ok(()) => {
+                info!(%project_id, %thread_id, turn_id = %expected_turn, "harness accepted steering input")
+            }
+            Err(error) => {
+                warn!(%project_id, %thread_id, turn_id = %expected_turn, %error, "harness rejected steering input")
+            }
+        }
+        result
+    }
+
     pub async fn interrupt(&self, thread_id: ThreadId) -> Result<(), HarnessError> {
         let binding = self
             .loaded_thread_binding(thread_id)
@@ -2578,6 +2656,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_validates_question_ownership_for_primary_and_child_threads() {
+        for kind in [
+            giskard_core::ThreadKind::Primary,
+            giskard_core::ThreadKind::Subagent,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+            let (project, config) = create_test_project(&store, "steering-ownership").await;
+            let thread = ThreadId::new();
+            store
+                .save_thread(
+                    project,
+                    &test_thread_file(project, thread, "native-steer", kind),
+                )
+                .await
+                .unwrap();
+            let (registry, _factory, _sink) = discovery_registry(store).await;
+            registry
+                .get_or_create_harness(project, &config)
+                .await
+                .unwrap();
+            registry
+                .shared
+                .event_driver(project)
+                .await
+                .unwrap()
+                .attach(
+                    super::LoadedThreadBinding {
+                        project_id: project,
+                        handle: ThreadHandle::opened(
+                            thread,
+                            "native-steer".into(),
+                            PathBuf::from("/tmp/test"),
+                        ),
+                        native_model: None,
+                    },
+                    kind.into(),
+                )
+                .await
+                .unwrap();
+            let runtime = registry.thread_runtime(thread).await.unwrap();
+            let turn = TurnId::new();
+            let item_id = ItemId::new();
+            runtime.replace_live_turn_for_test(turn, None);
+            runtime.apply_event_for_test(
+                &AgentEvent::ItemCompleted {
+                    thread,
+                    turn,
+                    item: Item {
+                        id: item_id,
+                        harness_item_id: "native-question".into(),
+                        payload: ItemPayload::AgentMessage {
+                            text: "Choose".into(),
+                            questions: vec![giskard_core::item::AsyncQuestion {
+                                title: "Which?".into(),
+                                options: None,
+                            }],
+                        },
+                        created_at: Utc::now(),
+                    },
+                },
+                true,
+            );
+            assert!(matches!(
+                registry
+                    .steer_turn(
+                        thread,
+                        turn,
+                        Some(ItemId::new()),
+                        UserInput::text("spoof"),
+                        None
+                    )
+                    .await,
+                Err(HarnessError::Protocol(_))
+            ));
+            assert!(matches!(
+                registry
+                    .steer_turn(
+                        thread,
+                        TurnId::new(),
+                        Some(item_id),
+                        UserInput::text("stale"),
+                        None
+                    )
+                    .await,
+                Err(HarnessError::Protocol(_))
+            ));
+            // The test harness advertises no steering: valid requests reach that boundary only.
+            assert!(matches!(
+                registry
+                    .steer_turn(thread, turn, Some(item_id), UserInput::text("answer"), None)
+                    .await,
+                Err(HarnessError::Unsupported(_))
+            ));
+            let generic = registry
+                .steer_turn(thread, turn, None, UserInput::text("generic"), None)
+                .await;
+            if kind == giskard_core::ThreadKind::Subagent {
+                assert!(matches!(generic, Err(HarnessError::ThreadReadOnly { .. })));
+            } else {
+                assert!(matches!(generic, Err(HarnessError::Unsupported(_))));
+            }
+            assert_eq!(runtime.live_snapshot().unwrap().turn_id, turn);
+            registry.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn an_explicit_open_after_quiesce_is_refused_and_leaves_nothing_behind() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
@@ -2855,6 +3041,7 @@ mod tests {
                     id: ItemId::new(),
                     harness_item_id: "native-agent-message".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: "hello".into(),
                     },
                     created_at: Utc::now(),

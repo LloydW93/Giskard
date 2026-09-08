@@ -42,6 +42,14 @@ When a bootstrapped native resume fails because its rollout disappeared, the ins
 replaces that exact native/Giskard binding with the fresh session identity, advances its route
 epoch, and preserves the retained delivery log.
 
+## Client clock requests
+
+The instance automatically answers `currentTime/read` with the server host's current Unix time
+in whole seconds (`currentTimeAt`). These connection service requests do not create browser
+questions or thread routes. Missing or empty `threadId` parameters receive JSON-RPC invalid-params
+errors; transport failures are logged with the request and native thread identity. This response
+support does not enable Codex's external-clock configuration.
+
 ## Identifier model
 
 Giskard-owned identifiers are durable application identities. Codex-native
@@ -174,6 +182,22 @@ A `functionCallOutput` item is mapped to a Giskard `ToolCall`. Codex emits it fo
 client supplied on `turn/start`, so the item carries the tool name, its optional namespace, and the
 output, but never the arguments — the recorded input is `null` rather than an invented object. A
 text body is kept as a JSON string so the transcript shows the tool's own text instead of a wrapper.
+
+## Asynchronous questions
+
+Native `agentMessage.questions` is preserved as harness-neutral `AsyncQuestion` values on the
+completed agent-message payload, including messages with empty text. Each question retains its
+title and optional string choices. The server stores these in the turn payload and projects them
+to browser history/live replay; older messages default to no questions.
+
+Native `userMessage.clientId` is preserved as optional `client_id` on user-message payloads and
+wire history. A steering caller can set `clientUserMessageId` so the browser correlates the exact
+accepted input after reconnect, even when another message in the same turn has identical text.
+Old user messages omit the field and remain readable.
+
+These messages do not create pending server requests or approvals. They have no JSON-RPC request
+ID and their answers are ordinary user input. See [Astra interactions](../../docs/astra-interactions.md)
+for the interaction contract and capability audit.
 
 ## Sub-agent links
 
@@ -642,3 +666,18 @@ share the same browser-facing generic server-request and MCP approval behavior.
   separation, and independent running commands when Codex reuses an item ID.
 - Worker tests assert background-terminal and `command/exec` termination routing
   and verify that process termination never falls back to turn interruption.
+
+## Active-turn steering
+
+`AgentHarness::steer_turn` is a control command handled by the same `CodexInstance` task
+that owns native routes and active turns. It checks the expected Giskard `TurnId` against
+the mapper's current turn, then sends `turn/steer` with the corresponding native
+`expectedTurnId`. It checks the returned native `turnId` before acknowledging delivery.
+No `turn/start`, route replacement, lease admission, or pending-request cancellation occurs.
+Text-only input is supported; empty input, attachments, stale turns, protocol errors, and
+timeouts are surfaced to the caller. Timeout does not prove non-delivery and must not cause
+an automatic retry. Incoming user-message items provide the durable transcript record.
+
+Steering forwards the optional browser client message ID as native `clientUserMessageId`;
+Codex echoes it as `userMessage.clientId`, preserved on user transcript items. Receipt
+matching uses that identity, so identical text sent twice in one turn remains distinct.

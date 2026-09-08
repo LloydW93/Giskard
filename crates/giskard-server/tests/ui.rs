@@ -1090,7 +1090,7 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("const attachmentsLoading = pendingAttachmentOperationCount() > 0")
             && body.contains(
-                "readOnly || state.activeTurn || state.updateRequired || state.uiVersionCheckPending ||"
+                "readOnly || (state.activeTurn && !canSteerTurn()) || !!state.pendingComposerSteer || state.updateRequired || state.uiVersionCheckPending ||"
             )
             && body.contains("attachmentsLoading || modelUnresolved || nothingToSend ||")
             && body.contains("!hasThreadSurface || (!ready && !draft)")

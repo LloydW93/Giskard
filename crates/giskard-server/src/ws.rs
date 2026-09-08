@@ -366,8 +366,9 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                         continue;
                     }
                 };
-                let metadata_request_id = match &msg {
-                    ClientMessage::SwitchMode { request_id, .. }
+                let client_request_id = match &msg {
+                    ClientMessage::SteerInput { request_id, .. }
+                    | ClientMessage::SwitchMode { request_id, .. }
                     | ClientMessage::SelectModel { request_id, .. }
                     | ClientMessage::SetPermissionPreset { request_id, .. } => {
                         Some(request_id.clone())
@@ -375,7 +376,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                     _ => None,
                 };
                 if let Err(mut e) = handle_client_msg(&state, client_id, &tx, msg).await {
-                    e.info.request_id = metadata_request_id;
+                    e.info.request_id = e.info.request_id.or(client_request_id);
                     error!(
                         %client_id,
                         code = %e.info.code,
@@ -487,6 +488,13 @@ async fn handle_client_msg(
                 ))
                 .await;
 
+            let _ = tx
+                .send(ServerMessage::ThreadCapabilities {
+                    thread_id,
+                    turn_steering: state.registry.turn_steering_supported(thread_id).await,
+                })
+                .await;
+
             // Initial/reconnect history remains a temporary bootstrap-only delta. Only older-page
             // pagination is fetched over HTTP and kept out of the ordered socket lane.
             //
@@ -585,6 +593,57 @@ async fn handle_client_msg(
         }
         ClientMessage::Unsubscribe { thread_id } => {
             state.hub.unsubscribe(thread_id, client_id).await;
+        }
+        ClientMessage::SteerInput {
+            thread_id,
+            expected_turn_id,
+            question_item_id,
+            request_id,
+            text,
+        } => {
+            let result: Result<(), WsError> = async {
+                if text.trim().is_empty() {
+                    return Err(WsError::new(
+                        "empty_input",
+                        ErrorSeverity::Error,
+                        "Send a message to steer the active turn.",
+                    )
+                    .thread(thread_id)
+                    .action("steer_input"));
+                }
+                tokio::time::timeout(
+                    HARNESS_CONTROL_TIMEOUT,
+                    state.registry.steer_turn(
+                        thread_id,
+                        expected_turn_id,
+                        question_item_id,
+                        UserInput::text(text),
+                        Some(format!("giskard-steer:{request_id}")),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    WsError::from_harness(
+                        HarnessError::Timeout("steering timed out; delivery is unknown".into()),
+                        "steer_input",
+                        Some(thread_id),
+                    )
+                })?
+                .map_err(|error| WsError::from_harness(error, "steer_input", Some(thread_id)))
+            }
+            .await;
+            if let Err(mut error) = result {
+                error.info.request_id = Some(request_id);
+                warn!(%thread_id, turn_id = %expected_turn_id, error = %error.info.message, "steering request failed");
+                return Err(error);
+            }
+            let _ = tx
+                .send(ServerMessage::SteerInputAccepted {
+                    thread_id,
+                    turn_id: expected_turn_id,
+                    request_id,
+                })
+                .await;
         }
         ClientMessage::SendInput {
             thread_id,

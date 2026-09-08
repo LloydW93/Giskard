@@ -47,6 +47,7 @@ fn make_fixture() -> ReplayFixture {
                 id: item,
                 harness_item_id: "it_1".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "## Plan\n1. Read auth.rs\n2. Refactor token refresh".into(),
                 },
                 created_at: now,
@@ -415,5 +416,39 @@ where
             panic!("thread predicate not satisfied in time");
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn steering_errors_keep_request_identity_through_the_websocket_loop() {
+    let server = start_server().await;
+    let mut socket = server.ws().await;
+    let thread_id = ThreadId::new();
+    for (request_id, text) in [("empty-steer", ""), ("missing-thread-steer", "continue")] {
+        socket
+            .send(ws::text(&ClientMessage::SteerInput {
+                thread_id,
+                expected_turn_id: TurnId::new(),
+                question_item_id: None,
+                request_id: request_id.into(),
+                text: text.into(),
+            }))
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let message = socket.next().await.unwrap().unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message
+                    && let Ok(ServerMessage::Error { error }) = serde_json::from_str(&text)
+                {
+                    break error;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(error.request_id.as_deref(), Some(request_id));
+        assert_eq!(error.thread_id, Some(thread_id));
+        assert_eq!(error.action.as_deref(), Some("steer_input"));
     }
 }

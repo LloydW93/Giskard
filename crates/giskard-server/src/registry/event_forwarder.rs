@@ -2965,6 +2965,7 @@ mod tests {
             id: item_id,
             harness_item_id: "native_first".into(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "first".into(),
             },
             created_at: Utc::now(),
@@ -2977,6 +2978,7 @@ mod tests {
             id: item_id,
             harness_item_id: "native_second".into(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "second".into(),
             },
             created_at: Utc::now(),
@@ -2994,6 +2996,7 @@ mod tests {
             id: item_id,
             harness_item_id: "stale_item".into(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "recovered".into(),
             },
             created_at: Utc::now(),
@@ -3012,6 +3015,7 @@ mod tests {
             id: first_id,
             harness_item_id: "first".into(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "first".into(),
             },
             created_at: Utc::now(),
@@ -3020,12 +3024,14 @@ mod tests {
             id: second_id,
             harness_item_id: "second".into(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "second".into(),
             },
             created_at: Utc::now(),
         };
         let replacement = Item {
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "updated second".into(),
             },
             ..second.clone()
@@ -3049,12 +3055,14 @@ mod tests {
             id: item_id,
             harness_item_id: String::new(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "partial".into(),
             },
             created_at: Utc::now(),
         };
         let completed = Item {
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "complete".into(),
             },
             ..first.clone()
@@ -3103,6 +3111,7 @@ mod tests {
                 id: original_item,
                 harness_item_id: "cmd_1".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "same identity".into(),
                 },
                 created_at: Utc::now(),
@@ -3117,6 +3126,7 @@ mod tests {
                 id: conflicting_item,
                 harness_item_id: "cmd_1".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "different identity".into(),
                 },
                 created_at: Utc::now(),
@@ -4322,6 +4332,7 @@ mod tests {
                 id: ItemId::new(),
                 harness_item_id: "agent_partial".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "partial answer".into(),
                 },
                 created_at: Utc::now(),
@@ -5853,7 +5864,10 @@ mod tests {
                 item: Item {
                     id: ItemId::new(),
                     harness_item_id: format!("user_{input}"),
-                    payload: ItemPayload::UserMessage { text: input.into() },
+                    payload: ItemPayload::UserMessage {
+                        client_id: None,
+                        text: input.into(),
+                    },
                     created_at: now,
                 },
             },
@@ -5864,6 +5878,7 @@ mod tests {
                     id: ItemId::new(),
                     harness_item_id: format!("agent_{output}"),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: output.into(),
                     },
                     created_at: now,
@@ -5943,6 +5958,7 @@ mod tests {
                         id: first_item_id,
                         harness_item_id: reused_harness.clone(),
                         payload: ItemPayload::AgentMessage {
+                            questions: vec![],
                             text: "first answer".into(),
                         },
                         created_at: now,
@@ -5995,6 +6011,7 @@ mod tests {
                 id: second_item_id,
                 harness_item_id: reused_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "first version in second turn".into(),
                 },
                 created_at: now,
@@ -6007,6 +6024,7 @@ mod tests {
                 id: second_item_id,
                 harness_item_id: reused_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "second version in second turn".into(),
                 },
                 created_at: now,
@@ -6019,6 +6037,7 @@ mod tests {
                 id: conflicting_item_id,
                 harness_item_id: reused_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "conflicting identity".into(),
                 },
                 created_at: now,
@@ -6049,7 +6068,7 @@ mod tests {
         assert!(
             matches!(
                 &saved[1].items[0].payload,
-                ItemPayload::AgentMessage { text } if text == "second version in second turn"
+                ItemPayload::AgentMessage { text, .. } if text == "second version in second turn"
             ),
             "upsert should keep the latest occurrence within the turn"
         );
@@ -6129,6 +6148,7 @@ mod tests {
                         id: first_item_id,
                         harness_item_id: reused_harness.clone(),
                         payload: ItemPayload::AgentMessage {
+                            questions: vec![],
                             text: "first answer".into(),
                         },
                         created_at: now,
@@ -6198,6 +6218,7 @@ mod tests {
                 id: second_item_id,
                 harness_item_id: reused_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "second answer".into(),
                 },
                 created_at: now,
@@ -6371,6 +6392,7 @@ mod tests {
                 id: item_id,
                 harness_item_id: harness.into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "final".into(),
                 },
                 created_at: now,
@@ -6489,6 +6511,7 @@ mod tests {
                 id: ItemId::new(),
                 harness_item_id: harness_item_id.to_owned(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: harness_item_id.to_owned(),
                 },
                 created_at: Utc::now(),
@@ -6665,6 +6688,7 @@ mod tests {
                 id: conflicting_item,
                 harness_item_id: "cmd_1".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "different identity".into(),
                 },
                 created_at: Utc::now(),
@@ -6716,6 +6740,7 @@ mod tests {
                 id: ItemId::new(),
                 harness_item_id: "cmd_late".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "late".into(),
                 },
                 created_at: Utc::now(),

@@ -111,7 +111,9 @@ cargo build -p giskard-server --bin giskard-server-replay
 GISKARD_E2E_PREBUILT_BIN=target/debug/giskard-server-replay tests/e2e/screenshots.sh
 ```
 
-This writes `docs/screenshots/ide-desktop.png` and `docs/screenshots/ide-mobile.png` — the default
+This writes `docs/screenshots/ide-desktop.png` and `docs/screenshots/ide-mobile.png`, plus
+`async-questions-desktop.png` and `async-questions-mobile.png` showing a question during a running
+turn. The IDE captures show the default
 IDE theme at desktop (1440×900 @2×) and mobile (390×844 @3×) viewports, each with a project open and
 a thread showing a message and the scripted reply. The generator lives in `screenshots/` and uses
 `screenshots.config.ts` (separate from the test suite so `run.sh` never regenerates images and this

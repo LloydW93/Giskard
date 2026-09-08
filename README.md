@@ -568,3 +568,12 @@ with `cargo deny check`.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Questions during ongoing work
+
+Giskard displays Codex asynchronous questions with suggested choices and a free-text answer. Submit
+explicitly to send an answer; the agent can keep working while you decide. Supported harnesses also
+accept text from the composer during a running turn. A rejected message keeps its draft; uncertain
+delivery is shown rather than automatically retried. See [Astra interactions](docs/astra-interactions.md)
+for the protocol contract and current native capability coverage, and the
+[steering protocol](docs/api-endpoints.md#steering-an-active-turn) for client integration.

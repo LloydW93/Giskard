@@ -73,6 +73,7 @@ impl ReplayFixture {
 }
 
 struct ThreadState {
+    active_turn: Arc<Mutex<Option<TurnId>>>,
     log: Arc<EventLog>,
     pending: Vec<AgentEvent>,
 }
@@ -134,6 +135,7 @@ impl ReplayHarness {
     fn with_fixtures(fixtures: HashMap<ReplayNativeThreadId, PreloadedFixture>) -> Self {
         Self {
             capabilities: HarnessCapabilities {
+                turn_steering: true,
                 live_approvals: true,
                 plan_build_modes: true,
                 per_turn_model: true,
@@ -284,7 +286,14 @@ impl AgentHarness for ReplayHarness {
 
         let log = Arc::new(EventLog::new());
         let mut threads = self.threads.lock().await;
-        threads.push((thread_id, ThreadState { log, pending }));
+        threads.push((
+            thread_id,
+            ThreadState {
+                log,
+                pending,
+                active_turn: Arc::new(Mutex::new(None)),
+            },
+        ));
 
         Ok(ThreadHandle {
             // A deterministic replay applies exactly the requested model, so echo it as
@@ -306,13 +315,23 @@ impl AgentHarness for ReplayHarness {
         let mut threads = self.threads.lock().await;
         if let Some((_, state)) = threads.iter_mut().find(|(id, _)| *id == thread.thread) {
             let log = state.log.clone();
+            let active_turn = state.active_turn.clone();
             let events = std::mem::take(&mut state.pending);
             drop(threads);
 
             // Send events asynchronously.
             tokio::spawn(async move {
                 for event in events {
+                    let mut active = active_turn.lock().await;
+                    match &event {
+                        AgentEvent::TurnStarted { turn, .. } => *active = Some(*turn),
+                        AgentEvent::TurnCompleted { turn, .. } if *active == Some(*turn) => {
+                            *active = None
+                        }
+                        _ => {}
+                    }
                     log.append(event);
+                    drop(active);
                     tokio::task::yield_now().await;
                 }
             });
@@ -345,6 +364,48 @@ impl AgentHarness for ReplayHarness {
         _req: ServerRequestId,
         _response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn steer_turn(
+        &self,
+        thread: &ThreadHandle,
+        expected_turn: TurnId,
+        input: UserInput,
+        client_message_id: Option<String>,
+    ) -> Result<(), HarnessError> {
+        let threads = self.threads.lock().await;
+        let state = threads
+            .iter()
+            .find(|(id, _)| *id == thread.thread)
+            .map(|(_, state)| state)
+            .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
+        let active = state.active_turn.lock().await;
+        if *active != Some(expected_turn) {
+            return Err(HarnessError::Protocol(
+                "the expected replay turn is no longer active".into(),
+            ));
+        }
+        let text = input.as_text().unwrap_or_default();
+        if text.trim().is_empty() || !input.attachments().is_empty() {
+            return Err(HarnessError::Protocol(
+                "steering requires nonempty text without attachments".into(),
+            ));
+        }
+        let id = ItemId::new();
+        state.log.append(AgentEvent::ItemCompleted {
+            thread: thread.thread,
+            turn: expected_turn,
+            item: Item {
+                id,
+                harness_item_id: format!("replay_steer_{id}"),
+                payload: ItemPayload::UserMessage {
+                    client_id: client_message_id,
+                    text: text.to_owned(),
+                },
+                created_at: chrono::Utc::now(),
+            },
+        });
         Ok(())
     }
 
@@ -475,6 +536,7 @@ mod tests {
                     id: item_id,
                     harness_item_id: "it_1".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: "Hello!".into(),
                     },
                     created_at: now,
@@ -613,6 +675,51 @@ mod tests {
         for event in events {
             assert_eq!(event.thread_id(), requested_thread);
         }
+    }
+
+    #[tokio::test]
+    async fn replay_steering_preserves_turn_and_rejects_stale_delivery() {
+        let harness = ReplayHarness::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let log = Arc::new(EventLog::new());
+        let active_turn = Arc::new(Mutex::new(Some(turn)));
+        harness.threads.lock().await.push((
+            thread,
+            ThreadState {
+                log: log.clone(),
+                pending: Vec::new(),
+                active_turn: active_turn.clone(),
+            },
+        ));
+        let handle = ThreadHandle::detached(thread, "replay_steering".into());
+        let mut events = harness.subscribe(&handle);
+        assert!(
+            harness
+                .steer_turn(&handle, TurnId::new(), UserInput::text("stale"), None)
+                .await
+                .is_err()
+        );
+        harness
+            .steer_turn(
+                &handle,
+                turn,
+                UserInput::text("answer"),
+                Some("replay-receipt-1".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(*active_turn.lock().await, Some(turn));
+        assert!(matches!(events.recv().await.unwrap(),
+            AgentEvent::ItemCompleted { turn: event_turn, item: Item { payload: ItemPayload::UserMessage { text, client_id }, .. }, .. }
+            if event_turn == turn && text == "answer" && client_id.as_deref() == Some("replay-receipt-1")));
+        *active_turn.lock().await = None;
+        assert!(
+            harness
+                .steer_turn(&handle, turn, UserInput::text("late"), None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

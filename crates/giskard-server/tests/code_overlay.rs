@@ -648,6 +648,7 @@ async fn command_output_links_rejects_unreadable_items_and_uses_thread_workspace
         id: wrong_kind,
         harness_item_id: "message".into(),
         payload: ItemPayload::AgentMessage {
+            questions: vec![],
             text: "isolated.rs:1".into(),
         },
         created_at: Utc::now(),

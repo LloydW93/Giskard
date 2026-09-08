@@ -1801,6 +1801,7 @@ mod tests {
                     id: item_id,
                     harness_item_id: "replacement-item".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: "the item no longer represents a file change".into(),
                     },
                     created_at: chrono::Utc::now(),
@@ -3142,6 +3143,7 @@ mod tests {
                     id: item_id,
                     harness_item_id: "item-1".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: "done".into(),
                     },
                     created_at: Utc::now(),

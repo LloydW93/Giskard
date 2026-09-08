@@ -100,6 +100,7 @@ pub fn completed_turn_fixture() -> ReplayFixture {
                 id: item,
                 harness_item_id: "it_1".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "done".into(),
                 },
                 created_at: now,
@@ -126,6 +127,7 @@ pub fn completed_turn(text: &str, model: ModelRef) -> Turn {
             id: ItemId::new(),
             harness_item_id: String::new(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: text.to_string(),
             },
             created_at: now,

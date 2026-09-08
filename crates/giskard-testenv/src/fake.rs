@@ -594,6 +594,7 @@ impl Gate {
 pub mod caps {
     use giskard_harness::HarnessCapabilities;
     pub const TURNS: HarnessCapabilities = HarnessCapabilities {
+        turn_steering: false,
         live_approvals: true,
         plan_build_modes: true,
         per_turn_model: true,
@@ -609,11 +610,13 @@ pub mod caps {
         context_compaction: false,
     };
     pub const ACTIVITY: HarnessCapabilities = HarnessCapabilities {
+        turn_steering: false,
         structured_diffs: false,
         token_usage: false,
         ..TURNS
     };
     pub const RESUMABLE: HarnessCapabilities = HarnessCapabilities {
+        turn_steering: false,
         resumable_threads: true,
         live_approvals: false,
         plan_build_modes: false,
@@ -629,6 +632,7 @@ pub mod caps {
         context_compaction: false,
     };
     pub const RESUMABLE_COMPACTION: HarnessCapabilities = HarnessCapabilities {
+        turn_steering: false,
         resumable_threads: true,
         context_compaction: true,
         live_approvals: false,
@@ -644,6 +648,7 @@ pub mod caps {
         mcp_oauth_login: false,
     };
     pub const REPLAY: HarnessCapabilities = HarnessCapabilities {
+        turn_steering: false,
         live_approvals: true,
         plan_build_modes: true,
         per_turn_model: true,

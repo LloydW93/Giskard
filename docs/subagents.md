@@ -162,7 +162,9 @@ corresponding composer and controls.
 
 Read-only does not prevent resolving work the child is already waiting on. Matched approval and
 server-request responses, interrupting an active child turn, terminating a command, transcript and
-history reads, and navigation remain supported.
+history reads, and navigation remain supported. A running child may also receive an answer to an
+asynchronous question: the server validates the question item against that child's current turn
+before steering input. This exception never permits general child messages or starts an idle child.
 
 ## Link-open API
 

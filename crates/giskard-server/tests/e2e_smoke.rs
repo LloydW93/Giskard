@@ -281,6 +281,7 @@ async fn emit_external_turn(
         id: ItemId::new(),
         harness_item_id: format!("external_{turn}"),
         payload: ItemPayload::AgentMessage {
+            questions: vec![],
             text: text.to_string(),
         },
         created_at: chrono::Utc::now(),
@@ -344,6 +345,7 @@ async fn emit_external_turn_without_completion(
         id: ItemId::new(),
         harness_item_id: format!("external_{turn}"),
         payload: ItemPayload::AgentMessage {
+            questions: vec![],
             text: text.to_string(),
         },
         created_at: chrono::Utc::now(),
@@ -477,6 +479,7 @@ fn started_inputs(core: &FakeCore) -> Vec<String> {
 impl Script for UnsupportedCompactionScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
+            turn_steering: false,
             live_approvals: false,
             plan_build_modes: false,
             per_turn_model: false,
@@ -551,6 +554,7 @@ impl Script for SlowCompactionScript {
                 id: ItemId::new(),
                 harness_item_id: format!("reply_{turn}"),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "other thread reply".into(),
                 },
                 created_at: chrono::Utc::now(),
@@ -1084,6 +1088,7 @@ impl Script for SlowStartScript {
             id: ItemId::new(),
             harness_item_id: format!("reply_{sequence}_{}", call.turn),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: format!("reply to {text}"),
             },
             created_at: chrono::Utc::now(),
@@ -1192,6 +1197,7 @@ impl Script for CountingScript {
 impl Script for NoMcpScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
+            turn_steering: false,
             live_approvals: false,
             plan_build_modes: false,
             per_turn_model: false,
@@ -1299,6 +1305,7 @@ fn make_fixture() -> ReplayFixture {
                 id: it_1,
                 harness_item_id: "it_1".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "Hello from replay!".into(),
                 },
                 created_at: now,
@@ -1341,6 +1348,7 @@ fn reused_item_id_across_turns_fixture(
                 id: item_id,
                 harness_item_id: shared_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "old answer".into(),
                 },
                 created_at: now,
@@ -1366,6 +1374,7 @@ fn reused_item_id_across_turns_fixture(
                 id: item_id,
                 harness_item_id: shared_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "new answer".into(),
                 },
                 created_at: now,
@@ -1410,6 +1419,7 @@ fn duplicate_history_fixture(
                 id: old_user,
                 harness_item_id: "old_user".into(),
                 payload: ItemPayload::UserMessage {
+                    client_id: None,
                     text: "old input".into(),
                 },
                 created_at: now,
@@ -1422,6 +1432,7 @@ fn duplicate_history_fixture(
                 id: old_agent,
                 harness_item_id: "old_agent".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "old answer".into(),
                 },
                 created_at: now,
@@ -1447,6 +1458,7 @@ fn duplicate_history_fixture(
                 id: new_user,
                 harness_item_id: "new_user".into(),
                 payload: ItemPayload::UserMessage {
+                    client_id: None,
                     text: "new input".into(),
                 },
                 created_at: now,
@@ -1459,6 +1471,7 @@ fn duplicate_history_fixture(
                 id: new_agent,
                 harness_item_id: "new_agent".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "new answer".into(),
                 },
                 created_at: now,
@@ -1525,7 +1538,10 @@ fn notice_fixture(thread: ThreadId, turn: TurnId) -> ReplayFixture {
             item: Item {
                 id: item,
                 harness_item_id: "a1".into(),
-                payload: ItemPayload::AgentMessage { text: "hi".into() },
+                payload: ItemPayload::AgentMessage {
+                    questions: vec![],
+                    text: "hi".into(),
+                },
                 created_at: chrono::Utc::now(),
             },
         },
@@ -1883,7 +1899,7 @@ async fn wait_for_agent_message_item(
                     && let WireAgentEvent::ItemCompleted { turn, item, .. } = *agent_event
                     && matches!(
                         item.payload,
-                        giskard_proto::WireItemPayload::AgentMessage { ref text }
+                        giskard_proto::WireItemPayload::AgentMessage { ref text, .. }
                             if text == expected_text
                     )
                 {
@@ -2023,7 +2039,9 @@ async fn wait_for_thread_activity(
                     }
                     ServerMessage::Event { thread_id, .. }
                     | ServerMessage::HistoryDelta { thread_id, .. }
-                    | ServerMessage::RunningTasks { thread_id, .. } => {
+                    | ServerMessage::RunningTasks { thread_id, .. }
+                    | ServerMessage::ThreadCapabilities { thread_id, .. }
+                    | ServerMessage::SteerInputAccepted { thread_id, .. } => {
                         assert_eq!(
                             thread_id, active_thread,
                             "thread-scoped message should belong to subscribed thread"
@@ -2933,7 +2951,9 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                         );
                     }
                     ServerMessage::HistoryDelta { thread_id, .. }
-                    | ServerMessage::RunningTasks { thread_id, .. } => {
+                    | ServerMessage::RunningTasks { thread_id, .. }
+                    | ServerMessage::ThreadCapabilities { thread_id, .. }
+                    | ServerMessage::SteerInputAccepted { thread_id, .. } => {
                         assert_eq!(
                             thread_id, active_thread,
                             "snapshots should belong to the subscribed thread"
@@ -3527,7 +3547,7 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
             assert!(turn.items.iter().any(|item| {
                 matches!(
                     &item.payload,
-                    ItemPayload::AgentMessage { text } if text == "subagent live output"
+                    ItemPayload::AgentMessage { text, .. } if text == "subagent live output"
                 )
             }));
             break;
@@ -4042,7 +4062,7 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
             assert!(turn.items.iter().any(|item| {
                 matches!(
                     &item.payload,
-                    ItemPayload::AgentMessage { text } if text == "collab child output"
+                    ItemPayload::AgentMessage { text, .. } if text == "collab child output"
                 )
             }));
             break;
@@ -4235,7 +4255,7 @@ async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
             assert!(turn.items.iter().any(|item| {
                 matches!(
                     &item.payload,
-                    ItemPayload::AgentMessage { text } if text == "delayed metadata child output"
+                    ItemPayload::AgentMessage { text, .. } if text == "delayed metadata child output"
                 )
             }));
             break;
@@ -4366,7 +4386,7 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
             assert!(turn.items.iter().any(|item| {
                 matches!(
                     &item.payload,
-                    ItemPayload::AgentMessage { text } if text == "server-resolved child output"
+                    ItemPayload::AgentMessage { text, .. } if text == "server-resolved child output"
                 )
             }));
             break;
@@ -5941,6 +5961,7 @@ async fn websocket_serializes_harness_error_events() {
                 }
                 other => panic!("expected error event, got {other:?}"),
             },
+            ServerMessage::ThreadCapabilities { thread_id, .. } => assert_eq!(thread_id, tid),
             ServerMessage::HistoryDelta { .. }
             | ServerMessage::LiveTurnSnapshot(_)
             | ServerMessage::RunningTasks { .. } => continue,
@@ -6276,6 +6297,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                         id: ItemId::new(),
                         harness_item_id: "old_user".into(),
                         payload: ItemPayload::UserMessage {
+                            client_id: None,
                             text: "old input".into(),
                         },
                         created_at: now,
@@ -6284,6 +6306,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                         id: ItemId::new(),
                         harness_item_id: "old_agent".into(),
                         payload: ItemPayload::AgentMessage {
+                            questions: vec![],
                             text: "old answer".into(),
                         },
                         created_at: now,
@@ -6349,8 +6372,8 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 if let ServerMessage::Event { agent_event, .. } = server_msg {
                     match *agent_event {
                         WireAgentEvent::ItemCompleted { item, .. } => match item.payload {
-                            giskard_proto::WireItemPayload::AgentMessage { text }
-                            | giskard_proto::WireItemPayload::UserMessage { text } => {
+                            giskard_proto::WireItemPayload::AgentMessage { text, .. }
+                            | giskard_proto::WireItemPayload::UserMessage { text, .. } => {
                                 if text.starts_with("old ") {
                                     seen_old = true;
                                 }
@@ -6478,6 +6501,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                     id: shared_item_id,
                     harness_item_id: "shared_agent".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: "old answer".into(),
                     },
                     created_at: now,
@@ -6564,14 +6588,14 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
     assert!(
         matches!(
             &saved[0].items[0].payload,
-            ItemPayload::AgentMessage { text } if text == "old answer"
+            ItemPayload::AgentMessage { text, .. } if text == "old answer"
         ),
         "old turn keeps its own payload"
     );
     assert!(
         matches!(
             &saved[1].items[0].payload,
-            ItemPayload::AgentMessage { text } if text == "new answer"
+            ItemPayload::AgentMessage { text, .. } if text == "new answer"
         ),
         "new turn keeps its own payload"
     );

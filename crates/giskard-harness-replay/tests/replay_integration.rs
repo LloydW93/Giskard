@@ -46,6 +46,7 @@ fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
                 id: it_1,
                 harness_item_id: "it_1".into(),
                 payload: ItemPayload::UserMessage {
+                    client_id: None,
                     text: "Fix the auth module".into(),
                 },
                 created_at: now,
@@ -77,6 +78,7 @@ fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
                 id: it_2,
                 harness_item_id: "it_2".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "I'll start by reading auth.rs".into(),
                 },
                 created_at: now,
@@ -188,7 +190,7 @@ async fn open_thread_one_turn_assert_state() {
     // Event 3: ItemCompleted (UserMessage)
     if let AgentEvent::ItemCompleted { item, .. } = &events[3] {
         match &item.payload {
-            ItemPayload::UserMessage { text } => assert_eq!(text, "Fix the auth module"),
+            ItemPayload::UserMessage { text, .. } => assert_eq!(text, "Fix the auth module"),
             _ => panic!("expected UserMessage"),
         }
     } else {
@@ -212,7 +214,7 @@ async fn open_thread_one_turn_assert_state() {
     // Event 6: ItemCompleted (AgentMessage)
     if let AgentEvent::ItemCompleted { item, .. } = &events[6] {
         match &item.payload {
-            ItemPayload::AgentMessage { text } => {
+            ItemPayload::AgentMessage { text, .. } => {
                 assert_eq!(text, "I'll start by reading auth.rs")
             }
             _ => panic!("expected AgentMessage"),

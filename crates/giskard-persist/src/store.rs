@@ -3687,7 +3687,10 @@ mod layout_tests {
         Item {
             id: giskard_core::ids::ItemId(ulid::Ulid::new()),
             harness_item_id: format!("native-{text}"),
-            payload: ItemPayload::AgentMessage { text: text.into() },
+            payload: ItemPayload::AgentMessage {
+                questions: vec![],
+                text: text.into(),
+            },
             created_at: Utc::now(),
         }
     }
@@ -3844,6 +3847,7 @@ mod layout_tests {
         let items = [item("first"), item("cargo build"), item("third")];
         let mut settled = items[1].clone();
         settled.payload = ItemPayload::AgentMessage {
+            questions: vec![],
             text: "cargo build (finished)".into(),
         };
 
@@ -4647,6 +4651,7 @@ mod layout_tests {
         let items = [item("first"), item("second"), item("third")];
         let mut settled = items[2].clone();
         settled.payload = ItemPayload::AgentMessage {
+            questions: vec![],
             text: "third (settled)".into(),
         };
 

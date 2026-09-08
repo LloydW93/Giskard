@@ -156,15 +156,29 @@ pub struct Item {
     pub created_at: DateTime<Utc>,
 }
 
+/// A nonblocking question carried by an agent message. Answers are ordinary user input,
+/// never approval decisions or responses to a pending server request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsyncQuestion {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+}
+
 /// Discriminated union of item payloads (spec §4.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ItemPayload {
     UserMessage {
         text: String,
+        /// Client-supplied input identity echoed by the harness, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
     },
     AgentMessage {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        questions: Vec<AsyncQuestion>,
     },
     Reasoning {
         text: String,
@@ -395,6 +409,7 @@ mod tests {
             id: ItemId::new(),
             harness_item_id: "it_1".into(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "Hello!".into(),
             },
             created_at: DateTime::parse_from_rfc3339("2026-07-06T10:00:00Z")
@@ -516,5 +531,18 @@ mod tests {
         };
         let json = serde_json::to_string(&delta).unwrap();
         assert!(json.contains("\"type\":\"text\""));
+    }
+    #[test]
+    fn async_questions_roundtrip_and_legacy_messages_default_to_no_questions() {
+        let legacy: ItemPayload =
+            serde_json::from_str(r#"{"kind":"agent_message","text":"hello"}"#).unwrap();
+        assert!(
+            matches!(legacy, ItemPayload::AgentMessage { questions, .. } if questions.is_empty())
+        );
+        let value = serde_json::json!({"kind":"agent_message", "text":"", "questions":[
+            {"title":"Choose", "options":["First", "Second"]}, {"title":"Details"}
+        ]});
+        let payload: ItemPayload = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(payload).unwrap(), value);
     }
 }

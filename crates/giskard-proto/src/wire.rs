@@ -182,9 +182,14 @@ pub struct WireSubagentLink {
 pub enum WireItemPayload {
     UserMessage {
         text: String,
+        /// Client-supplied input identity echoed by the harness, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
     },
     AgentMessage {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        questions: Vec<giskard_core::item::AsyncQuestion>,
     },
     Reasoning {
         text: String,
@@ -582,8 +587,8 @@ impl From<SubagentLink> for WireSubagentLink {
 impl From<ItemPayload> for WireItemPayload {
     fn from(p: ItemPayload) -> Self {
         match p {
-            ItemPayload::UserMessage { text } => Self::UserMessage { text },
-            ItemPayload::AgentMessage { text } => Self::AgentMessage { text },
+            ItemPayload::UserMessage { text, client_id } => Self::UserMessage { text, client_id },
+            ItemPayload::AgentMessage { text, questions } => Self::AgentMessage { text, questions },
             ItemPayload::Reasoning { text } => Self::Reasoning { text },
             ItemPayload::CommandExecution {
                 command,
@@ -1165,5 +1170,44 @@ mod tests {
             assert!(subagent.get("harness_thread_id").is_none());
             assert_eq!(subagent["path"], "reviewer");
         }
+    }
+    #[test]
+    fn async_questions_survive_wire_projection_and_old_messages_still_load() {
+        let questions = vec![giskard_core::item::AsyncQuestion {
+            title: "Choose a direction".into(),
+            options: Some(vec!["First".into(), "Second".into()]),
+        }];
+        let wire = WireItemPayload::from(ItemPayload::AgentMessage {
+            text: String::new(),
+            questions: questions.clone(),
+        });
+        let encoded = serde_json::to_value(wire).unwrap();
+        assert_eq!(encoded["questions"][0]["title"], "Choose a direction");
+        let decoded: WireItemPayload = serde_json::from_value(encoded).unwrap();
+        assert!(
+            matches!(decoded, WireItemPayload::AgentMessage { questions: actual, .. } if actual == questions)
+        );
+        let old: WireItemPayload =
+            serde_json::from_str(r#"{"kind":"agent_message","text":"old"}"#).unwrap();
+        assert!(
+            matches!(old, WireItemPayload::AgentMessage { questions, .. } if questions.is_empty())
+        );
+    }
+    #[test]
+    fn user_message_client_identity_survives_wire_projection() {
+        let wire = WireItemPayload::from(ItemPayload::UserMessage {
+            text: "answer".into(),
+            client_id: Some("request".into()),
+        });
+        assert_eq!(serde_json::to_value(wire).unwrap()["client_id"], "request");
+        let old: WireItemPayload =
+            serde_json::from_str(r#"{"kind":"user_message","text":"old"}"#).unwrap();
+        assert!(matches!(
+            old,
+            WireItemPayload::UserMessage {
+                client_id: None,
+                ..
+            }
+        ));
     }
 }

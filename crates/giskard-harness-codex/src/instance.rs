@@ -2,6 +2,9 @@ use super::*;
 use crate::native_routes::UnknownNativeThread;
 use crate::uploads::{cleanup_active_turn_upload, cleanup_all_active_turn_uploads};
 
+#[path = "current_time.rs"]
+mod current_time;
+
 /// One task-owned runtime for one Codex app-server process.
 ///
 /// Exactly one instance is created for each spawned transport and moved into exactly one Tokio
@@ -548,6 +551,19 @@ where
                 MessageOutcome::Handled
             }
             codex_codes::ServerMessage::Request { id, request } => {
+                // Service requests are answered by the instance, without registering a browser
+                // action or inventing a thread/turn solely to read the clock.
+                match current_time::respond(&mut self.client, &id, &request).await {
+                    Ok(true) => return MessageOutcome::Handled,
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(action = "respond_current_time", method = request.method(),
+                            request_id = ?id,
+                            harness_thread_id = ?server_request_native_scope(&request).0,
+                            error = %error, "failed to send Codex current-time response");
+                        return MessageOutcome::Handled;
+                    }
+                }
                 let Some(event) = self
                     .map_or_discover(
                         |mapper| mapper.try_map_server_request(&id, &request, fallback_thread),
@@ -623,6 +639,33 @@ where
                     response_payload,
                 )
                 .await;
+                let _ = response.send(result);
+            }
+            ControlCommand::SteerTurn {
+                thread,
+                expected_turn,
+                input,
+                client_message_id,
+                response,
+            } => {
+                let result = timeout_codex_control(
+                    "steer_turn",
+                    Some(&thread),
+                    None,
+                    None,
+                    handle_steer_turn(
+                        &mut self.client,
+                        &self.mapper,
+                        &thread,
+                        expected_turn,
+                        input,
+                        client_message_id,
+                    ),
+                )
+                .await;
+                if let Err(error) = &result {
+                    warn!(thread_id = %thread.thread, turn_id = %expected_turn, %error, "Codex steering failed");
+                }
                 let _ = response.send(result);
             }
             ControlCommand::Interrupt { thread, response } => {

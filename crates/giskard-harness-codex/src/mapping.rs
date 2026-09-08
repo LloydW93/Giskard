@@ -190,6 +190,14 @@ impl CodexMapper {
         self.active_turns.get(&thread).map(NativeTurnId::as_str)
     }
 
+    /// Read the existing active identity without minting a turn for a stale steering request.
+    pub fn active_giskard_turn_for_thread(&self, thread: ThreadId) -> Option<TurnId> {
+        let native = self.active_turns.get(&thread)?;
+        self.turn_ids
+            .get(&NativeTurnKey::new(thread, native.clone()))
+            .copied()
+    }
+
     pub fn clear_active_turn(&mut self, thread: ThreadId) {
         self.active_turns.remove(&thread);
         self.turns.retain(|key, _| key.thread_id != thread);
@@ -2723,7 +2731,9 @@ fn map_thread_item_complete(
     completed_at_ms: i64,
 ) -> Item {
     let payload = match item {
-        codex_codes::ThreadItem::UserMessage { content, .. } => {
+        codex_codes::ThreadItem::UserMessage {
+            content, client_id, ..
+        } => {
             let text = content
                 .iter()
                 .filter_map(|c| match c {
@@ -2732,14 +2742,29 @@ fn map_thread_item_complete(
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            ItemPayload::UserMessage { text }
+            ItemPayload::UserMessage {
+                text,
+                client_id: client_id.clone(),
+            }
         }
-        codex_codes::ThreadItem::AgentMessage { text, .. } => {
-            ItemPayload::AgentMessage { text: text.clone() }
-        }
-        codex_codes::ThreadItem::Plan { text, .. } => {
-            ItemPayload::AgentMessage { text: text.clone() }
-        }
+        codex_codes::ThreadItem::AgentMessage {
+            text, questions, ..
+        } => ItemPayload::AgentMessage {
+            questions: questions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|q| giskard_core::item::AsyncQuestion {
+                    title: q.title.clone(),
+                    options: q.options.clone(),
+                })
+                .collect(),
+            text: text.clone(),
+        },
+        codex_codes::ThreadItem::Plan { text, .. } => ItemPayload::AgentMessage {
+            questions: vec![],
+            text: text.clone(),
+        },
         codex_codes::ThreadItem::Reasoning {
             content, summary, ..
         } => {
@@ -7269,5 +7294,64 @@ mod tests {
             }
             other => panic!("expected Result, got {other:?}"),
         }
+    }
+    #[test]
+    fn async_questions_survive_item_mapping_without_a_server_request() {
+        let mut mapper = CodexMapper::new("/workspace".into());
+        let thread = ThreadId::new();
+        let event = mapper
+            .map_notification(
+                &completed_item(json!({
+                    "type": "agentMessage", "id": "question", "text": "",
+                    "questions": [
+                        {"title": "Which approach?", "options": ["Small change", "Redesign"]},
+                        {"title": "Any constraints?"}
+                    ]
+                })),
+                thread,
+            )
+            .unwrap();
+        let AgentEvent::ItemCompleted { item, .. } = event else {
+            panic!("expected completed item")
+        };
+        let ItemPayload::AgentMessage { text, questions } = item.payload else {
+            panic!("expected message")
+        };
+        assert!(text.is_empty());
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].title, "Which approach?");
+        assert_eq!(
+            questions[0].options.as_ref().unwrap(),
+            &["Small change", "Redesign"]
+        );
+        assert_eq!(questions[1].options, None);
+        assert!(mapper.pending_server_requests.is_empty());
+    }
+
+    #[test]
+    fn active_turn_lookup_does_not_mint_or_keep_a_completed_turn() {
+        let mut mapper = CodexMapper::new("/workspace".into());
+        let thread = ThreadId::new();
+        assert_eq!(mapper.active_giskard_turn_for_thread(thread), None);
+        assert!(mapper.turn_ids.is_empty());
+        let turn = mapper.register_active_turn(thread, "native").unwrap();
+        assert_eq!(mapper.active_giskard_turn_for_thread(thread), Some(turn));
+        mapper.clear_active_turn(thread);
+        assert_eq!(mapper.active_giskard_turn_for_thread(thread), None);
+    }
+    #[test]
+    fn user_message_preserves_client_input_identity() {
+        let event = CodexMapper::new("/workspace".into())
+            .map_notification(
+                &completed_item(json!({
+                    "type":"userMessage", "id":"native-input", "clientId":"browser-request",
+                    "content":[{"type":"text", "text":"Same answer"}]
+                })),
+                ThreadId::new(),
+            )
+            .unwrap();
+        assert!(
+            matches!(event, AgentEvent::ItemCompleted { item: Item { payload: ItemPayload::UserMessage { client_id: Some(id), .. }, .. }, .. } if id == "browser-request")
+        );
     }
 }

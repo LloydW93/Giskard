@@ -199,6 +199,13 @@ enum HarnessCommand {
 }
 
 enum ControlCommand {
+    SteerTurn {
+        thread: ThreadHandle,
+        expected_turn: TurnId,
+        input: UserInput,
+        client_message_id: Option<String>,
+        response: oneshot::Sender<Result<(), HarnessError>>,
+    },
     ClaimNativeThread {
         thread: ThreadId,
         harness_thread_id: String,
@@ -523,6 +530,7 @@ impl CodexHarness {
             shutdown_tx,
             worker_done,
             capabilities: HarnessCapabilities {
+                turn_steering: true,
                 live_approvals: true,
                 plan_build_modes: true,
                 per_turn_model: true,
@@ -1039,6 +1047,29 @@ impl AgentHarness for CodexHarness {
             ControlCommand::RespondServerRequest {
                 id,
                 response_payload,
+                response: tx,
+            },
+        )
+        .await?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
+    async fn steer_turn(
+        &self,
+        thread: &ThreadHandle,
+        expected_turn: TurnId,
+        input: UserInput,
+        client_message_id: Option<String>,
+    ) -> Result<(), HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue_control(
+            "steer_turn",
+            ControlCommand::SteerTurn {
+                thread: thread.clone(),
+                expected_turn,
+                input,
+                client_message_id,
                 response: tx,
             },
         )
@@ -2128,6 +2159,53 @@ async fn reject_pending_requests_for_interrupted_thread(
     }
 }
 
+async fn handle_steer_turn(
+    client: &mut dyn CodexTransport,
+    mapper: &CodexMapper,
+    thread: &ThreadHandle,
+    expected_turn: TurnId,
+    input: UserInput,
+    client_message_id: Option<String>,
+) -> Result<(), HarnessError> {
+    if mapper.active_giskard_turn_for_thread(thread.thread) != Some(expected_turn) {
+        return Err(HarnessError::Protocol(
+            "the expected turn is no longer active; steering was not sent".into(),
+        ));
+    }
+    if !input.attachments().is_empty() {
+        return Err(HarnessError::Unsupported(
+            "turn steering currently accepts text only".into(),
+        ));
+    }
+    let text = input.as_text().unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(HarnessError::Protocol(
+            "steering input must not be empty".into(),
+        ));
+    }
+    let native_turn = mapper
+        .active_native_turn_for_thread(thread.thread)
+        .ok_or_else(|| HarnessError::Protocol("no active turn to steer".into()))?;
+    let response: serde_json::Value = codex_request(
+        client,
+        CodexOperationContext::for_thread("steer_turn", thread).with_native_turn_id(native_turn),
+        "turn/steer",
+        &serde_json::json!({
+            "threadId": thread.harness_thread_id,
+            "expectedTurnId": native_turn,
+            "clientUserMessageId": client_message_id,
+            "input": [{"type": "text", "text": text, "text_elements": []}],
+        }),
+    )
+    .await?;
+    if response.get("turnId").and_then(serde_json::Value::as_str) != Some(native_turn) {
+        return Err(HarnessError::Protocol(
+            "turn/steer acknowledged an unexpected turn".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn handle_interrupt(
     client: &mut dyn CodexTransport,
     mapper: &CodexMapper,
@@ -2919,6 +2997,7 @@ mod tests {
                 std::future::pending().await
             } else {
                 match method {
+                    "turn/steer" => Ok(json!({"turnId": params["expectedTurnId"]})),
                     codex_codes::protocol::methods::THREAD_START => {
                         state.thread_counter += 1;
                         let native_thread_id = format!("native-thread-{}", state.thread_counter);
@@ -3575,6 +3654,91 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn steering_targets_the_expected_native_turn_and_rejects_stale_input() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let turn = harness
+            .start_turn(&thread, UserInput::text("work"), build_turn_overrides())
+            .await
+            .unwrap();
+        assert!(
+            harness
+                .steer_turn(&thread, TurnId::new(), UserInput::text("stale"), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            harness
+                .steer_turn(&thread, turn, UserInput::text(" "), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            !controller
+                .requests()
+                .await
+                .iter()
+                .any(|request| request.method == "turn/steer")
+        );
+        harness
+            .steer_turn(
+                &thread,
+                turn,
+                UserInput::text("focus on tests"),
+                Some("steer-receipt-1".into()),
+            )
+            .await
+            .unwrap();
+        let requests = controller.requests().await;
+        let steer = requests
+            .iter()
+            .find(|request| request.method == "turn/steer")
+            .unwrap();
+        assert_eq!(steer.params["threadId"], thread.harness_thread_id);
+        assert_eq!(
+            steer.params["expectedTurnId"],
+            controller.started_turns().await[0].native_turn_id
+        );
+        assert_eq!(steer.params["input"][0]["text"], "focus on tests");
+        assert_eq!(steer.params["clientUserMessageId"], "steer-receipt-1");
+        assert_eq!(controller.started_turns().await.len(), 1);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn steering_timeout_does_not_stop_worker() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let turn = harness
+            .start_turn(&thread, UserInput::text("work"), build_turn_overrides())
+            .await
+            .unwrap();
+        controller
+            .state
+            .lock()
+            .await
+            .hang_methods
+            .insert("turn/steer".into());
+        assert!(matches!(
+            harness
+                .steer_turn(&thread, turn, UserInput::text("tests"), None)
+                .await,
+            Err(HarnessError::Timeout(_))
+        ));
+        harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -5935,7 +6099,7 @@ mod tests {
             assert!(
                 matches!(&message, AgentEvent::ItemCompleted { thread, item, .. }
                 if *thread == child.thread
-                    && matches!(&item.payload, ItemPayload::AgentMessage { text } if text == "hello"))
+                    && matches!(&item.payload, ItemPayload::AgentMessage { text, .. } if text == "hello"))
             );
             let completed = expect_event(&mut child_stream, "child TurnCompleted").await;
             assert!(

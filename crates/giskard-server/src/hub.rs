@@ -362,6 +362,8 @@ fn server_message_kind(msg: &ServerMessage) -> &'static str {
         ServerMessage::RunningTasks { .. } => "running_tasks",
         ServerMessage::Error { .. } => "error",
         ServerMessage::Pong => "pong",
+        ServerMessage::ThreadCapabilities { .. } => "thread_capabilities",
+        ServerMessage::SteerInputAccepted { .. } => "steer_input_accepted",
     }
 }
 

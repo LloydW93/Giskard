@@ -644,8 +644,8 @@
     background:var(--scroll-thumb); border:2px solid var(--scroll-track); border-radius:999px;
   }
   .composer textarea::-webkit-scrollbar-thumb:hover { background:var(--scroll-thumb-hover); }
-  /* Send (up-pointing paper-plane arrow) and Stop (red filled square) are flex siblings; only one
-     is ever visible (the other has [hidden]), so they occupy the same 40px slot. Both match the
+  /* Send (up-pointing paper-plane arrow) and Stop (red filled square) are flex siblings. Steering
+     harnesses show both while running; other harnesses share a single slot. Both match the
      composer's at-rest height, mirroring the ＋ attach button on the left for a symmetric composer;
      when the textarea grows they keep that height and stay aligned to its bottom edge. */
   .composer #sendBtn,
@@ -1096,3 +1096,14 @@
   @media (max-width:480px) {
     .git-line .git-sync, .git-line .git-sep { display:none; }
   }
+
+/* Async question cards stay in the transcript while the agent continues working. */
+.agent-questions { display:flex; flex-direction:column; gap:12px; margin-top:12px; }
+.agent-questions fieldset { min-width:0; margin:0; padding:12px; border:1px solid var(--border); border-radius:8px; }
+.agent-questions legend { font-weight:600; padding:0 4px; overflow-wrap:anywhere; }
+.question-option { display:flex; align-items:baseline; gap:8px; margin:8px 0; overflow-wrap:anywhere; }
+.question-option input { flex:none; }
+.question-free-text { display:flex; flex-direction:column; gap:6px; margin-top:12px; }
+.question-free-text textarea { width:100%; box-sizing:border-box; resize:vertical; font:inherit; }
+.agent-questions .question-delivery { margin:0; }
+.agent-questions button[type=submit] { align-self:flex-start; }

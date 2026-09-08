@@ -91,6 +91,9 @@ const SCRIPTED_APPROVAL_THEN_ERROR_MESSAGE: &str = "Scripted non-fatal harness e
 /// Prompt that raises a `requestUserInput` server request and then keeps the turn in-flight. This
 /// harness deliberately never emits `ServerRequestResolved` when the answer is routed — modelling a
 /// harness whose resolved event is late or absent, which is the window a reload has to survive.
+const SCRIPTED_ASYNC_QUESTION_TRIGGER: &str = "Ask a scripted async question.";
+const SCRIPTED_IDLE_QUESTION_TRIGGER: &str = "Ask a scripted question and finish.";
+const SCRIPTED_ASYNC_QUESTION: &str = "Which branch should I use for the implementation?";
 const SCRIPTED_SERVER_REQUEST_TRIGGER: &str = "Trigger a scripted user input request.";
 const SCRIPTED_SERVER_REQUEST_ID: &str = "scripted-server-request-1";
 const SCRIPTED_SERVER_REQUEST_QUESTION: &str = "Which branch should I use?";
@@ -163,6 +166,7 @@ impl ScriptedHarness {
                 mcp_reload: false,
                 mcp_oauth_login: false,
                 context_compaction: false,
+                turn_steering: true,
             },
             threads: tokio::sync::Mutex::new(Vec::new()),
             native_bindings: tokio::sync::Mutex::new(native_bindings),
@@ -384,6 +388,7 @@ impl ScriptedHarness {
                     id: ItemId::new(),
                     harness_item_id: format!("scripted_child_reply_{turn}"),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: SCRIPTED_SUBAGENT_REPLY.into(),
                     },
                     created_at: chrono::Utc::now(),
@@ -564,11 +569,52 @@ impl AgentHarness for ScriptedHarness {
             input_text == Some(SCRIPTED_SERVER_REQUEST_TRIGGER) || raise_server_request_then_error;
         let raise_lazy_diffs = input_text == Some(SCRIPTED_DIFF_TRIGGER);
         let stream_reasoning = input_text == Some(SCRIPTED_REASONING_TRIGGER);
+        let idle_question = input_text == Some(SCRIPTED_IDLE_QUESTION_TRIGGER);
+        let async_question = input_text == Some(SCRIPTED_ASYNC_QUESTION_TRIGGER) || idle_question;
+
+        let echoed_input = input.as_text().unwrap_or_default().to_string();
 
         // Stream the canned reply the way a real harness would: start, incremental deltas, then a
         // completed item and a turn-completed with token usage. Emitted off-task with yields so the
         // WebSocket layer observes distinct frames (the transcript renders progressively).
         tokio::spawn(async move {
+            if async_question {
+                let _ = sender.append(AgentEvent::TurnStarted {
+                    thread: thread_id,
+                    turn,
+                });
+                let _ = sender.append(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item: Item {
+                        id: ItemId::new(),
+                        harness_item_id: format!("scripted_async_question_{turn}"),
+                        payload: ItemPayload::AgentMessage {
+                            text: String::new(),
+                            questions: vec![giskard_core::item::AsyncQuestion {
+                                title: SCRIPTED_ASYNC_QUESTION.into(),
+                                options: Some(vec![
+                                    "Create a new branch".into(),
+                                    "Use the current branch".into(),
+                                ]),
+                            }],
+                        },
+                        created_at: chrono::Utc::now(),
+                    },
+                });
+                if idle_question {
+                    let _ = sender.append(AgentEvent::TurnCompleted {
+                        thread: thread_id,
+                        turn,
+                        usage: TokenUsage::new(20, 8),
+                        status: TurnStatus {
+                            kind: TurnStatusKind::Completed,
+                            message: None,
+                        },
+                    });
+                }
+                return;
+            }
             if raise_lazy_diffs {
                 let item_id = ItemId::new();
                 let file_change = |diff: &str, status: &str| Item {
@@ -784,6 +830,19 @@ impl AgentHarness for ScriptedHarness {
                 thread: thread_id,
                 turn,
             });
+            let _ = sender.append(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("scripted_user_input_{turn}"),
+                    payload: ItemPayload::UserMessage {
+                        text: echoed_input,
+                        client_id: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            });
             tokio::task::yield_now().await;
             if stream_reasoning {
                 // Stream the note the way a real harness does — start, text deltas, completion — so
@@ -854,6 +913,7 @@ impl AgentHarness for ScriptedHarness {
                     id: item_id,
                     harness_item_id: "scripted_1".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: SCRIPTED_REPLY.into(),
                     },
                     created_at: chrono::Utc::now(),
@@ -910,6 +970,7 @@ impl AgentHarness for ScriptedHarness {
                     id: ItemId::new(),
                     harness_item_id: format!("scripted_approval_ack_{turn}"),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: format!("Approval recorded: {label}"),
                     },
                     created_at: chrono::Utc::now(),
@@ -924,6 +985,41 @@ impl AgentHarness for ScriptedHarness {
         _req: giskard_core::ids::ServerRequestId,
         _response: giskard_core::server_request::ServerRequestResponse,
     ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn steer_turn(
+        &self,
+        thread: &ThreadHandle,
+        expected_turn: TurnId,
+        input: UserInput,
+        client_message_id: Option<String>,
+    ) -> Result<(), HarnessError> {
+        let Some(sender) = self.sender_for(thread.thread).await else {
+            return Err(HarnessError::ThreadNotFound(thread.thread));
+        };
+        let _ = sender.append(AgentEvent::ItemCompleted {
+            thread: thread.thread,
+            turn: expected_turn,
+            item: Item {
+                id: ItemId::new(),
+                harness_item_id: format!("scripted_steered_input_{}", ItemId::new()),
+                payload: ItemPayload::UserMessage {
+                    text: input.as_text().unwrap_or_default().into(),
+                    client_id: client_message_id,
+                },
+                created_at: chrono::Utc::now(),
+            },
+        });
+        let _ = sender.append(AgentEvent::TurnCompleted {
+            thread: thread.thread,
+            turn: expected_turn,
+            usage: TokenUsage::new(20, 8),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        });
         Ok(())
     }
 
