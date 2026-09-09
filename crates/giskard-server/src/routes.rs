@@ -750,6 +750,11 @@ async fn open_thread(
             "primary thread {thread_id} has no authoritative model"
         )));
     }
+    let goals_queue = state
+        .registry
+        .harness(&project_config, &thread_file.harness)
+        .await
+        .is_ok_and(|harness| harness.goals_queue_supported());
     if let Some(binding) = state.registry.loaded_thread_binding(thread_id).await {
         let handle = binding.handle();
         return Ok(Json(OpenThreadResponse {
@@ -757,6 +762,7 @@ async fn open_thread(
             harness_thread_id: handle.harness_thread_id.clone(),
             harness: thread_file.harness,
             turn_steering: binding.turn_steering(),
+            goals_queue,
             warning: None,
         }));
     }
@@ -826,6 +832,7 @@ async fn open_thread(
                 harness_thread_id: thread_file.harness_thread_id,
                 harness: thread_file.harness,
                 turn_steering: false,
+                goals_queue: false,
                 warning: Some(read_only_info(
                     context.as_ref(),
                     Some(error.to_string()),
@@ -869,6 +876,7 @@ async fn open_thread(
         harness_thread_id: handle.harness_thread_id,
         harness: thread_file.harness,
         turn_steering,
+        goals_queue,
         warning,
     }))
 }
@@ -1022,6 +1030,11 @@ async fn start_thread_with_message(
         }
     };
     let turn_steering = binding.turn_steering();
+    let goals_queue = state
+        .registry
+        .harness(&project_config, &harness_name)
+        .await
+        .is_ok_and(|harness| harness.goals_queue_supported());
     let handle = binding.handle().clone();
     if handle.thread != thread_id {
         cleanup_new_thread_after_start_failure(
@@ -1146,6 +1159,7 @@ async fn start_thread_with_message(
         harness: harness_name,
         turn_id,
         turn_steering,
+        goals_queue,
         warning,
     }))
 }
