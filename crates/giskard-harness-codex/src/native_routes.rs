@@ -10,6 +10,8 @@ use crate::native_ids::{NativeRouteEpoch, NativeThreadId};
 pub(super) struct NativeRoute {
     pub(super) thread_id: ThreadId,
     pub(super) epoch: NativeRouteEpoch,
+    /// Verified native configuration, scoped to this route and process lifetime.
+    pub(super) context_window: Option<u32>,
 }
 
 /// Owns the bijective native-thread routes established for one Codex worker.
@@ -73,6 +75,7 @@ impl NativeThreadRoutes {
         let route = NativeRoute {
             thread_id,
             epoch: self.next_epoch,
+            context_window: None,
         };
         self.by_native.insert(native_thread_id.clone(), route);
         self.native_by_thread.insert(thread_id, native_thread_id);
@@ -145,6 +148,7 @@ impl NativeThreadRoutes {
         let route = NativeRoute {
             thread_id,
             epoch: next_epoch,
+            context_window: None,
         };
         self.by_native.remove(&expected_native_thread_id);
         self.by_native.insert(new_native_thread_id.clone(), route);
@@ -157,6 +161,23 @@ impl NativeThreadRoutes {
     /// Returns the route for a normalized native ID when one is established.
     pub(super) fn route_for_native(&self, native_thread_id: &str) -> Option<NativeRoute> {
         self.by_native.get(native_thread_id.trim()).copied()
+    }
+
+    pub(super) fn set_context_window(
+        &mut self,
+        native: &str,
+        thread: ThreadId,
+        value: Option<u32>,
+    ) -> Result<(), HarnessError> {
+        let route = self
+            .by_native
+            .get_mut(native)
+            .filter(|route| route.thread_id == thread)
+            .ok_or_else(|| {
+                HarnessError::Protocol("Context configuration lost its native thread route".into())
+            })?;
+        route.context_window = value;
+        Ok(())
     }
 
     /// Resolves provider identity while preserving the mapper's scoped fallback rules.

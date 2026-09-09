@@ -192,6 +192,25 @@ impl CodexMapper {
             .is_some_and(|route| route.thread_id == handle.thread)
     }
 
+    pub(super) fn applied_context_window(
+        &self,
+        handle: &giskard_harness::ThreadHandle,
+    ) -> Option<u32> {
+        self.routes
+            .route_for_native(&handle.harness_thread_id)
+            .filter(|route| route.thread_id == handle.thread)
+            .and_then(|route| route.context_window)
+    }
+
+    pub(super) fn set_context_window(
+        &mut self,
+        handle: &giskard_harness::ThreadHandle,
+        value: Option<u32>,
+    ) -> Result<(), giskard_core::error::HarnessError> {
+        self.routes
+            .set_context_window(&handle.harness_thread_id, handle.thread, value)
+    }
+
     pub fn active_native_turn_for_thread(&self, thread: ThreadId) -> Option<&str> {
         self.active_turns.get(&thread).map(NativeTurnId::as_str)
     }
@@ -414,6 +433,22 @@ impl CodexMapper {
         notif: &Notification,
         fallback_thread: ThreadId,
     ) -> MappingResult<Option<AgentEvent>> {
+        let unloaded = match notif {
+            Notification::ThreadClosed(event) => Some(event.thread_id.as_str()),
+            Notification::ThreadArchived(event) => Some(event.thread_id.as_str()),
+            _ => None,
+        };
+        if let Some(native) = unloaded
+            && let Some(route) = self.routes.route_for_native(native)
+        {
+            // Native runtime configuration does not survive unload/archive. Preserve identity.
+            if let Err(error) = self
+                .routes
+                .set_context_window(native, route.thread_id, None)
+            {
+                warn!(%error, native_thread_id = native, "could not invalidate native context configuration");
+            }
+        }
         Ok(match notif {
             Notification::TurnStarted(TurnStartedNotification { thread_id, turn }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread)?;

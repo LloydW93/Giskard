@@ -7,6 +7,7 @@
 //! See the crate README for Codex-native identifier scopes, item and process
 //! lifecycles, background-command ownership, and termination routing.
 
+mod context_policy;
 mod dynamic_tools;
 mod goals_queue;
 mod instance;
@@ -605,6 +606,7 @@ impl CodexHarness {
             shutdown_tx,
             worker_done,
             capabilities: HarnessCapabilities {
+                context_window_configuration: true,
                 turn_steering: true,
                 live_approvals: true,
                 plan_build_modes: true,
@@ -1683,6 +1685,7 @@ async fn resume_thread(
     resume_id: &str,
     cwd: &str,
     model: &giskard_core::model::ModelRef,
+    context_window: Option<u32>,
 ) -> Result<OpenedNativeThread, HarnessError> {
     let params = codex_codes::ThreadResumeParams {
         thread_id: resume_id.to_owned(),
@@ -1692,6 +1695,11 @@ async fn resume_thread(
         exclude_turns: Some(true),
         ..Default::default()
     };
+    let mut params =
+        serde_json::to_value(params).map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    if let Some(window) = context_window {
+        params["config"] = context_policy::config(window)?;
+    }
     let resp: codex_codes::ThreadResumeResponse = codex_request(
         client,
         context,
@@ -1733,6 +1741,7 @@ async fn start_thread(
     cwd: &str,
     initial_model: &giskard_core::model::ModelRef,
     dynamic_tools: &[Value],
+    context_window: Option<u32>,
 ) -> Result<OpenedNativeThread, HarnessError> {
     let params = codex_codes::ThreadStartParams {
         cwd: Some(cwd.to_owned()),
@@ -1742,6 +1751,9 @@ async fn start_thread(
     };
     let mut params =
         serde_json::to_value(params).map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    if let Some(window) = context_window {
+        params["config"] = context_policy::config(window)?;
+    }
     if !dynamic_tools.is_empty() {
         params["dynamicTools"] = Value::Array(dynamic_tools.to_vec());
     }
@@ -2924,6 +2936,7 @@ mod tests {
 
     fn turn_overrides(mode: Mode, effort: Option<Effort>) -> TurnOverrides {
         TurnOverrides {
+            context_window: None,
             model: Some(test_model(effort)),
             mode,
             permission_preset: PermissionPreset::AskFirst,
@@ -3508,6 +3521,7 @@ mod tests {
     fn open_opts(thread: ThreadId, resume: Option<&str>) -> OpenThreadOptions {
         let (updates, _) = giskard_harness::thread_update_channel();
         OpenThreadOptions {
+            context_window: None,
             project: ProjectId::new(),
             thread,
             workspace_root: PathBuf::from("/tmp"),
@@ -3830,6 +3844,121 @@ mod tests {
                 message: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn selected_context_is_configured_at_creation_and_reused_for_turn_and_goal() {
+        use giskard_core::goals_queue::GoalsQueueCommand;
+        let (harness, controller) = spawn_fake_harness();
+        let mut opts = open_opts(ThreadId::new(), None);
+        opts.context_window = Some(272_000);
+        let thread = harness.open_thread(opts).await.unwrap();
+        let mut settings = build_turn_overrides();
+        settings.context_window = Some(272_000);
+        harness
+            .goals_queue(
+                &thread,
+                GoalsQueueCommand::Add {
+                    text: "queued".into(),
+                    client_message_id: "context-test".into(),
+                },
+                Some(settings.clone()),
+            )
+            .await
+            .unwrap();
+        harness
+            .start_turn(&thread, UserInput::text("test"), settings)
+            .await
+            .unwrap();
+        let calls = controller.requests().await;
+        assert_eq!(
+            calls[0].params["config"],
+            context_policy::config(272_000).unwrap()
+        );
+        assert!(calls.iter().any(|request| request.method == "turn/start"));
+        assert!(
+            calls
+                .iter()
+                .any(|request| request.method == "thread/queue/add")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|request| request.method == "thread/unsubscribe")
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_context_failure_prevents_goal_and_turn_launch() {
+        use giskard_core::goals_queue::GoalsQueueCommand;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let mut settings = build_turn_overrides();
+        settings.context_window = Some(272_000);
+        // This fake does not provide native idle snapshots. Both admission paths must fail
+        // configuration rather than continue with an unverified window.
+        assert!(
+            harness
+                .goals_queue(
+                    &thread,
+                    GoalsQueueCommand::Add {
+                        text: "queued".into(),
+                        client_message_id: "context-failure".into()
+                    },
+                    Some(settings.clone())
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            harness
+                .start_turn(&thread, UserInput::text("test"), settings)
+                .await
+                .is_err()
+        );
+        let calls = controller.requests().await;
+        assert!(
+            !calls
+                .iter()
+                .any(|request| request.method == "thread/queue/add"
+                    || request.method == "turn/start"
+                    || request.method == "thread/settings/update")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_passes_context_config_without_attesting_warm_application() {
+        let (harness, controller) = spawn_fake_harness();
+        let mut opts = open_opts(ThreadId::new(), Some("native-resume"));
+        opts.context_window = Some(272_000);
+        let thread = harness.open_thread(opts).await.unwrap();
+        let calls = controller.requests().await;
+        let resume = calls
+            .iter()
+            .find(|request| request.method == "thread/resume")
+            .unwrap();
+        assert_eq!(
+            resume.params["config"],
+            context_policy::config(272_000).unwrap()
+        );
+        let mut settings = build_turn_overrides();
+        settings.context_window = Some(272_000);
+        assert!(
+            harness
+                .start_turn(&thread, UserInput::text("test"), settings)
+                .await
+                .is_err()
+        );
+        assert!(
+            !controller
+                .requests()
+                .await
+                .iter()
+                .any(|request| request.method == "turn/start")
+        );
     }
 
     #[tokio::test]
@@ -4751,6 +4880,7 @@ mod tests {
         let thread = ThreadId::new();
         harness
             .open_thread(OpenThreadOptions {
+                context_window: None,
                 project: ProjectId::new(),
                 thread,
                 workspace_root: PathBuf::from("/tmp"),

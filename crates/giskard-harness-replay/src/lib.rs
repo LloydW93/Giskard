@@ -135,6 +135,7 @@ impl ReplayHarness {
     fn with_fixtures(fixtures: HashMap<ReplayNativeThreadId, PreloadedFixture>) -> Self {
         Self {
             capabilities: HarnessCapabilities {
+                context_window_configuration: true,
                 turn_steering: true,
                 live_approvals: true,
                 plan_build_modes: true,
@@ -570,6 +571,7 @@ mod tests {
 
         let handle = harness
             .open_thread(giskard_harness::OpenThreadOptions {
+                context_window: None,
                 project: giskard_core::ProjectId::new(),
                 thread: _thread_id,
                 workspace_root: "/tmp".into(),
@@ -593,6 +595,7 @@ mod tests {
                 &handle,
                 UserInput::text("test"),
                 TurnOverrides {
+                    context_window: None,
                     model: None,
                     mode: Mode::Build,
                     permission_preset: giskard_core::turn::PermissionPreset::AutoApprove,
@@ -634,6 +637,7 @@ mod tests {
 
         let handle = harness
             .open_thread(giskard_harness::OpenThreadOptions {
+                context_window: None,
                 project: giskard_core::ProjectId::new(),
                 thread: requested_thread,
                 workspace_root: "/tmp".into(),
@@ -656,6 +660,7 @@ mod tests {
                 &handle,
                 UserInput::text("test"),
                 TurnOverrides {
+                    context_window: None,
                     model: None,
                     mode: Mode::Build,
                     permission_preset: giskard_core::turn::PermissionPreset::AutoApprove,

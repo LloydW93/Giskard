@@ -24,6 +24,8 @@ use giskard_core::user_input::UserInput;
 /// the UI adapts accordingly (§13.5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HarnessCapabilities {
+    /// Native per-session raw context configuration can be applied before work starts.
+    pub context_window_configuration: bool,
     /// Additional input can be delivered to a specific active turn.
     pub turn_steering: bool,
     /// Server-initiated, per-action approval requests (accept/decline while a turn is live).
@@ -300,6 +302,8 @@ pub struct OpenThreadOptions {
     /// The model to open on. For a resume this is an explicit override; the harness reports the
     /// effective model in the returned handle so callers can detect a provider that ignored it.
     pub initial_model: ModelRef,
+    /// Raw native context cap for this session.
+    pub context_window: Option<u32>,
     /// Bounded, non-blocking destination for metadata discovered after open returns.
     pub updates: ThreadUpdateSink,
 }

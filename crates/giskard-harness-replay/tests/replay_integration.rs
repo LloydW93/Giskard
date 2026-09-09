@@ -112,6 +112,7 @@ async fn open_thread_one_turn_assert_state() {
     // Open thread
     let handle = harness
         .open_thread(OpenThreadOptions {
+            context_window: None,
             project: giskard_core::ProjectId::new(),
             thread: expected_thread,
             workspace_root: "/tmp/test".into(),
@@ -139,6 +140,7 @@ async fn open_thread_one_turn_assert_state() {
             &handle,
             UserInput::text("Fix the auth module"),
             giskard_core::turn::TurnOverrides {
+                context_window: None,
                 model: Some(ModelRef {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
@@ -250,6 +252,7 @@ async fn replay_persisted_state_roundtrip() {
 
     let handle = harness
         .open_thread(OpenThreadOptions {
+            context_window: None,
             project: giskard_core::ProjectId::new(),
             thread: thread_id,
             workspace_root: "/tmp/test".into(),
@@ -271,6 +274,7 @@ async fn replay_persisted_state_roundtrip() {
             &handle,
             UserInput::text("test"),
             giskard_core::turn::TurnOverrides {
+                context_window: None,
                 model: None,
                 mode: Mode::Plan,
                 permission_preset: PermissionPreset::AskFirst,

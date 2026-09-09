@@ -298,6 +298,13 @@ where
                 overrides,
                 response,
             } => {
+                if let Err(error) =
+                    context_policy::ensure(&mut self.client, &mut self.mapper, &thread, &overrides)
+                        .await
+                {
+                    let _ = response.send(Err(error));
+                    return;
+                }
                 match handle_start_turn(
                     &mut self.client,
                     &mut self.mapper,
@@ -345,6 +352,7 @@ where
                 resume_id,
                 &cwd,
                 &opts.initial_model,
+                opts.context_window,
             )
             .await
             {
@@ -368,6 +376,7 @@ where
                         &cwd,
                         &opts.initial_model,
                         self.dynamic_tools.specs(),
+                        opts.context_window,
                     )
                     .await?
                 }
@@ -381,6 +390,7 @@ where
                 &cwd,
                 &opts.initial_model,
                 self.dynamic_tools.specs(),
+                opts.context_window,
             )
             .await?
         };
@@ -396,6 +406,20 @@ where
         } else {
             self.claim_thread_route(opened.harness_thread_id.clone(), thread_id)?;
         }
+
+        let context_handle = ThreadHandle::opened(
+            thread_id,
+            opened.harness_thread_id.clone(),
+            opts.workspace_root.clone(),
+        );
+        self.mapper.set_context_window(
+            &context_handle,
+            if opts.resume.is_none() || resume_warning.is_some() {
+                opts.context_window
+            } else {
+                None
+            },
+        )?;
 
         let _ = broadcast_event(&self.senders, thread_id, || AgentEvent::ThreadOpened {
             thread: thread_id,
@@ -719,6 +743,21 @@ where
                 } else {
                     Ok(())
                 };
+                let guard = match guard {
+                    Ok(()) if command.requires_settings() => match settings.as_ref() {
+                        Some(settings) => {
+                            context_policy::ensure(
+                                &mut self.client,
+                                &mut self.mapper,
+                                &thread,
+                                settings,
+                            )
+                            .await
+                        }
+                        None => Ok(()),
+                    },
+                    other => other,
+                };
                 let result = if let Err(error) = guard {
                     Err(error)
                 } else {
@@ -870,6 +909,9 @@ where
                 } else {
                     handle_set_thread_archived(&mut self.client, &thread, archived).await
                 };
+                if result.is_ok() && self.mapper.has_thread_route(&thread) {
+                    let _ = self.mapper.set_context_window(&thread, None);
+                }
                 let _ = response.send(result);
             }
             ControlCommand::DeleteThread { thread, response } => {

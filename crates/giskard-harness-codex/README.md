@@ -828,3 +828,39 @@ explicit operation. Pause and save/resume a goal to apply changed preferences to
 Captured settings are thread-wide, not per queued entry. If settings succeed but the following
 mutation fails, the acknowledged settings remain native state; the next explicit control captures
 preferences again. Reads, clear, edit, delete and reorder do not change settings.
+
+## Per-session context configuration
+
+`OpenThreadOptions.context_window` and `TurnOverrides.context_window` carry a selected **raw**
+context window. New native sessions receive `model_context_window`,
+`model_auto_compact_token_limit`, and `model_auto_compact_token_limit_scope = "total"` through
+`thread/start.config`. Resume passes the same configuration, but does not assume Codex applied it:
+Codex 0.153.4 ignores overrides when rejoining a subscribed or running session.
+
+Before an explicit turn or a goal/queue launch operation, the instance verifies a changed limit.
+The applied value belongs to the existing native route; opening a resumed route invalidates it.
+Reconfiguration requires an idle native primary session, no active goal, and an empty native queue.
+It selects an alternate reasoning effort from the native model catalog, sets that temporary marker,
+and confirms it through `thread/read.thread.reasoningEffort`. The snapshot read is bounded and
+leaves native notifications in their original transport inbox. It then unsubscribes and resumes the
+same native thread with the desired effort and context configuration. Only a response reporting the
+desired effort proves that native cold reconstruction occurred. A successful warm resume returning
+the marker is an explicit failure. No turn or inference request is created by this process.
+
+On failure, the instance rejoins the native thread and restores the desired effort; recovery failures
+are visible and prevent launch. It never restarts the project process, replaces native history, or
+writes global Codex configuration. Models without an advertised alternate effort cannot verify a
+changed limit this way and receive an explicit error; a new session can take the desired limit at
+creation. Active work keeps its current configuration until a later admitted launch can apply the
+saved preference. Pause active native goals and empty native queues before changing their limit.
+
+The configured raw window is distinct from Codex's usable runtime window. Codex applies its model
+headroom percentage, clamps to the model maximum, and caps auto-compaction at 90% of the raw
+window. Resume token-usage replay can contain a historical runtime denominator and is not used
+as configuration attestation. Context selection is not a hard billing guarantee: token estimates,
+large tool results, and native fallback buffers can cross a pricing boundary.
+
+Protocol evidence is pinned to OpenAI Codex tag `rust-v0.153.4` (`3d2ee51`):
+`app-server/src/request_processors/thread_processor.rs` (warm/cold resume),
+`thread_lifecycle.rs` (warm response), `models-manager/src/model_info.rs` (configuration overrides),
+and `protocol/src/openai_models.rs` (usable context and compaction limits).

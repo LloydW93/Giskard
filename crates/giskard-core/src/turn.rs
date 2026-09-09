@@ -125,6 +125,9 @@ impl PermissionPreset {
 /// can pass it to `turn/start`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnOverrides {
+    /// Selected raw session window; applied before native work is admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
     pub mode: Mode,
@@ -232,6 +235,7 @@ mod tests {
     #[test]
     fn turn_overrides_serde() {
         let overrides = TurnOverrides {
+            context_window: None,
             model: Some(ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
