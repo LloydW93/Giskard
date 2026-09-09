@@ -1445,6 +1445,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Unknown,
                     context_window: 0,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -1485,6 +1486,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Unknown,
                     context_window: 0,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -1694,6 +1696,7 @@ mod tests {
             .send(TurnIntent::StartTurn {
                 input: context.user_input.clone(),
                 overrides: giskard_core::turn::TurnOverrides {
+                    context_window: None,
                     model: None,
                     mode: Mode::Build,
                     permission_preset: PermissionPreset::AskFirst,

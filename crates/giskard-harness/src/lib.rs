@@ -402,6 +402,8 @@ pub struct OpenThreadOptions {
     /// The model to open on. For a resume this is an explicit override; the harness reports the
     /// effective model in the returned handle so callers can detect a provider that ignored it.
     pub initial_model: ModelRef,
+    /// Raw native context cap for this session.
+    pub context_window: Option<u32>,
     /// Bounded, non-blocking destination for metadata discovered after open returns.
     pub updates: ThreadUpdateSink,
 }
@@ -611,6 +613,10 @@ impl DiscoveryStream {
 pub trait AgentHarness: Send + Sync {
     // instance scope
     fn capabilities(&self) -> HarnessCapabilities;
+
+    fn context_window_configuration_supported(&self) -> bool {
+        false
+    }
 
     /// The harness's own version, when it knows it.
     ///

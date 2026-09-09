@@ -479,6 +479,7 @@ fn started_inputs(core: &FakeCore) -> Vec<String> {
 impl Script for UnsupportedCompactionScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
+            context_window_configuration: false,
             turn_steering: false,
             live_approvals: false,
             plan_build_modes: false,
@@ -1201,6 +1202,7 @@ impl Script for CountingScript {
 impl Script for NoMcpScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
+            context_window_configuration: false,
             turn_steering: false,
             live_approvals: false,
             plan_build_modes: false,
@@ -2224,6 +2226,7 @@ async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
                 thread_id,
                 UserInput::text("cancelled caller"),
                 TurnOverrides {
+                    context_window: None,
                     model: Some(model.clone()),
                     mode: thread.mode.as_known().unwrap(),
                     permission_preset: thread.permission_preset,
@@ -2254,6 +2257,7 @@ async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
             thread_id,
             UserInput::text("next turn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(thread.current_model.as_known().unwrap().clone()),
                 mode: thread.mode.as_known().unwrap(),
                 permission_preset: thread.permission_preset,
@@ -2313,6 +2317,7 @@ async fn cancelling_compaction_caller_does_not_abandon_admitted_operation() {
             thread_id,
             UserInput::text("after compaction"),
             TurnOverrides {
+                context_window: None,
                 model: Some(thread.current_model.as_known().unwrap().clone()),
                 mode: thread.mode.as_known().unwrap(),
                 permission_preset: thread.permission_preset,
@@ -2354,6 +2359,7 @@ async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_atta
             thread_id,
             UserInput::text("a turn nobody is subscribed to"),
             TurnOverrides {
+                context_window: None,
                 model: Some(thread_file.current_model.as_known().unwrap().clone()),
                 mode: thread_file.mode.as_known().unwrap(),
                 permission_preset: thread_file.permission_preset,
@@ -3805,6 +3811,7 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -3945,6 +3952,7 @@ async fn route_and_forwarder_import_same_native_child_once() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4065,6 +4073,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4331,6 +4340,7 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4417,6 +4427,7 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
             parent_id,
             UserInput::text("collab spawn input fallback"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4518,6 +4529,7 @@ async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
             parent_id,
             UserInput::text("subagent delayed metadata"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4610,6 +4622,7 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4741,6 +4754,7 @@ async fn subagent_link_open_rejects_unknown_and_non_link_items() {
             parent_id,
             UserInput::text("plain activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4809,6 +4823,7 @@ async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
             parent_id,
             UserInput::text("subagent terminal fallback"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4894,6 +4909,7 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4960,6 +4976,7 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
             parent_id,
             UserInput::text("subagent interrupted"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -5058,6 +5075,7 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -5258,6 +5276,7 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
             child.id,
             UserInput::text("reverse parent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(fake_native_model()),
                 mode: Mode::Build,
                 permission_preset: child.permission_preset,
@@ -5310,6 +5329,7 @@ async fn route_rejects_native_child_with_a_different_parent() {
             parent_id,
             UserInput::text("foreign subagent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -5379,6 +5399,7 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -5411,6 +5432,7 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
             &child_handle,
             UserInput::text("nested collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(fake_native_model()),
                 mode: Mode::Build,
                 permission_preset: child.permission_preset,
@@ -5519,6 +5541,7 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -5559,6 +5582,7 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
             &child_handle,
             UserInput::text("approval"),
             TurnOverrides {
+                context_window: None,
                 model: Some(fake_native_model()),
                 mode: Mode::Build,
                 permission_preset: child_file.permission_preset,
@@ -6335,6 +6359,7 @@ async fn subscribe_reopens_persisted_thread() {
                 mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: HashMap::from([(
                     "openai".into(),
                     HashMap::from([("gpt-5.5".into(), 258_400)]),
@@ -6449,6 +6474,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
                 mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
@@ -6585,6 +6611,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
@@ -6788,6 +6815,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                 mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
@@ -7184,6 +7212,7 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
                     reasoning_effort: None,
                 }),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
@@ -7286,6 +7315,7 @@ async fn open_thread_normalization_reuses_live_handle() {
                 mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 current_model: giskard_core::turn::TurnModel::Known(stale_model.clone()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
@@ -7413,6 +7443,7 @@ async fn concurrent_subagent_cold_opens_install_one_native_owner() {
             mode: giskard_core::turn::TurnMode::Known(Mode::Build),
             current_model: giskard_core::turn::TurnModel::Unknown,
             context_window: 0,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: Default::default(),

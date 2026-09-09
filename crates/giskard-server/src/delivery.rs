@@ -279,6 +279,7 @@ mod tests {
     fn thread_state(thread_id: ThreadId, revision: u64) -> ThreadState {
         ThreadState {
             metadata: ThreadMetadata {
+                context_window_override: None,
                 thread_id,
                 revision,
                 title: format!("revision {revision}"),

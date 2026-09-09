@@ -756,6 +756,7 @@ mod tests {
 
     fn overrides() -> TurnOverrides {
         TurnOverrides {
+            context_window: None,
             model: Some(model()),
             mode: Mode::Build,
             permission_preset: PermissionPreset::AskFirst,
@@ -933,6 +934,7 @@ mod tests {
         let (updates, _) = thread_update_channel();
         harness
             .open_thread(OpenThreadOptions {
+                context_window: None,
                 project: giskard_core::ids::ProjectId::new(),
                 thread,
                 workspace_root: PathBuf::from("/tmp"),
@@ -956,6 +958,7 @@ mod tests {
         let first = ThreadId::new();
         let second = ThreadId::new();
         let opts = |thread| OpenThreadOptions {
+            context_window: None,
             project: giskard_core::ids::ProjectId::new(),
             thread,
             workspace_root: PathBuf::from("/tmp"),

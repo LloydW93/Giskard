@@ -316,6 +316,7 @@ async fn replay_persisted_state_roundtrip() {
             reasoning_effort: None,
         }),
         context_window: 262_144,
+        context_window_override: None,
         model_context_windows: Default::default(),
         permission_preset: PermissionPreset::AskFirst,
         model_efforts: std::collections::HashMap::new(),

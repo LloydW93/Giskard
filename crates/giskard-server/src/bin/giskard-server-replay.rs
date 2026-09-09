@@ -507,6 +507,7 @@ impl AgentHarness for ScriptedHarness {
                 thread,
                 UserInput::text(text),
                 TurnOverrides {
+                    context_window: None,
                     model: None,
                     mode: giskard_core::turn::Mode::Build,
                     permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
