@@ -238,7 +238,7 @@ async fn defaults_and_overrides_reach_native_boundaries_and_stay_session_scoped(
 }
 
 #[tokio::test]
-async fn small_remote_limits_win_and_resolved_capacity_is_always_configurable() {
+async fn small_remote_limits_win_and_unknown_maxima_cannot_be_overridden() {
     for maximum in [Some(128_000), None] {
         let harness = FakeHarness::new(ContextScript {
             maximum,
@@ -256,7 +256,6 @@ async fn small_remote_limits_win_and_resolved_capacity_is_always_configurable() 
         );
         let settings = get(&server, &path).await;
         assert_eq!(settings["default_window"], maximum.unwrap_or(272_000));
-        assert_eq!(settings["advertised_maximum"], maximum.unwrap_or(1_000_000));
         let response = server
             .client
             .post(server.url(&path))
@@ -265,14 +264,7 @@ async fn small_remote_limits_win_and_resolved_capacity_is_always_configurable() 
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            if maximum.is_some() {
-                reqwest::StatusCode::BAD_REQUEST
-            } else {
-                reqwest::StatusCode::OK
-            }
-        );
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
         let response = server
             .client
             .post(server.url(&path))

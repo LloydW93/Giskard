@@ -33,7 +33,7 @@ fn project_settings(
     supported: bool,
 ) -> Settings {
     Settings {
-        advertised_maximum: Some(descriptor.maximum_session_context_window()),
+        advertised_maximum: descriptor.advertised_context_window.filter(|v| *v > 0),
         default_window: descriptor.default_session_context_window(),
         selected_window: crate::models::selected_session_context_window(
             descriptor,
@@ -117,7 +117,14 @@ pub(super) async fn update(
         ));
     }
     if let Some(value) = request.context_window {
-        let maximum = descriptor.maximum_session_context_window();
+        let maximum = descriptor
+            .advertised_context_window
+            .filter(|v| *v > 0)
+            .ok_or_else(|| {
+                ApiError::BadRequest(
+                    "The model has not advertised its maximum context window".into(),
+                )
+            })?;
         if value < descriptor.default_session_context_window() || value > maximum {
             return Err(ApiError::BadRequest(format!(
                 "Context limit must be between {} and {} tokens",
