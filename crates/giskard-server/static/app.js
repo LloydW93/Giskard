@@ -11641,6 +11641,7 @@ const goalsQueue = (() => {
   document.body.appendChild(overlay);
   let supported = false, opened = false, snapshot = null, busy = false, loading = false;
   let panelGeneration = 0, readSequence = 0, editingId = null, goalDirty = false, refreshPending = false;
+  let goalFormObjective = "";
   function path(view) { return `/api/projects/${encodeURIComponent(view.projectId)}/threads/${encodeURIComponent(view.threadId)}/goals-queue`; }
   function readOnly() {
     const meta = state.threadId && threadMetaForId(state.threadId);
@@ -11665,7 +11666,8 @@ const goalsQueue = (() => {
   }
   function fillGoal() {
     const goal = snapshot && snapshot.goal;
-    $("goalObjective").value = goal ? goal.objective : "";
+    goalFormObjective = goal ? goal.objective : "";
+    $("goalObjective").value = goalFormObjective;
     $("goalStatus").value = goal ? goal.status : "active";
     $("goalBudget").value = goal && goal.token_budget != null ? goal.token_budget : "";
     goalDirty = false;
@@ -11760,8 +11762,13 @@ const goalsQueue = (() => {
   $("goalForm").onsubmit = event => {
     event.preventDefault();
     const budget = $("goalBudget").value;
-    const command = { action:"set_goal", objective:$("goalObjective").value.trim(), status:$("goalStatus").value };
-    if (!command.objective) return;
+    const objective = $("goalObjective").value.trim();
+    if (!objective) return;
+    const command = { action:"set_goal", status:$("goalStatus").value };
+    // Supplying even the same objective resets accounting on a terminal native goal. Compare
+    // with the displayed form baseline, since a live refresh may change the native objective
+    // while the user is editing only status or budget.
+    if (!snapshot.goal || objective !== goalFormObjective.trim()) command.objective = objective;
     if (budget) { const value = Number(budget); if (!Number.isSafeInteger(value) || value < 1) { status("Token budget must be a positive whole number.", true); return; } command.token_budget = value; }
     mutate(command, () => { goalDirty = false; });
   };
