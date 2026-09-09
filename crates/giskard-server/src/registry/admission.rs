@@ -80,6 +80,7 @@ fn orphan_file(
         mode: TurnMode::Unknown,
         current_model,
         context_window: 0,
+        context_window_override: None,
         model_context_windows: HashMap::new(),
         permission_preset: PermissionPreset::AskFirst,
         model_efforts: HashMap::new(),

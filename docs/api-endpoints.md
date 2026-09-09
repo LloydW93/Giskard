@@ -15,6 +15,7 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/tool-output`,
 `GET /api/projects/{id}/threads/{thread_id}/deletion-impact`,
 `GET /api/projects/{id}/models`,
+`GET/POST /api/projects/{id}/threads/{thread_id}/context-window`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
 `GET /api/projects/{id}/threads/{thread_id}/highlight|raw|image`, `POST
 /api/projects/{id}/threads/{thread_id}/linkify`, `POST
@@ -51,6 +52,20 @@ of model metadata, and passed to each turn. Nonempty selections must match an ad
 and fit in 128 bytes; invalid selections return HTTP 400 or WebSocket `invalid_service_tier`.
 Sending with a tier that was removed from the catalog returns the same structured error.
 Absent/null selects the native thread default; model defaults are descriptive, never inferred.
+
+`GET /api/projects/{id}/threads/{thread_id}/context-window` returns the selected model together
+with its `advertised_maximum`, policy `default_window`, durable `override_window`, resulting
+`selected_window`, known `non_premium_window`, latest runtime `effective_window`, and
+`can_configure`. These values deliberately distinguish the raw session selection from the smaller
+effective window a harness may report after reserving headroom.
+
+`POST` on the same path accepts `{ "model": ModelRef, "context_window": number | null }`. A number
+must be between the policy default and the model's current advertised maximum; `null` resets to the
+default. The model reference is an optimistic concurrency guard and stale selections return 409.
+The preference is durable per primary session, is cleared by a provider/model change, and is
+preserved across effort or service-tier changes. It affects subsequent native launch boundaries
+without interrupting active work. Archived and agent-owned threads cannot change it; a harness
+without context configuration reports `can_configure: false` and rejects updates.
 
 `POST /api/projects/{id}/threads/start` takes `git_strategy`, which decides where the thread's
 working tree comes from: `shared` (the project's own checkout — the default, and what an omitted

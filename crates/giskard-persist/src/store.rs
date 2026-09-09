@@ -98,6 +98,9 @@ pub struct ThreadFile {
     /// is replaced when the harness reports an authoritative runtime value.
     #[serde(default)]
     pub context_window: u32,
+    /// Explicit raw limit for this session's selected provider/model; None uses pricing policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_override: Option<u32>,
     /// Harness-reported effective windows nested by provider and model. These survive reloads and
     /// model switches without making Giskard maintain model-specific built-in metadata.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -1142,6 +1145,17 @@ impl PersistStore {
         };
         let mut after = before.clone();
         f(&mut after);
+        let before_model = before
+            .current_model
+            .as_known()
+            .map(|m| (&m.provider, &m.model));
+        let after_model = after
+            .current_model
+            .as_known()
+            .map(|m| (&m.provider, &m.model));
+        if before_model != after_model {
+            after.context_window_override = None;
+        }
 
         // The store, not mutation closures, owns both ordering fields.
         after.revision = before.revision;
@@ -2390,6 +2404,7 @@ mod tests {
             mode: TurnMode::Known(Mode::Build),
             current_model: TurnModel::Known(test_model()),
             context_window: 128_000,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
@@ -2730,6 +2745,7 @@ mod tests {
             mode: TurnMode::Known(Mode::Build),
             current_model: TurnModel::Known(test_model()),
             context_window: 262_144,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
@@ -2826,6 +2842,7 @@ mod tests {
             mode: TurnMode::Known(Mode::Build),
             current_model: TurnModel::Known(test_model()),
             context_window: 262_144,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
@@ -2881,6 +2898,7 @@ mod tests {
             mode: TurnMode::Known(Mode::Build),
             current_model: TurnModel::Known(test_model()),
             context_window: 262_144,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
@@ -2930,6 +2948,7 @@ mod tests {
                 mode: TurnMode::Known(Mode::Plan),
                 current_model: TurnModel::Known(test_model()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: HashMap::new(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: HashMap::new(),
@@ -3247,6 +3266,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(test_model()),
                     context_window: 0,
+                    context_window_override: None,
                     model_context_windows: HashMap::new(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),
@@ -3581,6 +3601,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(test_model()),
                     context_window: 0,
+                    context_window_override: None,
                     model_context_windows: HashMap::new(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),
@@ -3630,6 +3651,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(test_model()),
                     context_window: 0,
+                    context_window_override: None,
                     model_context_windows: HashMap::new(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),

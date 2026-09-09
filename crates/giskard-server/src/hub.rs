@@ -745,6 +745,7 @@ mod tests {
 
         let state = |revision| ThreadState {
             metadata: ThreadMetadata {
+                context_window_override: None,
                 thread_id,
                 revision,
                 title: format!("revision {revision}"),
@@ -827,6 +828,7 @@ mod tests {
             thread_id,
             Outbound::Metadata(ThreadState {
                 metadata: ThreadMetadata {
+                    context_window_override: None,
                     thread_id,
                     revision: 2,
                     title: "Thread".into(),

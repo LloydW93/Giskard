@@ -594,6 +594,7 @@ impl Gate {
 pub mod caps {
     use giskard_harness::HarnessCapabilities;
     pub const TURNS: HarnessCapabilities = HarnessCapabilities {
+        context_window_configuration: false,
         turn_steering: false,
         live_approvals: true,
         plan_build_modes: true,
@@ -616,6 +617,7 @@ pub mod caps {
         ..TURNS
     };
     pub const RESUMABLE: HarnessCapabilities = HarnessCapabilities {
+        context_window_configuration: false,
         turn_steering: false,
         resumable_threads: true,
         live_approvals: false,
@@ -632,6 +634,7 @@ pub mod caps {
         context_compaction: false,
     };
     pub const RESUMABLE_COMPACTION: HarnessCapabilities = HarnessCapabilities {
+        context_window_configuration: false,
         turn_steering: false,
         resumable_threads: true,
         context_compaction: true,
@@ -648,6 +651,7 @@ pub mod caps {
         mcp_oauth_login: false,
     };
     pub const REPLAY: HarnessCapabilities = HarnessCapabilities {
+        context_window_configuration: false,
         turn_steering: false,
         live_approvals: true,
         plan_build_modes: true,
@@ -700,6 +704,7 @@ mod tests {
 
     fn overrides() -> TurnOverrides {
         TurnOverrides {
+            context_window: None,
             model: Some(model()),
             mode: Mode::Build,
             permission_preset: PermissionPreset::AskFirst,
@@ -833,6 +838,7 @@ mod tests {
         let (updates, _) = thread_update_channel();
         harness
             .open_thread(OpenThreadOptions {
+                context_window: None,
                 project: giskard_core::ids::ProjectId::new(),
                 thread,
                 workspace_root: PathBuf::from("/tmp"),
@@ -856,6 +862,7 @@ mod tests {
         let first = ThreadId::new();
         let second = ThreadId::new();
         let opts = |thread| OpenThreadOptions {
+            context_window: None,
             project: giskard_core::ids::ProjectId::new(),
             thread,
             workspace_root: PathBuf::from("/tmp"),

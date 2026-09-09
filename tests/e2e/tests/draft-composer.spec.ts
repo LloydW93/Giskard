@@ -127,7 +127,7 @@ test.describe("draft composer", () => {
 
     await page.locator("#sendBtn").click();
     const body = (await started).postDataJSON();
-    expect(body.model_ref).toMatchObject({ provider: "replay", model: "replay-model" });
+    expect(body.model_ref).toMatchObject({ provider: "replay", model: "gpt-6-astra" });
     await expect(
       page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
     ).toBeVisible();
@@ -170,7 +170,7 @@ test.describe("draft composer", () => {
     const body = (await started).postDataJSON();
     expect(body.model_ref).toMatchObject({
       provider: "replay",
-      model: "replay-model",
+      model: "gpt-6-astra",
       reasoning_effort: "high",
     });
   });

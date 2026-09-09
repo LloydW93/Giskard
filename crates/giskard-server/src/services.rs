@@ -125,6 +125,7 @@ mod tests {
                         service_tier: None,
                     }),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),

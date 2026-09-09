@@ -3638,6 +3638,12 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
   linkified paths — paired with the **context-window gauge** as a persistent, honest read on
   "how full is this conversation." That gauge + linkified transcript is what makes Giskard
   feel purpose-built rather than a generic chat wrapper.
+- The Context control distinguishes three capacities: the provider-advertised maximum, the raw
+  per-session selection, and the effective runtime window used by the gauge. A session defaults to
+  `min(advertised maximum, known non-premium input threshold)`. A writable primary may persist a
+  larger raw selection up to the advertised maximum; changing provider/model clears it. The server
+  applies it at a safe native start or verified cold-resume boundary and never interrupts active
+  work merely to change the limit.
 - Copy is plain and action-named (§ frontend writing guidance): buttons say exactly what
   happens ("Save plan to project", "Switch to Build", "Interrupt"). Empty states invite
   action ("No projects yet — create one to start."). Thread setting controls use visible labels
@@ -3750,7 +3756,8 @@ their bootstrap establishes a new per-connection baseline. A metadata revision d
 `active_turn`, transcript events, tasks, requests, or notices.
 
 `ThreadMetadata` is the only browser projection of persisted thread detail. It contains the thread
-id, revision, title, mode, current model, effective context window, permission preset, and token
+id, revision, title, mode, current model, effective context window, optional raw session context
+override, permission preset, and token
 aggregates. Native harness ids, per-model caches for unselected models, ownership internals, and Git
 workspace records remain server-side. Every project thread-summary row carries that thread's same
 revision so WebSocket detail and HTTP catalog results can be compared without treating their

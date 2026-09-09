@@ -81,6 +81,7 @@ async fn thread_lifecycle_native_failure_preserves_local_thread() {
                     service_tier: None,
                 }),
                 context_window: 262_144,
+                context_window_override: None,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),

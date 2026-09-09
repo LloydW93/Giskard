@@ -10,6 +10,7 @@ The implementation is based on Codex CLI 0.153.4 and rebased on upstream `252528
 | Audio input | done | WAV/MP3 native audio input, signature/MIME checks, model modality validation, durable descriptors. |
 | Model capabilities | done | Provider-scoped tiers, default tier, input modalities and multi-agent version, including statically configured models. |
 | Service tiers | done | Persistent picker choice, advertised-value validation, native per-turn overrides. |
+| Session context limits | done | Non-premium defaults, per-session raw overrides, verified native cold reload and effective-window reporting. |
 | Rich MCP forms | done | Nested fields/defaults/optional values, JSON editor for complex shapes, complete server-side JSON Schema validation, exact responses/retries. |
 | Dynamic client tools | done | Explicit TOML executor allowlist, native registration, argument schemas, typed results and bounded process/result lifecycles. |
 | Attestation integration | done | Explicit host command provider, conditional negotiation, bounded/redacted service handling. |
@@ -19,6 +20,9 @@ The implementation is based on Codex CLI 0.153.4 and rebased on upstream `252528
 
 The model picker preserves native capability metadata and offers only advertised service tiers.
 “Native default” omits a per-turn override; selecting a tier persists it for subsequent messages.
+The Context card defaults a session to the smaller of its advertised maximum and known
+non-premium threshold, and can save a larger raw limit up to that maximum. The effective gauge may
+be lower after native headroom. Provider/model changes reset the override.
 WAV/MP3 attachments use native audio input when the model permits it. Other audio containers remain
 ordinary file attachments with a visible explanation; they are not relabelled as supported codecs.
 

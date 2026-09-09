@@ -83,6 +83,7 @@ fn thread_file(pid: ProjectId, tid: ThreadId) -> giskard_persist::store::ThreadF
             service_tier: None,
         }),
         context_window: 1,
+        context_window_override: None,
         model_context_windows: std::collections::HashMap::new(),
         permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
         model_efforts: std::collections::HashMap::new(),

@@ -126,7 +126,18 @@ pub fn context_window_with_runtime(
         .and_then(|models| models.get(&model.model))
         .copied()
         .filter(|window| *window > 0)
-        .unwrap_or(descriptor.context_window)
+        .unwrap_or_else(|| descriptor.default_session_context_window())
+}
+
+/// Clamp a session preference to the current advertised maximum; never use runtime usage as max.
+pub fn selected_session_context_window(
+    descriptor: &ModelDescriptor,
+    requested: Option<u32>,
+) -> u32 {
+    let default = descriptor.default_session_context_window();
+    requested
+        .map(|value| value.clamp(default, descriptor.maximum_session_context_window()))
+        .unwrap_or(default)
 }
 
 /// The full static model list offered by the model picker (§8.3): every declared
@@ -200,7 +211,8 @@ pub fn order_for_picker(mut models: Vec<ModelDescriptor>, config: &Config) -> Ve
 ///   provider that advertised its own levels keeps those, and only a model nothing else has
 ///   described takes the harness catalog's.
 ///
-/// The harness never supplies context window (Codex's `model/list` omits it).
+/// A harness may preserve a remotely advertised maximum alongside its native catalog metadata;
+/// the provider's direct discovery result still wins when both supplied one.
 pub fn apply_harness_metadata(
     mut base: Vec<ModelDescriptor>,
     harness_models: &[ModelDescriptor],
@@ -230,6 +242,9 @@ pub fn apply_harness_metadata(
         // below, both would claim it and the picker would start on whichever came first.
         if h.provider.is_empty() || h.provider == d.provider {
             d.is_default = h.is_default;
+            if d.advertised_context_window.is_none() {
+                d.advertised_context_window = h.advertised_context_window;
+            }
             d.service_tiers = h.service_tiers.clone();
             d.default_service_tier = h.default_service_tier.clone();
             d.input_modalities = h.input_modalities.clone();
@@ -1411,6 +1426,69 @@ model_listing = true
         assert_eq!(descriptor.context_window, 100_000);
         assert_eq!(descriptor.maximum_session_context_window(), 1_050_000);
         assert_eq!(descriptor.default_session_context_window(), 272_000);
+    }
+
+    #[test]
+    fn harness_maximum_fills_only_the_matching_providers_missing_capacity() {
+        let config: Config = toml::from_str(
+            "[providers.openai]\n[[providers.openai.models]]\nid = \"gpt-6-astra\"\ncontext_window = 272000\n[providers.proxy]\n[[providers.proxy.models]]\nid = \"gpt-6-astra\"\ncontext_window = 272000\n",
+        )
+        .unwrap();
+        let harness_capacity = {
+            let mut model = ModelDescriptor::conservative("openai", "gpt-6-astra");
+            model.advertised_context_window = Some(1_000_000);
+            model
+        };
+        let filled = apply_harness_metadata(
+            list_descriptors(&config),
+            std::slice::from_ref(&harness_capacity),
+            &config,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            filled
+                .iter()
+                .find(|model| model.provider == "openai")
+                .and_then(|model| model.advertised_context_window),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            filled
+                .iter()
+                .find(|model| model.provider == "proxy")
+                .and_then(|model| model.advertised_context_window),
+            None
+        );
+
+        let mut base = list_descriptors(&config);
+        base.iter_mut()
+            .find(|model| model.provider == "openai")
+            .unwrap()
+            .advertised_context_window = Some(922_000);
+        let out = apply_harness_metadata(base, &[harness_capacity], &config, &HashSet::new());
+        let capacity = |provider: &str| {
+            out.iter()
+                .find(|model| model.provider == provider)
+                .and_then(|model| model.advertised_context_window)
+        };
+        assert_eq!(capacity("openai"), Some(922_000));
+        assert_eq!(capacity("proxy"), None);
+    }
+
+    #[test]
+    fn saved_session_limit_is_clamped_when_remote_capacity_shrinks() {
+        let mut descriptor = ModelDescriptor::conservative("provider", "gpt-6-astra");
+        descriptor.advertised_context_window = Some(1_000_000);
+        assert_eq!(
+            selected_session_context_window(&descriptor, Some(900_000)),
+            900_000
+        );
+
+        descriptor.advertised_context_window = Some(512_000);
+        assert_eq!(
+            selected_session_context_window(&descriptor, Some(900_000)),
+            512_000
+        );
     }
 
     /// The shape a provider serves a harness that identified itself: the metadata Giskard otherwise

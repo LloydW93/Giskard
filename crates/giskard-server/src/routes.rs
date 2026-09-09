@@ -1,3 +1,4 @@
+mod context_window;
 mod goals_queue;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -78,6 +79,7 @@ pub(crate) async fn http_request_context_middleware(
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
+        .route("/api/projects/{id}/threads/{thread_id}/context-window", get(context_window::read).post(context_window::update))
         .route("/api/projects/{id}/threads/{thread_id}/goals-queue", get(goals_queue::read).post(goals_queue::change))
         .route("/api/projects", get(list_projects).post(create_project))
         .route(
@@ -930,7 +932,8 @@ async fn start_thread_with_message(
         kind: ThreadKind::Primary,
         mode: TurnMode::Known(req.mode),
         current_model: TurnModel::Known(model_ref.clone()),
-        context_window: model_descriptor.context_window,
+        context_window: model_descriptor.default_session_context_window(),
+        context_window_override: None,
         model_context_windows: std::collections::HashMap::new(),
         permission_preset: req.permission_preset,
         model_efforts: std::collections::HashMap::new(),
@@ -959,6 +962,7 @@ async fn start_thread_with_message(
     };
 
     let overrides = TurnOverrides {
+        context_window: Some(model_descriptor.default_session_context_window()),
         model: Some(model_ref.clone()),
         mode: req.mode,
         permission_preset: req.permission_preset,
@@ -2274,6 +2278,7 @@ mod tests {
                 service_tier: None,
             }),
             context_window: 128_000,
+            context_window_override: None,
             model_context_windows: Default::default(),
             permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
             model_efforts: Default::default(),

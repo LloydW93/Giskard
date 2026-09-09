@@ -851,8 +851,35 @@ impl HarnessRegistry {
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
         let restore_permit = self.shared.services.runtime.restoration_permit(&authority);
 
+        let app_config = self
+            .shared
+            .services
+            .store
+            .load_config()
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        let catalog = self.project_model_catalog(config).await.unwrap_or_default();
+        let descriptor =
+            crate::models::resolve_catalog_descriptor(&catalog, &app_config, &initial_model);
+        let existing = self
+            .shared
+            .services
+            .store
+            .load_thread(config.id, thread)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        let requested = existing
+            .as_ref()
+            .filter(|tf| {
+                tf.current_model.as_known().is_some_and(|m| {
+                    m.provider == initial_model.provider && m.model == initial_model.model
+                })
+            })
+            .and_then(|tf| tf.context_window_override);
+        let limit = crate::models::selected_session_context_window(&descriptor, requested);
         let handle = harness
             .open_thread(OpenThreadOptions {
+                context_window: Some(limit),
                 project: config.id,
                 thread,
                 workspace_root: workspace_root.into(),
@@ -2521,6 +2548,7 @@ mod tests {
                 service_tier: None,
             }),
             context_window: 128_000,
+            context_window_override: None,
             model_context_windows: Default::default(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: Default::default(),
@@ -3292,6 +3320,7 @@ mod tests {
                     let (updates, _) = giskard_harness::thread_update_channel();
                     let _ = h
                         .open_thread(giskard_harness::OpenThreadOptions {
+                            context_window: None,
                             project: project_id,
                             thread: ThreadId::new(),
                             workspace_root: "/tmp/test".into(),
@@ -3495,6 +3524,7 @@ mod tests {
                             service_tier: None,
                         }),
                         context_window: 128_000,
+                        context_window_override: None,
                         model_context_windows: Default::default(),
                         permission_preset: PermissionPreset::AskFirst,
                         model_efforts: Default::default(),

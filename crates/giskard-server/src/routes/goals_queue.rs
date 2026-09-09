@@ -87,7 +87,14 @@ async fn execute(
         if model.provider != native.provider {
             return Err(ApiError::Conflict("Selected provider differs from the loaded native thread; create or reopen a thread on that provider".into()));
         }
+        let app_config = state.store.load_config().await?;
+        let catalog = project_model_catalog(state, &config, &app_config).await;
+        let descriptor = crate::models::resolve_catalog_descriptor(&catalog, &app_config, &model);
         Some(giskard_core::turn::TurnOverrides {
+            context_window: Some(crate::models::selected_session_context_window(
+                &descriptor,
+                thread.context_window_override,
+            )),
             model: Some(model),
             mode,
             permission_preset: thread.permission_preset,

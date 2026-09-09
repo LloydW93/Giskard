@@ -778,6 +778,10 @@ async fn handle_client_msg(
             //    Codex on whatever model was set at `thread/start`.
             //  - the thread's persisted permission preset (§9).
             let overrides = TurnOverrides {
+                context_window: Some(crate::models::selected_session_context_window(
+                    &descriptor,
+                    tf.context_window_override,
+                )),
                 model: Some(effective_model.clone()),
                 mode: effective_mode,
                 permission_preset: tf.permission_preset,

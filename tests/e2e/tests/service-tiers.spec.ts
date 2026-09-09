@@ -59,6 +59,6 @@ test("changing models clears the prior tier and hides unsupported controls", asy
   await page.locator("#modelSel").selectOption("replay/without-tiers");
   await expect(page.locator("#serviceTierControl")).toBeHidden();
   await expect(page.locator("#modelPickerBtn")).not.toContainText("Priority");
-  await page.locator("#modelSel").selectOption("replay/replay-model");
+  await page.locator("#modelSel").selectOption("replay/gpt-6-astra");
   await expect(page.locator("#serviceTierSel")).toHaveValue("");
 });

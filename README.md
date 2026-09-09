@@ -149,15 +149,22 @@ Then open **http://127.0.0.1:8787**, log in, and:
    [Sub-agent threads](docs/subagents.md) for spawning protocols, read-only event ownership,
    prompts, approvals, and deletion behavior.
 
-Model metadata retains the remote maximum separately from configured context defaults.
-[Context capacity and pricing policy](docs/context-window-policy.md) documents the input-capacity
-bounds and exact model identifiers with known non-premium thresholds.
+Model metadata retains the remote maximum separately from configured context defaults. A new
+session starts at the smaller of that maximum and the model's known non-premium input threshold
+(272,000 tokens for Astra). The top-right **Context** card can save a larger raw limit for that
+session, up to the current advertised maximum, or reset it to the default. The preference applies
+at the next safe native launch boundary; running work is never interrupted to change it. Selecting
+a different provider or model clears the preference. [Session context limits](docs/session-context-limits.md)
+documents the complete lifecycle, while [Context capacity and pricing policy](docs/context-window-policy.md)
+documents the source bounds and exact model identifiers with known non-premium thresholds.
 
 The header context value is a context-window indicator, not a billing total. It updates during a
 turn from Codex's latest reported input tokens, which are the best available proxy for "how full is
 the active conversation?" Clicking **Context** opens a card with both the current context footprint
-and cumulative input/output/total tokens. Those cumulative totals can legitimately exceed the
-model's context window over a long thread.
+and cumulative input/output/total tokens, plus the session limit editor when the harness supports
+it. The selected limit is a raw budgeting and compaction input; the effective gauge can be lower
+because Codex reserves headroom. Cumulative totals can legitimately exceed the model's context
+window over a long thread.
 
 > **Common gotcha:** with `secure_cookies = true` over plain HTTP, the browser drops the session
 > cookie — login appears to succeed but nothing loads. Use `false` for local HTTP; set `true` only

@@ -3,7 +3,7 @@ import { login, SCRIPTED_REPLY, selectedThread } from "./helpers";
 
 const endpoint = /\/api\/projects\/[^/]+\/threads\/[^/]+\/context-window$/;
 const fixture = {
-  model: { provider:"replay", model:"replay-model", reasoning_effort:"high" },
+  model: { provider:"replay", model:"gpt-6-astra", reasoning_effort:"high" },
   advertised_maximum:1000000, default_window:272000, selected_window:272000,
   override_window:null as number | null, non_premium_window:272000, effective_window:258400,
   can_configure:true,

@@ -160,6 +160,7 @@ impl ScriptedHarness {
         }
         Ok(Self {
             capabilities: HarnessCapabilities {
+                context_window_configuration: true,
                 live_approvals: true,
                 plan_build_modes: true,
                 per_turn_model: true,
@@ -476,6 +477,7 @@ impl AgentHarness for ScriptedHarness {
                 thread,
                 UserInput::text(text),
                 TurnOverrides {
+                    context_window: None,
                     model: None,
                     mode: giskard_core::turn::Mode::Build,
                     permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
@@ -487,8 +489,9 @@ impl AgentHarness for ScriptedHarness {
     }
 
     async fn list_models(&self) -> Result<Vec<giskard_core::model::ModelDescriptor>, HarnessError> {
-        let mut model =
-            giskard_core::model::ModelDescriptor::conservative("replay", "replay-model");
+        let mut model = giskard_core::model::ModelDescriptor::conservative("replay", "gpt-6-astra");
+        model.context_window = 272_000;
+        model.advertised_context_window = Some(1_000_000);
         model.service_tiers = Some(vec![
             giskard_core::model::ModelServiceTier {
                 id: "default".into(),
@@ -1149,11 +1152,11 @@ password_hash = "{password_hash}"
 kind = "replay"
 
 [providers.replay]
-model_listing = false
+model_listing = true
   [[providers.replay.models]]
-  id = "replay-model"
+  id = "gpt-6-astra"
   display_name = "Replay Model"
-  context_window = 131072
+  context_window = 272000
   supports_reasoning_effort = true
 "#
     );
