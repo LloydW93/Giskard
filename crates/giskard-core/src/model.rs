@@ -48,6 +48,9 @@ pub struct ModelDescriptor {
     pub model: String,
     /// Token limit; drives the context gauge (§10.3).
     pub context_window: u32,
+    /// Provider-advertised request capacity, independent of configured or runtime defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertised_context_window: Option<u32>,
     /// Whether the effort selector is shown (§8.5).
     pub supports_reasoning_effort: bool,
     /// The exact reasoning-effort levels this model advertises (e.g. from Codex's `model/list`),
@@ -88,7 +91,41 @@ impl ModelRef {
     }
 }
 
+/// Last verified against official OpenAI model/pricing documentation on 2026-09-09.
+/// Exact identifiers avoid assigning a family's prices to mini/nano or unknown future variants.
+/// See docs/context-window-policy.md for sources. Values are decimal tokens, not kibit units.
+pub fn non_premium_context_window(model_id: &str) -> Option<u32> {
+    match model_id {
+        "gpt-6-astra"
+        | "gpt-5.6-sol"
+        | "gpt-5.6-terra"
+        | "gpt-5.6-luna"
+        | "gpt-5.5"
+        | "gpt-5.5-2026-04-23"
+        | "gpt-5.5-pro"
+        | "gpt-5.5-pro-2026-04-23"
+        | "gpt-5.4"
+        | "gpt-5.4-2026-03-05"
+        | "gpt-5.4-pro"
+        | "gpt-5.4-pro-2026-03-05" => Some(272_000),
+        _ => None,
+    }
+}
+
 impl ModelDescriptor {
+    /// A catalog maximum is never replaced by token-usage reports from a limited session.
+    pub fn maximum_session_context_window(&self) -> u32 {
+        self.advertised_context_window
+            .filter(|value| *value > 0)
+            .or(Some(self.context_window).filter(|value| *value > 0))
+            .unwrap_or(Self::CONSERVATIVE_CONTEXT_WINDOW)
+    }
+
+    pub fn default_session_context_window(&self) -> u32 {
+        let maximum = self.maximum_session_context_window();
+        non_premium_context_window(&self.model).map_or(maximum, |threshold| maximum.min(threshold))
+    }
+
     /// Conservative context window used when the model's size is unknown (spec §8.3 step 3).
     pub const CONSERVATIVE_CONTEXT_WINDOW: u32 = 128_000;
 
@@ -99,6 +136,7 @@ impl ModelDescriptor {
             provider: provider.into(),
             model: model.into(),
             context_window: Self::CONSERVATIVE_CONTEXT_WINDOW,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: None,
@@ -114,6 +152,60 @@ impl ModelDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_defaults_respect_exact_pricing_boundaries_and_remote_capacity() {
+        for model in [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5.5-2026-04-23",
+            "gpt-5.5-pro-2026-04-23",
+            "gpt-5.4",
+            "gpt-5.4-pro",
+            "gpt-5.4-2026-03-05",
+            "gpt-5.4-pro-2026-03-05",
+        ] {
+            let mut descriptor = ModelDescriptor::conservative("provider", model);
+            for maximum in [100_000, 271_999, 272_000, 272_001, 1_050_000] {
+                descriptor.advertised_context_window = Some(maximum);
+                assert_eq!(descriptor.maximum_session_context_window(), maximum);
+                assert_eq!(
+                    descriptor.default_session_context_window(),
+                    maximum.min(272_000),
+                    "{model}"
+                );
+            }
+        }
+        for model in [
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.6-cyber",
+            "gpt-6-astra-custom",
+            "other/gpt-6-astra",
+            "unknown",
+        ] {
+            assert_eq!(non_premium_context_window(model), None);
+            let mut descriptor = ModelDescriptor::conservative("provider", model);
+            descriptor.advertised_context_window = Some(1_050_000);
+            assert_eq!(descriptor.default_session_context_window(), 1_050_000);
+        }
+    }
+
+    #[test]
+    fn session_capacity_falls_back_without_inventing_remote_metadata() {
+        let mut descriptor = ModelDescriptor::conservative("provider", "gpt-6-astra");
+        assert_eq!(descriptor.advertised_context_window, None);
+        assert_eq!(descriptor.default_session_context_window(), 128_000);
+        descriptor.context_window = 400_000;
+        assert_eq!(descriptor.default_session_context_window(), 272_000);
+        descriptor.advertised_context_window = Some(0);
+        descriptor.context_window = 0;
+        assert_eq!(descriptor.maximum_session_context_window(), 128_000);
+    }
 
     #[test]
     fn model_ref_key() {
@@ -178,6 +270,7 @@ mod tests {
         )
         .unwrap();
         assert!(missing.reasoning_efforts.is_empty());
+        assert_eq!(missing.advertised_context_window, None);
 
         // An explicit empty array also deserializes to empty, and is omitted on serialize.
         let empty: ModelDescriptor = serde_json::from_str(
@@ -194,6 +287,7 @@ mod tests {
         // A populated list serializes and round-trips.
         let mut d = ModelDescriptor::conservative("p", "m");
         d.reasoning_efforts = vec!["low".into(), "high".into()];
+        d.advertised_context_window = Some(1_050_000);
         let json = serde_json::to_value(&d).unwrap();
         assert_eq!(
             json["reasoning_efforts"],
@@ -201,6 +295,7 @@ mod tests {
         );
         let back: ModelDescriptor = serde_json::from_value(json).unwrap();
         assert_eq!(back.reasoning_efforts, vec!["low", "high"]);
+        assert_eq!(back.advertised_context_window, Some(1_050_000));
 
         // The conservative constructor initializes the field empty.
         assert!(

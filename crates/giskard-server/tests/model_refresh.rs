@@ -992,6 +992,7 @@ async fn a_stock_harness_catalog_fills_the_picker_on_its_own() {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             context_window: giskard_core::model::ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["low".into(), "high".into()],
             display_name: Some("GPT-5.5".into()),

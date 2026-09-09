@@ -39,6 +39,7 @@ fn catalog_model(model: &str, name: &str, efforts: &[&str]) -> ModelDescriptor {
         provider: String::new(), // Codex `model/list` is provider-agnostic.
         model: model.into(),
         context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+        advertised_context_window: None,
         supports_reasoning_effort: !efforts.is_empty(),
         reasoning_efforts: efforts.iter().map(|e| (*e).to_string()).collect(),
         display_name: Some(name.into()),

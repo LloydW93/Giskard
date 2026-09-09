@@ -149,6 +149,10 @@ Then open **http://127.0.0.1:8787**, log in, and:
    [Sub-agent threads](docs/subagents.md) for spawning protocols, read-only event ownership,
    prompts, approvals, and deletion behavior.
 
+Model metadata retains the remote maximum separately from configured context defaults.
+[Context capacity and pricing policy](docs/context-window-policy.md) documents the input-capacity
+bounds and exact model identifiers with known non-premium thresholds.
+
 The header context value is a context-window indicator, not a billing total. It updates during a
 turn from Codex's latest reported input tokens, which are the best available proxy for "how full is
 the active conversation?" Clicking **Context** opens a card with both the current context footprint

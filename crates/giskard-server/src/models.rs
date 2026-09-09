@@ -25,6 +25,7 @@ fn from_config(config: &Config, provider: &str, model: &str) -> Option<ModelDesc
         provider: provider.to_string(),
         model: model.to_string(),
         context_window: m.context_window,
+        advertised_context_window: None,
         supports_reasoning_effort: m.supports_reasoning_effort,
         reasoning_efforts: Vec::new(),
         display_name: m.display_name.clone(),
@@ -57,6 +58,7 @@ pub fn resolve_catalog_descriptor(
     // Config owns its explicitly configurable fields, but does not declare native capabilities.
     // Preserve those from the composed catalog even when config supplies this model's window.
     if let Some(native) = catalog_entry {
+        descriptor.advertised_context_window = native.advertised_context_window;
         descriptor.service_tiers = native.service_tiers.clone();
         descriptor.default_service_tier = native.default_service_tier.clone();
         descriptor.input_modalities = native.input_modalities.clone();
@@ -137,6 +139,7 @@ pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
                 provider: id.clone(),
                 model: m.id.clone(),
                 context_window: m.context_window,
+                advertised_context_window: None,
                 supports_reasoning_effort: m.supports_reasoning_effort,
                 reasoning_efforts: Vec::new(),
                 display_name: m.display_name.clone(),
@@ -319,9 +322,19 @@ fn model_entries(
     }
 }
 
+/// Input limits bound request capacity even when the full input/output window is larger.
+fn bounded_capacity(window: Option<u32>, input: Option<u32>) -> Option<u32> {
+    match (window, input) {
+        (Some(window), Some(input)) => Some(window.min(input)),
+        (window, input) => window.or(input),
+    }
+}
+
 #[derive(Deserialize)]
 struct OpenAiModel {
     id: String,
+    #[serde(default)]
+    max_context_window: Option<serde_json::Value>,
     #[serde(default)]
     context_window: Option<serde_json::Value>,
     #[serde(default)]
@@ -350,6 +363,8 @@ struct HarnessCatalogModel {
     /// (`ModelInfo::resolved_context_window`), so an entry carrying only the maximum still has one.
     #[serde(default)]
     max_context_window: Option<serde_json::Value>,
+    #[serde(default)]
+    max_input_tokens: Option<serde_json::Value>,
     /// `None` is "said nothing about efforts"; `Some([])` is "said there are none". The two must
     /// stay apart: the harness-catalog overlay fills the first and must not touch the second.
     ///
@@ -474,6 +489,7 @@ pub struct DiscoveredModel {
     pub provider: String,
     pub model: String,
     pub context_window: Option<u32>,
+    pub advertised_context_window: Option<u32>,
     pub display_name: Option<String>,
     /// `None` is "the endpoint said nothing about efforts"; `Some([])` is "it said there are none".
     /// Collapsing the two would let the harness-catalog overlay hand a model effort levels its own
@@ -497,6 +513,14 @@ pub fn merge_models(
         .map(|d| (d.provider.clone(), d.model.clone()))
         .collect();
     for discovered in dynamic {
+        if let Some(existing) = base.iter_mut().find(|descriptor| {
+            descriptor.provider == discovered.provider && descriptor.model == discovered.model
+        }) && let Some(maximum) = discovered
+            .advertised_context_window
+            .filter(|value| *value > 0)
+        {
+            existing.advertised_context_window = Some(maximum);
+        }
         if seen.insert((discovered.provider.clone(), discovered.model.clone())) {
             let mut descriptor = ModelDescriptor::conservative(
                 discovered.provider.clone(),
@@ -505,6 +529,7 @@ pub fn merge_models(
             if let Some(context_window) = discovered.context_window.filter(|window| *window > 0) {
                 descriptor.context_window = context_window;
             }
+            descriptor.advertised_context_window = discovered.advertised_context_window;
             descriptor.display_name = discovered.display_name.clone();
             // An advertised effort list is also the answer to whether the selector is shown at all,
             // so the two move together — including when the answer is "none", which is why this
@@ -629,6 +654,8 @@ fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel
     // Insertion-ordered so the picker keeps the order the provider listed, and so a catalog entry
     // refines an OpenAI one in place rather than jumping to the end.
     let mut out: IndexMap<String, (DiscoveredModel, bool)> = IndexMap::new();
+    let mut input_limits: HashMap<String, u32> = HashMap::new();
+    let mut explicit_maxima: HashMap<String, u32> = HashMap::new();
 
     for entry in openai.unwrap_or_default() {
         let model: OpenAiModel = match serde_json::from_value(entry) {
@@ -645,16 +672,32 @@ fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel
         };
         let context_window = parse_discovered_capacity(model.context_window.as_ref());
         let max_input_tokens = parse_discovered_capacity(model.max_input_tokens.as_ref());
-        let invalid = context_window.is_err() || max_input_tokens.is_err();
+        let max_context_window = parse_discovered_capacity(model.max_context_window.as_ref());
+        let invalid =
+            context_window.is_err() || max_input_tokens.is_err() || max_context_window.is_err();
+        let advertised_context_window = bounded_capacity(
+            max_context_window
+                .ok()
+                .flatten()
+                .or(context_window.ok().flatten()),
+            max_input_tokens.ok().flatten(),
+        );
         if invalid {
             warn!(
                 provider = %provider,
                 model = %model.id,
                 context_window = ?model.context_window,
+                max_context_window = ?model.max_context_window,
                 max_input_tokens = ?model.max_input_tokens,
                 action = "discover_models",
                 "ignoring invalid model capacity metadata"
             );
+        }
+        if let Ok(Some(maximum)) = max_context_window {
+            explicit_maxima.insert(model.id.clone(), maximum);
+        }
+        if let Ok(Some(limit)) = max_input_tokens {
+            input_limits.insert(model.id.clone(), limit);
         }
         out.insert(
             model.id.clone(),
@@ -662,6 +705,7 @@ fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel
                 DiscoveredModel {
                     provider: provider.to_string(),
                     model: model.id,
+                    advertised_context_window,
                     context_window: context_window
                         .ok()
                         .flatten()
@@ -693,13 +737,32 @@ fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel
             out.shift_remove(&model.slug);
             continue;
         }
-        let (context_window, invalid_window) = model.context_window();
+        let (context_window, mut invalid_window) = model.context_window();
+        let maximum = parse_discovered_capacity(model.max_context_window.as_ref());
+        let input_maximum = parse_discovered_capacity(model.max_input_tokens.as_ref());
+        invalid_window |= maximum.is_err() || input_maximum.is_err();
+        let advertised_context_window = bounded_capacity(
+            maximum
+                .ok()
+                .flatten()
+                .or_else(|| explicit_maxima.get(&model.slug).copied())
+                .or(context_window)
+                .or_else(|| {
+                    out.get(&model.slug)
+                        .and_then(|entry| entry.0.advertised_context_window)
+                }),
+            input_maximum
+                .ok()
+                .flatten()
+                .or_else(|| input_limits.get(&model.slug).copied()),
+        );
         if invalid_window {
             warn!(
                 provider = %provider,
                 model = %model.slug,
                 context_window = ?model.context_window,
                 max_context_window = ?model.max_context_window,
+                max_input_tokens = ?model.max_input_tokens,
                 action = "discover_models",
                 "ignoring invalid model capacity metadata"
             );
@@ -716,6 +779,9 @@ fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel
         });
         // Field by field: the catalog wins where it says something, and leaves what it does not
         // mention as the OpenAI entry had it.
+        if let Some(maximum) = advertised_context_window {
+            entry.0.advertised_context_window = Some(maximum);
+        }
         if let Some(window) = context_window {
             entry.0.context_window = Some(window);
         }
@@ -1219,6 +1285,7 @@ model_listing = true
             provider: model.provider.clone(),
             model: model.model.clone(),
             context_window: 64_000,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["high".into()],
             display_name: Some("Stale".into()),
@@ -1303,6 +1370,47 @@ model_listing = true
                 "{unusable:?} should not reach the query"
             );
         }
+    }
+
+    #[test]
+    fn advertised_capacity_preserves_larger_maximum_and_respects_input_bound() {
+        for body in [
+            br#"{"models":[{"slug":"gpt-6-astra","context_window":272000,"max_context_window":1050000,"max_input_tokens":922000}]}"#.as_slice(),
+            br#"{"data":[{"id":"gpt-6-astra","context_window":272000,"max_context_window":1050000,"max_input_tokens":922000}]}"#.as_slice(),
+            br#"{"data":[{"id":"gpt-6-astra","max_input_tokens":922000}],"models":[{"slug":"gpt-6-astra","context_window":272000,"max_context_window":1050000}]}"#.as_slice(),
+            br#"{"data":[{"id":"gpt-6-astra","max_input_tokens":922000,"max_context_window":1050000}],"models":[{"slug":"gpt-6-astra","context_window":272000}]}"#.as_slice(),
+            br#"{"data":[{"id":"gpt-6-astra","context_window":272000,"max_input_tokens":922000,"max_context_window":1050000}],"models":[{"slug":"gpt-6-astra","display_name":"Astra"}]}"#.as_slice(),
+        ] {
+            let parsed = parse_models_body(body, "provider").unwrap();
+            assert_eq!(parsed[0].0.context_window, Some(272_000));
+            assert_eq!(parsed[0].0.advertised_context_window, Some(922_000));
+            assert!(!parsed[0].1);
+        }
+    }
+
+    #[test]
+    fn malformed_maximum_keeps_valid_remote_capacity_and_warns() {
+        let parsed = parse_models_body(br#"{"models":[{"slug":"gpt-6-astra","context_window":400000,"max_context_window":"invalid"}]}"#, "provider").unwrap();
+        assert_eq!(parsed[0].0.advertised_context_window, Some(400_000));
+        assert!(parsed[0].1);
+    }
+
+    #[test]
+    fn configured_window_does_not_erase_remote_maximum() {
+        let config: Config = toml::from_str("[providers.provider]\n[[providers.provider.models]]\nid = \"gpt-6-astra\"\ncontext_window = 100000\n").unwrap();
+        let parsed = parse_models_body(br#"{"models":[{"slug":"gpt-6-astra","context_window":272000,"max_context_window":1050000}]}"#, "provider").unwrap();
+        let dynamic: Vec<_> = parsed.into_iter().map(|(model, _)| model).collect();
+        let merged = merge_models(list_descriptors(&config), &dynamic);
+        let model = ModelRef {
+            provider: "provider".into(),
+            model: "gpt-6-astra".into(),
+            reasoning_effort: None,
+            service_tier: None,
+        };
+        let descriptor = resolve_catalog_descriptor(&merged, &config, &model);
+        assert_eq!(descriptor.context_window, 100_000);
+        assert_eq!(descriptor.maximum_session_context_window(), 1_050_000);
+        assert_eq!(descriptor.default_session_context_window(), 272_000);
     }
 
     /// The shape a provider serves a harness that identified itself: the metadata Giskard otherwise
@@ -1676,6 +1784,7 @@ model_listing = true
             provider: "opencodex".into(),
             model: "gpt-5.5".into(),
             context_window: Some(262_144),
+            advertised_context_window: Some(262_144),
             display_name: Some("GPT-5.5".into()),
             reasoning_efforts: Some(vec!["low".into(), "high".into()]),
             priority: None,
@@ -1745,6 +1854,7 @@ model_listing = true
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 context_window: 262_144,
+                advertised_context_window: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
                 display_name: None,
@@ -1758,6 +1868,7 @@ model_listing = true
                 provider: "cloudflare-litellm".into(),
                 model: "@cf/z-ai/glm-4.7".into(),
                 context_window: 131_072,
+                advertised_context_window: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
                 display_name: Some("GLM-4.7".into()),
@@ -1774,6 +1885,7 @@ model_listing = true
                 provider: String::new(),
                 model: "gpt-5.5".into(),
                 context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+                advertised_context_window: None,
                 supports_reasoning_effort: true,
                 reasoning_efforts: vec!["low".into(), "high".into()],
                 display_name: Some("GPT-5.5".into()),
@@ -1787,6 +1899,7 @@ model_listing = true
                 provider: String::new(),
                 model: "@cf/z-ai/glm-4.7".into(),
                 context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+                advertised_context_window: None,
                 supports_reasoning_effort: true,
                 reasoning_efforts: vec!["medium".into()],
                 display_name: Some("GLM 4.7".into()),
@@ -1835,6 +1948,7 @@ model_listing = true
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             context_window: 128_000,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: None,
@@ -1873,6 +1987,7 @@ model_listing = true
             provider: "openai".into(),
             model: "from-catalog".into(),
             context_window: 128_000,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: None,
@@ -1909,6 +2024,7 @@ model_listing = true
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             context_window: 128_000,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: Some("GPT-5.5".into()),
@@ -1984,6 +2100,7 @@ model_listing = true
             provider: "opencodex".into(),
             model: "gpt-5.5".into(),
             context_window: 262_144,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["low".into(), "high".into(), "xhigh".into()],
             display_name: Some("GPT-5.5".into()),
@@ -1998,6 +2115,7 @@ model_listing = true
             provider: String::new(),
             model: "gpt-5.5".into(),
             context_window: 0,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["low".into(), "medium".into()],
             display_name: Some("Other".into()),
@@ -2034,6 +2152,7 @@ model_listing = true
             provider: "opencodex".into(),
             model: "gpt-5.5".into(),
             context_window: 262_144,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: None,
@@ -2047,6 +2166,7 @@ model_listing = true
             provider: String::new(),
             model: "gpt-5.5".into(),
             context_window: 0,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["low".into(), "medium".into()],
             display_name: None,
@@ -2078,6 +2198,7 @@ model_listing = true
             provider: "litellm".into(),
             model: "gpt-5.5".into(),
             context_window: 128_000,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: None,
@@ -2091,6 +2212,7 @@ model_listing = true
             provider: String::new(),
             model: "gpt-5.5".into(),
             context_window: 0,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["low".into(), "medium".into()],
             display_name: Some("GPT-5.5".into()),
@@ -2131,6 +2253,7 @@ model_listing = true
             provider: "p".into(),
             model: model.into(),
             context_window: 1000,
+            advertised_context_window: None,
             supports_reasoning_effort: supports,
             reasoning_efforts: Vec::new(),
             display_name: name.map(str::to_string),
@@ -2145,6 +2268,7 @@ model_listing = true
             provider: String::new(),
             model: model.into(),
             context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            advertised_context_window: None,
             supports_reasoning_effort: !efforts.is_empty(),
             reasoning_efforts: efforts.iter().map(|e| (*e).to_string()).collect(),
             display_name: Some(name.into()),
@@ -2220,6 +2344,7 @@ model_listing = true
             provider: String::new(),
             model: "gpt-5.5".into(),
             context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: Some("GPT-5.5".into()),
@@ -2237,6 +2362,7 @@ model_listing = true
             provider: String::new(),
             model: "gpt-5.5".into(),
             context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: Vec::new(),
             display_name: Some("GPT-5.5".into()),
@@ -2337,6 +2463,7 @@ model_listing = true
             provider: String::new(),
             model: "shared-model".into(),
             context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["focused".into()],
             display_name: Some("Shared Model".into()),

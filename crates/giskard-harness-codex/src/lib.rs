@@ -2714,6 +2714,7 @@ fn map_model(model: NativeCatalogModel, provider: &str) -> ModelDescriptor {
         provider: provider.to_string(),
         model: id,
         context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+        advertised_context_window: None,
         supports_reasoning_effort: !reasoning_efforts.is_empty(),
         reasoning_efforts,
         display_name,
