@@ -113,7 +113,8 @@ declared opens read-only naming it, while its siblings on declared harnesses ope
 missing declaration degrades that thread, not the project.
 
 `GET /api/projects/{id}/threads/{thread_id}/context-window` returns the selected model together
-with its `advertised_maximum`, policy `default_window`, durable `override_window`, resulting
+with its `advertised_maximum` (catalog metadata or retained natural gauge capacity), policy
+`default_window`, durable `override_window`, resulting
 `selected_window`, known `non_premium_window`, latest runtime `effective_window`, and
 `can_configure`. These values deliberately distinguish the raw session selection from the smaller
 effective window a harness may report after reserving headroom.
