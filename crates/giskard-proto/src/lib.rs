@@ -123,6 +123,8 @@ pub struct ThreadMetadata {
     pub mode: giskard_core::turn::TurnMode,
     pub current_model: giskard_core::turn::TurnModel,
     pub context_window: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_override: Option<u32>,
     pub permission_preset: PermissionPreset,
     pub tokens: TokenLedger,
 }
@@ -1326,6 +1328,7 @@ mod tests {
         let tid = ThreadId::new();
         let msg = ServerMessage::ThreadState(ThreadState {
             metadata: ThreadMetadata {
+                context_window_override: None,
                 thread_id: tid,
                 revision: 7,
                 title: "Typed state".into(),
@@ -1366,6 +1369,7 @@ mod tests {
         let msg = ServerMessage::ThreadMetadataResult {
             request_id: "metadata-7".into(),
             metadata: ThreadMetadata {
+                context_window_override: None,
                 thread_id: tid,
                 revision: 7,
                 title: "Committed state".into(),

@@ -196,6 +196,25 @@ impl CodexMapper {
             .is_some_and(|route| route.thread_id == thread.thread)
     }
 
+    pub(super) fn applied_context_window(
+        &self,
+        handle: &giskard_harness::ThreadHandle,
+    ) -> Option<u32> {
+        self.routes
+            .route_for_native(&handle.harness_thread_id)
+            .filter(|route| route.thread_id == handle.thread)
+            .and_then(|route| route.context_window)
+    }
+
+    pub(super) fn set_context_window(
+        &mut self,
+        handle: &giskard_harness::ThreadHandle,
+        value: Option<u32>,
+    ) -> Result<(), HarnessError> {
+        self.routes
+            .set_context_window(&handle.harness_thread_id, handle.thread, value)
+    }
+
     pub fn clear_active_turn(&mut self, thread: ThreadId) {
         self.active_turns.remove(&thread);
         self.turns.retain(|key, _| key.thread_id != thread);

@@ -121,6 +121,17 @@ pub fn context_window_with_runtime(
         .unwrap_or(descriptor.context_window)
 }
 
+/// Clamp a session preference to the current advertised maximum; never use runtime usage as max.
+pub fn selected_session_context_window(
+    descriptor: &ModelDescriptor,
+    requested: Option<u32>,
+) -> u32 {
+    let default = descriptor.default_session_context_window();
+    requested
+        .map(|value| value.clamp(default, descriptor.maximum_session_context_window()))
+        .unwrap_or(default)
+}
+
 /// The full static model list offered by the model picker (§8.3): every declared
 /// `[[providers.<id>.models]]` entry, resolved to a `ModelDescriptor`.
 pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {

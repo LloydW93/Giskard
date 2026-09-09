@@ -284,6 +284,7 @@ mod tests {
                 reasoning_effort: None,
             }),
             context_window: 1,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),

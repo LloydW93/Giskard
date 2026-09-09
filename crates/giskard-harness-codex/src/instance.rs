@@ -259,6 +259,17 @@ where
                 overrides,
                 response,
             } => {
+                if let Err(error) = context_policy::ensure(
+                    &mut self.client,
+                    &mut self.mapper,
+                    &thread,
+                    &overrides,
+                )
+                .await
+                {
+                    let _ = response.send(Err(error));
+                    return;
+                }
                 match handle_start_turn(
                     &mut self.client,
                     &mut self.mapper,
@@ -306,6 +317,7 @@ where
                 resume_id,
                 &cwd,
                 &opts.initial_model,
+                opts.context_window,
             )
             .await
             {
@@ -323,13 +335,27 @@ where
                         opts.project,
                     )
                     .with_thread_id(thread_id);
-                    start_thread(&mut self.client, context, &cwd, &opts.initial_model).await?
+                    start_thread(
+                        &mut self.client,
+                        context,
+                        &cwd,
+                        &opts.initial_model,
+                        opts.context_window,
+                    )
+                    .await?
                 }
             }
         } else {
             let context = CodexOperationContext::for_project("thread_start", opts.project)
                 .with_thread_id(thread_id);
-            start_thread(&mut self.client, context, &cwd, &opts.initial_model).await?
+            start_thread(
+                &mut self.client,
+                context,
+                &cwd,
+                &opts.initial_model,
+                opts.context_window,
+            )
+            .await?
         };
 
         // B4: bind the (possibly re-established) native id to the durable ThreadId. A failed
@@ -342,6 +368,14 @@ where
             )?;
         } else {
             self.claim_thread_route(opened.harness_thread_id.clone(), thread_id)?;
+        }
+        if let Some(window) = opts.context_window {
+            let handle = ThreadHandle::opened(
+                thread_id,
+                opened.harness_thread_id.clone(),
+                opts.workspace_root.clone(),
+            );
+            self.mapper.set_context_window(&handle, Some(window))?;
         }
 
         let _ = broadcast_event(&self.senders, thread_id, || AgentEvent::ThreadOpened {

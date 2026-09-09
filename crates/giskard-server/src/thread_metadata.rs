@@ -174,6 +174,7 @@ impl ThreadMetadataService {
             mode: thread.mode,
             current_model: thread.current_model.clone(),
             context_window: thread.context_window,
+            context_window_override: thread.context_window_override,
             permission_preset: thread.permission_preset,
             tokens: thread.tokens.clone(),
         }
@@ -245,6 +246,7 @@ struct ThreadDetailProjection {
     mode: TurnMode,
     current_model: TurnModel,
     context_window: u32,
+    context_window_override: Option<u32>,
     permission_preset: giskard_core::turn::PermissionPreset,
     tokens: giskard_core::token::TokenLedger,
 }
@@ -256,6 +258,7 @@ impl From<&ThreadFile> for ThreadDetailProjection {
             mode: thread.mode,
             current_model: thread.current_model.clone(),
             context_window: thread.context_window,
+            context_window_override: thread.context_window_override,
             permission_preset: thread.permission_preset,
             tokens: thread.tokens.clone(),
         }
@@ -328,6 +331,7 @@ mod tests {
                 reasoning_effort: None,
             }),
             context_window: 128_000,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),

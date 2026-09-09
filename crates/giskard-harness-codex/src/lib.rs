@@ -7,6 +7,7 @@
 //! See the crate README for Codex-native identifier scopes, item and process
 //! lifecycles, background-command ownership, and termination routing.
 
+mod context_policy;
 mod goals_queue;
 mod instance;
 #[cfg(test)]
@@ -1015,6 +1016,10 @@ async fn configured_workspace_write_roots(
 
 #[async_trait]
 impl AgentHarness for CodexHarness {
+    fn context_window_configuration_supported(&self) -> bool {
+        true
+    }
+
     fn capabilities(&self) -> HarnessCapabilities {
         self.capabilities
     }
@@ -1632,6 +1637,7 @@ async fn resume_thread(
     resume_id: &str,
     cwd: &str,
     model: &giskard_core::model::ModelRef,
+    context_window: Option<u32>,
 ) -> Result<OpenedNativeThread, HarnessError> {
     let params = codex_codes::ThreadResumeParams {
         thread_id: resume_id.to_owned(),
@@ -1644,6 +1650,11 @@ async fn resume_thread(
         developer_instructions: Some(giskard_harness::GISKARD_FRONTEND_INSTRUCTIONS.to_owned()),
         ..Default::default()
     };
+    let mut params =
+        serde_json::to_value(params).map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    if let Some(window) = context_window {
+        params["config"] = context_policy::config(window)?;
+    }
     let resp: codex_codes::ThreadResumeResponse = codex_request(
         client,
         context,
@@ -1684,6 +1695,7 @@ async fn start_thread(
     context: CodexOperationContext<'_>,
     cwd: &str,
     initial_model: &giskard_core::model::ModelRef,
+    context_window: Option<u32>,
 ) -> Result<OpenedNativeThread, HarnessError> {
     let params = codex_codes::ThreadStartParams {
         cwd: Some(cwd.to_owned()),
@@ -1693,6 +1705,11 @@ async fn start_thread(
         developer_instructions: Some(giskard_harness::GISKARD_FRONTEND_INSTRUCTIONS.to_owned()),
         ..Default::default()
     };
+    let mut params =
+        serde_json::to_value(params).map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    if let Some(window) = context_window {
+        params["config"] = context_policy::config(window)?;
+    }
     let resp: codex_codes::ThreadStartResponse = codex_request(
         client,
         context,
