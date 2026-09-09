@@ -112,6 +112,7 @@ pub(crate) fn descriptors(snapshot: &CatalogSnapshot) -> Vec<ModelDescriptor> {
                 provider: ANTHROPIC_PROVIDER_ID.into(),
                 model: entry.value.clone(),
                 context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+                advertised_context_window: None,
                 supports_reasoning_effort: entry.supports_effort,
                 reasoning_efforts: entry.supported_effort_levels.clone(),
                 display_name: entry.display_name.clone(),

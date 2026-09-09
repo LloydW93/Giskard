@@ -176,6 +176,10 @@ Then open **http://127.0.0.1:8787**, log in, and:
    the background: the row stays in the sidebar with a progress bar until they are all gone, and
    can be cancelled or, if it stops early, retried.
 
+Model metadata retains the remote maximum separately from configured context defaults.
+[Context capacity and pricing policy](docs/context-window-policy.md) documents the input-capacity
+bounds and exact model identifiers with known non-premium thresholds.
+
 The header context value is a context-window indicator, not a billing total. It updates during a
 turn from Codex's latest reported input tokens, which are the best available proxy for "how full is
 the active conversation?" Clicking **Context** opens a card with both the current context footprint
