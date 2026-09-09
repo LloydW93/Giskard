@@ -253,7 +253,7 @@ mod tests {
     async fn refresh_rejects_account_switches_without_echoing_identity_or_tokens() {
         let providers = NativeServiceProviders {
             external_auth_command: shell(
-                "printf '%s' '{\"accessToken\":\"secret\",\"chatgptAccountId\":\"other-account\"}'",
+                "cat >/dev/null; printf '%s' '{\"accessToken\":\"secret\",\"chatgptAccountId\":\"other-account\"}'",
             ),
             ..Default::default()
         };
