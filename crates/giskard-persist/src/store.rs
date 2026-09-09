@@ -206,13 +206,15 @@ impl ThreadMutation {
 }
 
 impl ThreadFile {
-    /// Record a harness-reported window for an exact model and update the visible capacity only
-    /// when that provider/model is selected. Reasoning effort is not part of capacity identity.
+    /// Retain the largest capacity observed for an exact model and update the current gauge.
+    /// Later reports may reflect a smaller session override, so they must not replace that capacity.
     pub fn record_model_context_window(&mut self, model: &ModelRef, context_window: u32) {
         self.model_context_windows
             .entry(model.provider.clone())
             .or_default()
-            .insert(model.model.clone(), context_window);
+            .entry(model.model.clone())
+            .and_modify(|window| *window = (*window).max(context_window))
+            .or_insert(context_window);
         if self.current_model.as_known().is_some_and(|current| {
             current.provider == model.provider && current.model == model.model
         }) {
@@ -2640,6 +2642,21 @@ mod tests {
         thread.record_model_context_window(&other, 64_000);
         assert_eq!(thread.context_window, 128_000);
         assert_eq!(thread.model_context_windows["proxy"]["other"], 64_000);
+    }
+
+    #[test]
+    fn a_reduced_session_report_does_not_erase_the_natural_model_capacity() {
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let mut thread = test_thread(project_id, thread_id);
+        let model = thread.current_model.as_known().unwrap().clone();
+        thread.record_model_context_window(&model, 828_400);
+        thread.record_model_context_window(&model, 258_400);
+        assert_eq!(thread.context_window, 258_400);
+        assert_eq!(
+            thread.model_context_windows[&model.provider][&model.model],
+            828_400
+        );
     }
 
     #[tokio::test]

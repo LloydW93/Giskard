@@ -32,11 +32,20 @@ fn project_settings(
     descriptor: &ModelDescriptor,
     supported: bool,
 ) -> Settings {
+    let mut descriptor = descriptor.clone();
+    if let Some(runtime) =
+        crate::models::runtime_model_context_window(&model, &thread.model_context_windows)
+    {
+        descriptor.advertised_context_window = descriptor
+            .advertised_context_window
+            .filter(|window| *window > 0)
+            .map_or(Some(runtime), |advertised| Some(advertised.min(runtime)));
+    }
     Settings {
         advertised_maximum: descriptor.advertised_context_window.filter(|v| *v > 0),
         default_window: descriptor.default_session_context_window(),
         selected_window: crate::models::selected_session_context_window(
-            descriptor,
+            &descriptor,
             thread.context_window_override,
         ),
         override_window: thread.context_window_override,
@@ -117,19 +126,24 @@ pub(super) async fn update(
         ));
     }
     if let Some(value) = request.context_window {
-        let maximum = descriptor
-            .advertised_context_window
-            .filter(|v| *v > 0)
-            .ok_or_else(|| {
-                ApiError::BadRequest(
-                    "The model has not advertised its maximum context window".into(),
-                )
-            })?;
-        if value < descriptor.default_session_context_window() || value > maximum {
+        let runtime =
+            crate::models::runtime_model_context_window(&model, &thread.model_context_windows);
+        let maximum = match (
+            descriptor.advertised_context_window.filter(|v| *v > 0),
+            runtime,
+        ) {
+            (Some(advertised), Some(runtime)) => Some(advertised.min(runtime)),
+            (advertised, runtime) => advertised.or(runtime),
+        }
+        .ok_or_else(|| {
+            ApiError::BadRequest("The model has not advertised its maximum context window".into())
+        })?;
+        let default = non_premium_context_window(&model.model)
+            .map_or(maximum, |threshold| maximum.min(threshold));
+        if value < default || value > maximum {
             return Err(ApiError::BadRequest(format!(
                 "Context limit must be between {} and {} tokens",
-                descriptor.default_session_context_window(),
-                maximum
+                default, maximum
             )));
         }
     }

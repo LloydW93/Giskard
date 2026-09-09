@@ -129,6 +129,39 @@ pub fn context_window_with_runtime(
         .unwrap_or_else(|| descriptor.default_session_context_window())
 }
 
+pub fn runtime_model_context_window(
+    model: &ModelRef,
+    runtime_windows: &HashMap<String, HashMap<String, u32>>,
+) -> Option<u32> {
+    runtime_windows
+        .get(&model.provider)
+        .and_then(|models| models.get(&model.model))
+        .copied()
+        .filter(|window| *window > 0)
+}
+
+/// Resolve a raw session limit only after either catalog metadata or the natural runtime gauge
+/// has established this model's capacity. This avoids manufacturing a 128K override that then
+/// hides the provider's real limit.
+pub fn configured_session_context_window(
+    model: &ModelRef,
+    descriptor: &ModelDescriptor,
+    runtime_windows: &HashMap<String, HashMap<String, u32>>,
+    requested: Option<u32>,
+) -> Option<u32> {
+    let mut resolved = descriptor.clone();
+    if let Some(runtime) = runtime_model_context_window(model, runtime_windows) {
+        resolved.advertised_context_window = resolved
+            .advertised_context_window
+            .filter(|window| *window > 0)
+            .map_or(Some(runtime), |advertised| Some(advertised.min(runtime)));
+    }
+    resolved
+        .advertised_context_window
+        .filter(|window| *window > 0)
+        .map(|_| selected_session_context_window(&resolved, requested))
+}
+
 /// Clamp a session preference to the current advertised maximum; never use runtime usage as max.
 pub fn selected_session_context_window(
     descriptor: &ModelDescriptor,

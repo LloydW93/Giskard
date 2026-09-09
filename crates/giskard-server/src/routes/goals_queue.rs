@@ -91,10 +91,12 @@ async fn execute(
         let catalog = project_model_catalog(state, &config, &app_config).await;
         let descriptor = crate::models::resolve_catalog_descriptor(&catalog, &app_config, &model);
         Some(giskard_core::turn::TurnOverrides {
-            context_window: Some(crate::models::selected_session_context_window(
+            context_window: crate::models::configured_session_context_window(
+                &model,
                 &descriptor,
+                &thread.model_context_windows,
                 thread.context_window_override,
-            )),
+            ),
             model: Some(model),
             mode,
             permission_preset: thread.permission_preset,

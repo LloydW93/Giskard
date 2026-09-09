@@ -2431,8 +2431,9 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "context_window": 258400,              // CACHE ONLY (C4): effective window for current_model;
                                          //   starts from descriptor metadata and is replaced by a
                                          //   harness-reported runtime value when available.
-  "model_context_windows": {             // C8: harness-reported effective windows retained by
-    "openai": { "gpt-5.5": 258400 }      //   exact provider/model for reloads and model switches.
+  "model_context_windows": {             // C8: first natural effective capacity retained by
+    "openai": { "gpt-5.5": 258400 }      //   exact provider/model for reloads and model switches;
+                                         //   reduced overrides do not replace it.
   },
   "permission_preset": "ask_first",        // permission preset (§9)
   "archived": false,                     // hidden from the active thread group when true
@@ -2470,8 +2471,9 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
 > The thread `tokens` object carries both the aggregate (`total`) **and** the per-model
 > breakdown (`by_model`), matching §10.2. A thread accumulates a distinct `by_model[provider][model]`
 > entry whenever its model changes mid-thread (§8.4). `context_window` is a cache (C4): catalog or
-> config metadata supplies its initial value, while `model_context_windows` retains authoritative
-> effective values reported by the harness for exact provider/model pairs.
+> config metadata supplies its initial value, while `model_context_windows` retains the natural
+> effective capacity first reported by the harness for exact provider/model pairs. The scalar
+> `context_window` continues to track the latest effective gauge denominator.
 
 ```jsonc
 // projects/<id>/tokens.json  and  tokens-global.json

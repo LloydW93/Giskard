@@ -876,10 +876,24 @@ impl HarnessRegistry {
                 })
             })
             .and_then(|tf| tf.context_window_override);
-        let limit = crate::models::selected_session_context_window(&descriptor, requested);
+        let limit = existing
+            .as_ref()
+            .and_then(|tf| {
+                crate::models::configured_session_context_window(
+                    &initial_model,
+                    &descriptor,
+                    &tf.model_context_windows,
+                    requested,
+                )
+            })
+            .or_else(|| {
+                descriptor
+                    .advertised_context_window
+                    .map(|_| crate::models::selected_session_context_window(&descriptor, requested))
+            });
         let handle = harness
             .open_thread(OpenThreadOptions {
-                context_window: Some(limit),
+                context_window: limit,
                 project: config.id,
                 thread,
                 workspace_root: workspace_root.into(),

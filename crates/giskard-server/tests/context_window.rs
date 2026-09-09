@@ -124,9 +124,18 @@ async fn defaults_and_overrides_reach_native_boundaries_and_stay_session_scoped(
         "/api/projects/{}/threads/{second}/context-window",
         project.id
     );
+    server
+        .state
+        .store
+        .update_thread(project.id, first, |tf| {
+            let selected = tf.current_model.as_known().unwrap().clone();
+            tf.record_model_context_window(&selected, 800_000);
+        })
+        .await
+        .unwrap();
     let settings = get(&server, &path).await;
     assert_eq!(settings["default_window"], 272_000);
-    assert_eq!(settings["advertised_maximum"], 1_000_000);
+    assert_eq!(settings["advertised_maximum"], 800_000);
     assert!(settings["override_window"].is_null());
     let response = server
         .client
@@ -185,7 +194,7 @@ async fn defaults_and_overrides_reach_native_boundaries_and_stay_session_scoped(
     .await
     .unwrap();
     assert!(launched.lock().unwrap().contains(&(first, Some(512_000))));
-    for invalid in [0, 271_999, 1_000_001] {
+    for invalid in [0, 271_999, 800_001] {
         let response = server
             .client
             .post(server.url(&path))
@@ -240,9 +249,10 @@ async fn defaults_and_overrides_reach_native_boundaries_and_stay_session_scoped(
 #[tokio::test]
 async fn small_remote_limits_win_and_unknown_maxima_cannot_be_overridden() {
     for maximum in [Some(128_000), None] {
+        let opened = Arc::new(Mutex::new(Vec::new()));
         let harness = FakeHarness::new(ContextScript {
             maximum,
-            opened: Default::default(),
+            opened: opened.clone(),
             launched: Default::default(),
         });
         let server = TestServer::builder(giskard_testenv::fake::factory(harness))
@@ -250,6 +260,7 @@ async fn small_remote_limits_win_and_unknown_maxima_cannot_be_overridden() {
             .await;
         let project = server.create_project("limited context").await;
         let thread = start(&server, project.id).await;
+        assert_eq!(*opened.lock().unwrap(), vec![maximum]);
         let path = format!(
             "/api/projects/{}/threads/{thread}/context-window",
             project.id
@@ -265,6 +276,31 @@ async fn small_remote_limits_win_and_unknown_maxima_cannot_be_overridden() {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        if maximum.is_none() {
+            server
+                .state
+                .store
+                .update_thread(project.id, thread, |tf| {
+                    let selected = tf.current_model.as_known().unwrap().clone();
+                    tf.record_model_context_window(&selected, 828_400);
+                    tf.record_model_context_window(&selected, 258_400);
+                })
+                .await
+                .unwrap();
+            let settings = get(&server, &path).await;
+            assert_eq!(settings["advertised_maximum"], 828_400);
+            assert_eq!(settings["default_window"], 272_000);
+            assert_eq!(settings["effective_window"], 258_400);
+            let response = server
+                .client
+                .post(server.url(&path))
+                .header("cookie", &server.cookie)
+                .json(&json!({"model":model(),"context_window":512000}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
         let response = server
             .client
             .post(server.url(&path))
