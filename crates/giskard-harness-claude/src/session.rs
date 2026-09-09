@@ -371,6 +371,7 @@ fn output_kind(output: &MapperOutput) -> &'static str {
 pub(crate) fn event_thread(event: &AgentEvent) -> ThreadId {
     match event {
         AgentEvent::ThreadOpened { thread, .. }
+        | AgentEvent::GoalsQueueChanged { thread }
         | AgentEvent::TurnStarted { thread, .. }
         | AgentEvent::TurnUsageUpdated { thread, .. }
         | AgentEvent::ItemStarted { thread, .. }

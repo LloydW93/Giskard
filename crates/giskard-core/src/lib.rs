@@ -41,3 +41,5 @@ pub use thread::ThreadKind;
 pub use token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
 pub use turn::{Mode, PermissionPreset, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 pub use user_input::{AttachmentKind, UserAttachment, UserInput};
+
+pub mod goals_queue;

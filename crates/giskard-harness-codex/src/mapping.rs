@@ -190,6 +190,12 @@ impl CodexMapper {
         self.active_turns.get(&thread).map(NativeTurnId::as_str)
     }
 
+    pub fn has_thread_route(&self, thread: &giskard_harness::ThreadHandle) -> bool {
+        self.routes
+            .route_for_native(&thread.harness_thread_id)
+            .is_some_and(|route| route.thread_id == thread.thread)
+    }
+
     pub fn clear_active_turn(&mut self, thread: ThreadId) {
         self.active_turns.remove(&thread);
         self.turns.retain(|key, _| key.thread_id != thread);
@@ -737,6 +743,16 @@ impl CodexMapper {
                     request_id,
                 })
             }
+
+            Notification::ThreadGoalUpdated(n) => Some(AgentEvent::GoalsQueueChanged {
+                thread: self.resolve_thread(&n.thread_id, fallback_thread)?,
+            }),
+            Notification::ThreadGoalCleared(n) => Some(AgentEvent::GoalsQueueChanged {
+                thread: self.resolve_thread(&n.thread_id, fallback_thread)?,
+            }),
+            Notification::ThreadQueueChanged(n) => Some(AgentEvent::GoalsQueueChanged {
+                thread: self.resolve_thread(&n.thread_id, fallback_thread)?,
+            }),
 
             // Codex advisories are non-fatal — surface them as notices (warnings), not hard errors,
             // so they don't fail the turn or the pending message.

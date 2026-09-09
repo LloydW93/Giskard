@@ -739,6 +739,20 @@ pub trait AgentHarness: Send + Sync {
         )))
     }
 
+    fn goals_queue_supported(&self) -> bool {
+        false
+    }
+
+    async fn goals_queue(
+        &self,
+        _thread: &ThreadHandle,
+        _command: giskard_core::goals_queue::GoalsQueueCommand,
+    ) -> Result<giskard_core::goals_queue::GoalsQueueSnapshot, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "goals and queue controls are not supported".into(),
+        ))
+    }
+
     /// Interrupt the active turn of a thread.
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
 
