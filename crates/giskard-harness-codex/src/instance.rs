@@ -743,8 +743,17 @@ where
                 } else {
                     Ok(())
                 };
+                // Stopping autonomous work must remain possible while its pending context
+                // preference cannot yet be applied. Keep ordinary launch settings handling;
+                // only defer the context reload for explicitly inactive goal statuses.
+                let stops_goal = matches!(
+                    &command,
+                    giskard_core::goals_queue::GoalsQueueCommand::SetGoal { status: Some(status), .. }
+                        if *status != giskard_core::goals_queue::GoalStatus::Active
+                );
                 let guard = match guard {
-                    Ok(()) if command.requires_settings() => match settings.as_ref() {
+                    Ok(()) if command.requires_settings() && !stops_goal => match settings.as_ref()
+                    {
                         Some(settings) => {
                             context_policy::ensure(
                                 &mut self.client,

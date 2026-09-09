@@ -3043,6 +3043,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct FakeCodexState {
+        goal_status: Option<String>,
         goals_queue_failure: Option<String>,
         settings_update_failure: Option<String>,
         thread_counter: usize,
@@ -3236,13 +3237,25 @@ mod tests {
                     "thread/goal/get" => {
                         if let Some(message) = &state.goals_queue_failure {
                             Err(HarnessError::Protocol(message.clone()))
+                        } else if let Some(status) = &state.goal_status {
+                            Ok(
+                                json!({"goal":{"threadId":params["threadId"],"objective":"test goal","status":status,"tokenBudget":null,
+                                "tokensUsed":0,"timeUsedSeconds":0,"createdAt":0,"updatedAt":0}}),
+                            )
                         } else {
                             Ok(json!({"goal":null}))
                         }
                     }
                     "thread/queue/list" => Ok(json!({"data":[],"nextCursor":null})),
-                    "thread/goal/set"
-                    | "thread/goal/clear"
+                    "thread/goal/set" => {
+                        if state.goal_status.is_some()
+                            && let Some(status) = params["status"].as_str()
+                        {
+                            state.goal_status = Some(status.to_owned());
+                        }
+                        Ok(json!({}))
+                    }
+                    "thread/goal/clear"
                     | "thread/queue/add"
                     | "thread/queue/update"
                     | "thread/queue/delete"
@@ -3886,6 +3899,82 @@ mod tests {
                 .iter()
                 .any(|request| request.method == "thread/unsubscribe")
         );
+    }
+
+    #[tokio::test]
+    async fn inactive_goal_statuses_bypass_pending_context_reload_but_resume_does_not() {
+        use giskard_core::goals_queue::{GoalStatus, GoalsQueueCommand};
+        for status in [
+            GoalStatus::Paused,
+            GoalStatus::Blocked,
+            GoalStatus::UsageLimited,
+            GoalStatus::BudgetLimited,
+            GoalStatus::Complete,
+        ] {
+            let (harness, controller) = spawn_fake_harness();
+            let thread = harness
+                .open_thread(open_opts(ThreadId::new(), None))
+                .await
+                .unwrap();
+            controller.state.lock().await.goal_status = Some("active".into());
+            let mut settings = build_turn_overrides();
+            settings.context_window = Some(272_000);
+            harness
+                .goals_queue(
+                    &thread,
+                    GoalsQueueCommand::SetGoal {
+                        objective: None,
+                        status: Some(status),
+                        token_budget: None,
+                    },
+                    Some(settings.clone()),
+                )
+                .await
+                .unwrap();
+            let calls = controller.requests().await;
+            let settings_index = calls
+                .iter()
+                .position(|request| request.method == "thread/settings/update")
+                .unwrap();
+            let goal_index = calls
+                .iter()
+                .position(|request| request.method == "thread/goal/set")
+                .unwrap();
+            assert!(
+                settings_index < goal_index,
+                "ordinary settings handling remains intact"
+            );
+            assert!(
+                !calls.iter().any(|request| request.method == "thread/read"
+                    || request.method == "thread/unsubscribe")
+            );
+            for status in [Some(GoalStatus::Active), None] {
+                assert!(
+                    harness
+                        .goals_queue(
+                            &thread,
+                            GoalsQueueCommand::SetGoal {
+                                objective: None,
+                                status,
+                                token_budget: None,
+                            },
+                            Some(settings.clone())
+                        )
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(
+                controller
+                    .requests()
+                    .await
+                    .iter()
+                    .filter(|request| request.method == "thread/goal/set")
+                    .count(),
+                1,
+                "reactivation must not bypass native context verification"
+            );
+        }
     }
 
     #[tokio::test]

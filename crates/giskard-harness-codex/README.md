@@ -852,7 +852,11 @@ are visible and prevent launch. It never restarts the project process, replaces 
 writes global Codex configuration. Models without an advertised alternate effort cannot verify a
 changed limit this way and receive an explicit error; a new session can take the desired limit at
 creation. Active work keeps its current configuration until a later admitted launch can apply the
-saved preference. Pause active native goals and empty native queues before changing their limit.
+saved preference. Pause active native goals and empty native queues before changing their limit. Explicitly setting
+a goal to Paused, Blocked, UsageLimited, BudgetLimited, or Complete bypasses context reload, so a
+pending limit cannot prevent stopping autonomous work. Ordinary model/permission settings still
+apply; activating a goal or updating it without an explicit inactive status still requires context
+verification.
 
 The configured raw window is distinct from Codex's usable runtime window. Codex applies its model
 headroom percentage, clamps to the model maximum, and caps auto-compaction at 90% of the raw
