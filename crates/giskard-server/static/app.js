@@ -10761,9 +10761,9 @@ function renderContextWindowEditor() {
   const readOnly = state.threadReadOnly || managedThreadReadOnly();
   const knownMaximum = Number.isSafeInteger(config.advertised_maximum) && config.advertised_maximum > 0;
   const configurable = config.can_configure && knownMaximum && !readOnly;
-  const explanation = readOnly ? "This thread is read-only." : !knownMaximum ?
-    "The provider has not advertised a maximum; custom limits are unavailable." :
-    !config.can_configure ? "This provider does not support session context limits." : "";
+  const explanation = readOnly ? "This thread is read-only." : !config.can_configure ?
+    "Session context limits are unavailable for this thread." : !knownMaximum ?
+    "No configurable maximum is available for this model." : "";
   const custom = config.override_window !== null && config.override_window !== undefined;
   host.insertAdjacentHTML("beforeend", `
     <div class="context-limit-controls">
@@ -10776,8 +10776,7 @@ function renderContextWindowEditor() {
       <input id="contextWindowValue" type="number" inputmode="numeric" step="1" min="${Number(config.default_window)}" max="${Number(config.advertised_maximum || config.default_window)}" value="${Number(config.selected_window)}" ${configurable && custom ? "" : "disabled"}>
       <button id="contextWindowSave" class="btn" type="button" ${configurable ? "" : "disabled"}>Save limit</button>
     </div>
-    <div class="muted context-limit-note">Advertised maximum: ${knownMaximum ? Number(config.advertised_maximum).toLocaleString() + " tokens" : "unknown"}. ${escapeHtml(explanation)}</div>
-    <div class="muted context-limit-note">Saved limits apply before the next turn; the current turn is unchanged. The usage gauge shows the effective window, which may reserve headroom.</div>
+    <div class="muted context-limit-note" ${explanation ? "" : "hidden"}>${escapeHtml(explanation)}</div>
     <div id="contextWindowPremium" class="context-limit-warning" hidden></div>
     <div id="contextWindowStatus" class="context-limit-note" role="status"></div>`);
   const update = () => {
@@ -10785,11 +10784,9 @@ function renderContextWindowEditor() {
     const value = $("contextWindowMode").value === "default" ? config.default_window : Number($("contextWindowValue").value);
     const warning = $("contextWindowPremium");
     const above = config.non_premium_window && value > config.non_premium_window;
-    warning.hidden = !config.non_premium_window;
+    warning.hidden = !above;
     warning.textContent = above ?
-      `Above ${Number(config.non_premium_window).toLocaleString()} input tokens, premium long-context rates can apply to the full request.` :
-      `The default targets the standard-rate input range (up to ${Number(config.non_premium_window || 0).toLocaleString()} tokens).`;
-    if (config.non_premium_window) warning.textContent += " This is not a price guarantee: tool results can expand a request.";
+      `Above ${Number(config.non_premium_window).toLocaleString()} tokens, long-context rates apply to the full request.` : "";
   };
   $("contextWindowMode").onchange = update;
   $("contextWindowValue").oninput = update;

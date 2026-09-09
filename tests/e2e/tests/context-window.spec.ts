@@ -44,8 +44,7 @@ test("context edits survive usage updates without another catalog request", asyn
   await expect(input).toBeFocused();
   await expect(input).toHaveValue("500000");
   await expect(page.locator("#usageCurrentValues")).toHaveText("12.3k / 258.4k");
-  await expect(page.locator("#contextWindowPremium")).toContainText("premium long-context rates");
-  await expect(page.locator("#contextWindowPremium")).toContainText("not a price guarantee");
+  await expect(page.locator("#contextWindowPremium")).toContainText("long-context rates");
   expect(reads).toBe(1);
   await page.locator("#contextWindowSave").click();
   await expect(page.locator("#contextWindowStatus")).toContainText("Saved for the next turn");
@@ -88,7 +87,7 @@ test("unknown maximum and read-only sessions cannot edit limits", async ({ page 
   await createThread(page);
   await openMenu(page);
   await expect(page.locator("#contextWindowSave")).toBeDisabled();
-  await expect(page.locator("#contextWindowSettings")).toContainText("has not advertised a maximum");
+  await expect(page.locator("#contextWindowSettings")).toContainText("Session context limits are unavailable");
   await page.locator("#usageClose").click();
   config = { ...fixture, can_configure:false };
   // Exercise the browser's read-only guard even if a stale response says it is configurable.

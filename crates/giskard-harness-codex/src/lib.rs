@@ -2641,6 +2641,10 @@ struct NativeCatalogModel {
     input_modalities: Option<Vec<String>>,
     #[serde(default)]
     multi_agent_version: Option<String>,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    max_context_window: Option<u64>,
 }
 
 /// List the models Codex advertises over the app-server `model/list` RPC, mapped to Giskard
@@ -2653,9 +2657,9 @@ struct NativeCatalogModel {
 /// built-in providers carry no `base_url` to discover against, with nothing in the picker at all.
 ///
 /// So the catalog is attributed to the provider Codex itself routes to, read from the same
-/// `config/read` that supplies the provider table. Codex omits the context window from this RPC,
-/// so descriptors still use the conservative default; these entries size no gauge until the
-/// harness reports a real window at turn time.
+/// `config/read` that supplies the provider table. Current Codex versions include the normal
+/// session window and the largest configurable window. Older versions may omit both, leaving the
+/// conservative default until another catalog source or runtime usage supplies a capacity.
 async fn handle_list_models(
     client: &mut dyn CodexTransport,
     cwd: String,
@@ -2696,7 +2700,7 @@ async fn handle_list_models(
 
 /// Map a Codex `model/list` entry to a Giskard [`ModelDescriptor`] under `provider`. See
 /// [`handle_list_models`] for where that provider comes from — the entry itself names none — and
-/// why the context window is conservative.
+/// how its context capacity is mapped.
 fn map_model(model: NativeCatalogModel, provider: &str) -> ModelDescriptor {
     // `model` is the wire slug used in a ModelRef; `id` is the preset id. Prefer the slug, but fall
     // back to the id if an older/edge payload leaves it empty.
@@ -2722,11 +2726,20 @@ fn map_model(model: NativeCatalogModel, provider: &str) -> ModelDescriptor {
     if reasoning_efforts.is_empty() && default_reasoning_effort != "none" {
         reasoning_efforts.push(default_reasoning_effort);
     }
+    let context_window = model
+        .context_window
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0);
+    let advertised_context_window = model
+        .max_context_window
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .or(context_window);
     ModelDescriptor {
         provider: provider.to_string(),
         model: id,
-        context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
-        advertised_context_window: None,
+        context_window: context_window.unwrap_or(ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW),
+        advertised_context_window,
         supports_reasoning_effort: !reasoning_efforts.is_empty(),
         reasoning_efforts,
         display_name,
@@ -3414,7 +3427,9 @@ mod tests {
                                     { "reasoningEffort": "high", "description": "" }
                                 ],
                                 "defaultReasoningEffort": "medium",
-                                "isDefault": true
+                                "isDefault": true,
+                                "contextWindow": 272000,
+                                "maxContextWindow": 872000
                             },
                             {
                                 "id": "gpt-5.5-mini",
@@ -3424,7 +3439,8 @@ mod tests {
                                 "hidden": false,
                                 "supportedReasoningEfforts": [],
                                 "defaultReasoningEffort": "medium",
-                                "isDefault": false
+                                "isDefault": false,
+                                "contextWindow": 128000
                             },
                             {
                                 "id": "internal-secret",
@@ -5241,11 +5257,8 @@ mod tests {
         // Codex routes to — `openai` here, the built-in default, since this config sets no
         // `model_provider`. Without that a stock setup has nothing to put in the picker.
         assert_eq!(flagship.provider, "openai");
-        // The context window is still absent from this RPC.
-        assert_eq!(
-            flagship.context_window,
-            ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW
-        );
+        assert_eq!(flagship.context_window, 272_000);
+        assert_eq!(flagship.advertised_context_window, Some(872_000));
 
         let mini = &models[1];
         assert_eq!(mini.model, "gpt-5.5-mini");
@@ -5255,6 +5268,8 @@ mod tests {
             "a non-none default is the sole effort when alternatives are empty"
         );
         assert_eq!(mini.reasoning_efforts, vec!["medium"]);
+        assert_eq!(mini.context_window, 128_000);
+        assert_eq!(mini.advertised_context_window, Some(128_000));
 
         assert!(
             controller
