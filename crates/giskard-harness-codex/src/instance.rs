@@ -658,6 +658,46 @@ where
                 .await;
                 let _ = response.send(result);
             }
+            ControlCommand::GoalsQueue {
+                thread,
+                command,
+                response,
+            } => {
+                let guard = if !command.is_read() && !self.mapper.has_thread_route(&thread) {
+                    Err(HarnessError::Protocol(
+                        "Thread binding changed; reopen before changing its goal or queue".into(),
+                    ))
+                } else if matches!(
+                    command,
+                    giskard_core::goals_queue::GoalsQueueCommand::Start { .. }
+                ) && self
+                    .mapper
+                    .active_native_turn_for_thread(thread.thread)
+                    .is_some()
+                {
+                    Err(HarnessError::ThreadBusy {
+                        thread: thread.thread,
+                    })
+                } else {
+                    Ok(())
+                };
+                let result = if let Err(error) = guard {
+                    Err(error)
+                } else {
+                    timeout_codex_control(
+                        "goals_queue",
+                        Some(&thread),
+                        None,
+                        None,
+                        super::goals_queue::execute(&mut self.client, &thread, command),
+                    )
+                    .await
+                };
+                if let Err(error) = &result {
+                    warn!(thread_id = %thread.thread, %error, "Codex goals/queue control failed");
+                }
+                let _ = response.send(result);
+            }
             ControlCommand::Interrupt { thread, response } => {
                 let native_turn_id = self
                     .mapper

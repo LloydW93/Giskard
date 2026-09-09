@@ -43,6 +43,8 @@ use crate::thread_graph::{
     graph_issue, load_thread_graph,
 };
 
+mod goals_queue;
+
 const PROJECT_LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_THREAD_TITLE_CHARS: usize = 120;
 const GENERATED_THREAD_TITLE_CHARS: usize = 72;
@@ -80,6 +82,10 @@ pub(crate) async fn http_request_context_middleware(
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/goals-queue",
+            get(goals_queue::read).post(goals_queue::change),
+        )
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/harnesses", get(list_harnesses))
         .route(

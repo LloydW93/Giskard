@@ -4784,3 +4784,14 @@ default already stated in-line:
 ---
 
 *End of specification.*
+
+### Native goal and queue controls
+
+Goals and queued submissions are harness-owned state, exposed as fresh snapshots and turnless
+invalidation events. The CodexInstance control lane serializes all native goal/queue RPCs. Giskard
+must not persist a competing snapshot or reserve turns from HTTP handlers. Autonomous turns caused
+by goals or queue start enter the existing forwarder's external-turn admission path. Mutations
+require a loaded writable primary thread and are unavailable while archived; child/orphan reads
+remain permitted. Clients refresh on reconnect and invalidation, preserve queue cursors, and do not
+retry uncertain mutations automatically. Queue editors must mark non-text entries and avoid silently
+replacing their attachment content. Native unsupported/protocol errors remain visible to operators.

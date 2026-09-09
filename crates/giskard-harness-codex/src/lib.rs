@@ -7,6 +7,7 @@
 //! See the crate README for Codex-native identifier scopes, item and process
 //! lifecycles, background-command ownership, and termination routing.
 
+mod goals_queue;
 mod instance;
 #[cfg(test)]
 mod log_checks;
@@ -234,6 +235,12 @@ enum HarnessCommand {
 }
 
 enum ControlCommand {
+    GoalsQueue {
+        thread: ThreadHandle,
+        command: giskard_core::goals_queue::GoalsQueueCommand,
+        response:
+            oneshot::Sender<Result<giskard_core::goals_queue::GoalsQueueSnapshot, HarnessError>>,
+    },
     ClaimNativeThread {
         thread: ThreadId,
         harness_thread_id: String,
@@ -696,6 +703,7 @@ impl CodexHarness {
         command: ControlCommand,
     ) -> Result<(), HarnessError> {
         let thread_id = match &command {
+            ControlCommand::GoalsQueue { thread, .. } => Some(thread.thread),
             ControlCommand::ClaimNativeThread { thread, .. } => Some(*thread),
             ControlCommand::Interrupt { thread, .. }
             | ControlCommand::SteerTurn { thread, .. }
@@ -1181,6 +1189,30 @@ impl AgentHarness for CodexHarness {
             ControlCommand::RespondServerRequest {
                 id,
                 response_payload,
+                response: tx,
+            },
+        )
+        .await?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
+    fn goals_queue_supported(&self) -> bool {
+        true
+    }
+
+    async fn goals_queue(
+        &self,
+        thread: &ThreadHandle,
+        command: giskard_core::goals_queue::GoalsQueueCommand,
+    ) -> Result<giskard_core::goals_queue::GoalsQueueSnapshot, HarnessError> {
+        command.validate().map_err(HarnessError::Protocol)?;
+        let (tx, rx) = oneshot::channel();
+        self.enqueue_control(
+            "goals_queue",
+            ControlCommand::GoalsQueue {
+                thread: thread.clone(),
+                command,
                 response: tx,
             },
         )

@@ -8029,3 +8029,47 @@ async fn browse_mkdir_creates_directory_and_rejects_escapes() {
     }
     assert!(!parent.path().parent().unwrap().join("evil").exists());
 }
+
+#[tokio::test]
+async fn goals_queue_http_rejects_invalid_input_and_managed_mutation() {
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let client = reqwest::Client::new();
+    let cookie = auth::login(&client, &server.base).await;
+    let (project, thread) =
+        create_project_and_thread(&server.state, &client, &server.base, &cookie).await;
+    let url = format!(
+        "{}/api/projects/{project}/threads/{thread}/goals-queue",
+        server.base
+    );
+    let invalid = client
+        .post(&url)
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"action":"set_goal","objective":"", "token_budget": -1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), 400);
+    server
+        .state
+        .store
+        .update_thread(project, thread, |t| {
+            t.kind = giskard_core::ThreadKind::Subagent
+        })
+        .await
+        .unwrap();
+    for action in [
+        serde_json::json!({"action":"clear_goal"}),
+        serde_json::json!({"action":"start","id":null}),
+        serde_json::json!({"action":"add","text":"test","client_message_id":"test-id"}),
+    ] {
+        let blocked = client
+            .post(&url)
+            .header("cookie", &cookie)
+            .json(&action)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), 409);
+        assert!(blocked.text().await.unwrap().contains("read-only"));
+    }
+}

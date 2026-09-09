@@ -1783,6 +1783,7 @@ impl ThreadEventForwarder {
         hub.publish(thread_id, Outbound::RuntimeEffects(applied))
             .await;
         let reaches_transcript = match &event {
+            AgentEvent::GoalsQueueChanged { .. } => true,
             AgentEvent::Error { error, .. } => {
                 warn!(
                     %project_id,
