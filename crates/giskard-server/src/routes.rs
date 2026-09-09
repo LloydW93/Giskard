@@ -962,7 +962,9 @@ async fn start_thread_with_message(
     };
 
     let overrides = TurnOverrides {
-        context_window: Some(model_descriptor.default_session_context_window()),
+        context_window: model_descriptor
+            .advertised_context_window
+            .map(|_| model_descriptor.default_session_context_window()),
         model: Some(model_ref.clone()),
         mode: req.mode,
         permission_preset: req.permission_preset,
