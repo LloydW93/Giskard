@@ -938,6 +938,7 @@ function normalizedThreadProjection(kind, payload, threadId, revision) {
       mode:payload.mode,
       current_model:payload.current_model,
       context_window:payload.context_window,
+      context_window_override:payload.context_window_override || null,
       permission_preset:payload.permission_preset,
       tokens:payload.tokens
     };
@@ -3763,6 +3764,20 @@ function renderCurrentThreadMetadata() {
   if (effective.tokens) renderTokens(effective.tokens);
   updateGauge(state.contextUsed, effective.context_window || 0);
   updateComposerControls();
+  if (!$("usageMenu").hidden && contextWindowEditor &&
+      contextWindowEditor.scope !== contextWindowScope()) {
+    // A save broadcasts metadata before returning HTTP. Keep its in-flight editor owned until
+    // settlement, then refetch; a provider/model or view change still invalidates it immediately.
+    if (contextWindowEditor.saving && contextWindowIdentity() === contextWindowEditor.identity) {
+      contextWindowEditor.scope = contextWindowScope();
+      contextWindowEditor.refreshAfterSave = true;
+    } else {
+      const editor = contextWindowEditor;
+      const savedSelectionMatches = editor.identity === contextWindowIdentity() && editor.config &&
+        (editor.config.override_window || null) === (effective.context_window_override || null);
+      loadContextWindowEditor(savedSelectionMatches ? editor.feedback : "");
+    }
+  }
 }
 
 function applyThreadMetadata(s, recoverConflict) {
@@ -10657,6 +10672,7 @@ function toggleUsageMenu() {
     $("subagentsMenu").hidden = true;
     $("mcpMenu").hidden = true;
     renderUsageMenu();
+    loadContextWindowEditor();
   }
 }
 function renderUsageMenu() {
@@ -10666,28 +10682,159 @@ function renderUsageMenu() {
   const window = state.contextWindow ? fmt(state.contextWindow) : "unknown";
   const pctLabel = pct === null ? "unknown" : `${pct.toFixed(1)}%`;
   const meterWidth = pct === null ? 0 : pct;
-  menu.innerHTML = `
+  if (!$("usageCurrentValues")) menu.innerHTML = `
     <div class="usage-head">
       <strong>Context Usage</strong>
       <button id="usageClose" type="button">Close</button>
     </div>
     <div class="usage-section">
       <div class="usage-section-title">Current Context</div>
-      <div class="usage-line"><span class="muted">Used</span><span class="mono">${escapeHtml(used)} / ${escapeHtml(window)}</span></div>
-      <div class="usage-meter" aria-hidden="true"><span style="width:${meterWidth}%"></span></div>
-      <div class="usage-line"><span class="muted">Window filled</span><span class="mono">${escapeHtml(pctLabel)}</span></div>
+      <div class="usage-line"><span class="muted">Used</span><span id="usageCurrentValues" class="mono"></span></div>
+      <div class="usage-meter" aria-hidden="true"><span id="usageMeterFill"></span></div>
+      <div class="usage-line"><span class="muted">Window filled</span><span id="usagePercent" class="mono"></span></div>
     </div>
+    <div id="contextWindowSettings" class="usage-section"></div>
     <div class="usage-section">
       <div class="usage-section-title">Actions</div>
       <button id="compactBtn" class="btn" type="button" title="Compact this thread's Codex context">Compact context</button>
     </div>
     <div class="usage-section">
       <div class="usage-section-title">Cumulative Tokens</div>
-      ${renderTokenStats(state.tokenLedger)}
+      <div id="usageTokenStats"></div>
     </div>`;
+  // Usage events must not replace the settings form: preserve focus and unsaved input.
+  $("usageCurrentValues").textContent = `${used} / ${window}`;
+  $("usageMeterFill").style.width = `${meterWidth}%`;
+  $("usagePercent").textContent = pctLabel;
+  $("usageTokenStats").innerHTML = renderTokenStats(state.tokenLedger);
   $("usageClose").onclick = () => { $("usageMenu").hidden = true; };
   $("compactBtn").onclick = compactContext;
   updateComposerControls();
+}
+// This editor belongs to one visible thread, never to a global model preference.
+let contextWindowEditor = null;
+function contextWindowIdentity() {
+  const model = state.currentModel || {};
+  return JSON.stringify([state.activeViewGeneration, state.projectId, state.threadId,
+    model.provider, model.model, !!state.threadReadOnly, managedThreadReadOnly()]);
+}
+function contextWindowScope() {
+  const detail = composedThreadDetail(state.threadId);
+  return JSON.stringify([contextWindowIdentity(), detail && detail.context_window_override]);
+}
+function contextWindowEditorCurrent(editor) {
+  return contextWindowEditor === editor && editor.scope === contextWindowScope() &&
+    !$("usageMenu").hidden;
+}
+async function loadContextWindowEditor(feedback) {
+  const editor = { scope:contextWindowScope(), identity:contextWindowIdentity(), projectId:state.projectId, threadId:state.threadId,
+    config:null, loading:true, saving:false, error:"", feedback:typeof feedback === "string" ? feedback : "" };
+  contextWindowEditor = editor;
+  renderContextWindowEditor();
+  try {
+    const config = await api("GET", `/api/projects/${encodeURIComponent(editor.projectId)}/threads/${encodeURIComponent(editor.threadId)}/context-window`, undefined, { timeoutMs:15000 });
+    if (!contextWindowEditorCurrent(editor)) return;
+    editor.config = config;
+  } catch (e) {
+    if (!contextWindowEditorCurrent(editor)) return;
+    editor.error = `Could not load session context limit: ${apiFailureMessage(e)}`;
+  }
+  if (!contextWindowEditorCurrent(editor)) return;
+  editor.loading = false;
+  renderContextWindowEditor();
+}
+function renderContextWindowEditor() {
+  const host = $("contextWindowSettings");
+  const editor = contextWindowEditor;
+  if (!host || !editor) return;
+  host.innerHTML = `<div class="usage-section-title">Session context limit</div>`;
+  if (editor.loading) {
+    host.insertAdjacentHTML("beforeend", `<div class="muted" role="status">Loading context limits…</div>`);
+    return;
+  }
+  const config = editor.config;
+  if (!config) {
+    host.insertAdjacentHTML("beforeend", `<div class="context-limit-error" role="alert">${escapeHtml(editor.error)}</div><button id="contextWindowRetry" class="btn" type="button">Retry</button>`);
+    $("contextWindowRetry").onclick = loadContextWindowEditor;
+    return;
+  }
+  const readOnly = state.threadReadOnly || managedThreadReadOnly();
+  const knownMaximum = Number.isSafeInteger(config.advertised_maximum) && config.advertised_maximum > 0;
+  const configurable = config.can_configure && knownMaximum && !readOnly;
+  const explanation = readOnly ? "This thread is read-only." : !knownMaximum ?
+    "The provider has not advertised a maximum; custom limits are unavailable." :
+    !config.can_configure ? "This provider does not support session context limits." : "";
+  const custom = config.override_window !== null && config.override_window !== undefined;
+  host.insertAdjacentHTML("beforeend", `
+    <div class="context-limit-controls">
+      <label for="contextWindowMode">Limit</label>
+      <select id="contextWindowMode" ${configurable ? "" : "disabled"}>
+        <option value="default" ${custom ? "" : "selected"}>Default (${Number(config.default_window).toLocaleString()} tokens)</option>
+        <option value="custom" ${custom ? "selected" : ""}>Custom</option>
+      </select>
+      <label for="contextWindowValue">Tokens</label>
+      <input id="contextWindowValue" type="number" inputmode="numeric" step="1" min="${Number(config.default_window)}" max="${Number(config.advertised_maximum || config.default_window)}" value="${Number(config.selected_window)}" ${configurable && custom ? "" : "disabled"}>
+      <button id="contextWindowSave" class="btn" type="button" ${configurable ? "" : "disabled"}>Save limit</button>
+    </div>
+    <div class="muted context-limit-note">Advertised maximum: ${knownMaximum ? Number(config.advertised_maximum).toLocaleString() + " tokens" : "unknown"}. ${escapeHtml(explanation)}</div>
+    <div class="muted context-limit-note">Saved limits apply before the next turn; the current turn is unchanged. The usage gauge shows the effective window, which may reserve headroom.</div>
+    <div id="contextWindowPremium" class="context-limit-warning" hidden></div>
+    <div id="contextWindowStatus" class="context-limit-note" role="status"></div>`);
+  const update = () => {
+    $("contextWindowValue").disabled = !configurable || $("contextWindowMode").value !== "custom" || editor.saving;
+    const value = $("contextWindowMode").value === "default" ? config.default_window : Number($("contextWindowValue").value);
+    const warning = $("contextWindowPremium");
+    const above = config.non_premium_window && value > config.non_premium_window;
+    warning.hidden = !config.non_premium_window;
+    warning.textContent = above ?
+      `Above ${Number(config.non_premium_window).toLocaleString()} input tokens, premium long-context rates can apply to the full request.` :
+      `The default targets the standard-rate input range (up to ${Number(config.non_premium_window || 0).toLocaleString()} tokens).`;
+    if (config.non_premium_window) warning.textContent += " This is not a price guarantee: tool results can expand a request.";
+  };
+  $("contextWindowMode").onchange = update;
+  $("contextWindowValue").oninput = update;
+  $("contextWindowSave").onclick = () => saveContextWindow(editor);
+  $("contextWindowStatus").textContent = editor.feedback;
+  update();
+}
+async function saveContextWindow(editor) {
+  if (!contextWindowEditorCurrent(editor) || editor.saving || !editor.config.can_configure ||
+      state.threadReadOnly || managedThreadReadOnly()) return;
+  const config = editor.config;
+  const custom = $("contextWindowMode").value === "custom";
+  const value = custom ? Number($("contextWindowValue").value) : null;
+  const status = $("contextWindowStatus");
+  if (custom && (!Number.isSafeInteger(value) || value < config.default_window || value > config.advertised_maximum)) {
+    status.setAttribute("role", "alert");
+    status.textContent = `Enter a whole number from ${Number(config.default_window).toLocaleString()} to ${Number(config.advertised_maximum).toLocaleString()}.`;
+    return;
+  }
+  editor.saving = true;
+  $("contextWindowSave").disabled = true;
+  $("contextWindowMode").disabled = true;
+  $("contextWindowValue").disabled = true;
+  status.setAttribute("role", "status");
+  status.textContent = "Saving…";
+  try {
+    const result = await api("POST", `/api/projects/${encodeURIComponent(editor.projectId)}/threads/${encodeURIComponent(editor.threadId)}/context-window`,
+      { model:config.model, context_window:value }, { timeoutMs:15000 });
+    // Metadata can arrive before the HTTP response and refresh this form. Never publish a
+    // delayed response into another thread/model, even when navigation returned to this thread.
+    if (!contextWindowEditorCurrent(editor)) return;
+    editor.config = result;
+    editor.saving = false;
+    editor.feedback = "Saved for the next turn. The current turn is unchanged.";
+    if (editor.refreshAfterSave) { loadContextWindowEditor(editor.feedback); return; }
+    renderContextWindowEditor();
+  } catch (e) {
+    if (!contextWindowEditorCurrent(editor)) return;
+    editor.saving = false;
+    $("contextWindowSave").disabled = false;
+    $("contextWindowMode").disabled = false;
+    $("contextWindowValue").disabled = !custom;
+    status.setAttribute("role", "alert");
+    status.textContent = `Could not save context limit: ${apiFailureMessage(e)}`;
+  }
 }
 $("usageBtn").onclick = (e) => { e.stopPropagation(); toggleUsageMenu(); };
 $("usageMenu").onclick = (e) => e.stopPropagation();

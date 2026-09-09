@@ -76,3 +76,15 @@ test("model capabilities and service tier", async ({ page }, testInfo) => {
   await page.screenshot({ path:file, animations:"disabled" });
   await testInfo.attach("model service tier", { path:file, contentType:"image/png" });
 });
+
+
+test("session context limit", async ({ page }, testInfo) => {
+  await openThread(page);
+  await page.locator("#usageBtn").click();
+  await expect(page.locator("#contextWindowMode")).toBeEnabled();
+  await page.locator("#contextWindowMode").selectOption("custom");
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  const file = path.join(OUT_DIR, `native-context-${testInfo.project.name}.png`);
+  await page.screenshot({ path:file, animations:"disabled" });
+  await testInfo.attach("session context limit", { path:file, contentType:"image/png" });
+});
