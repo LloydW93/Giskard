@@ -263,6 +263,9 @@ pub struct ModelConfig {
 pub struct HarnessConfig {
     pub kind: String,
     pub idle_shutdown_secs: u64,
+    pub dynamic_tools: Vec<giskard_core::dynamic_tool_config::DynamicToolNamespaceConfig>,
+    pub attestation_provider_command: Vec<String>,
+    pub external_auth_provider_command: Vec<String>,
 }
 
 impl Default for HarnessConfig {
@@ -270,6 +273,9 @@ impl Default for HarnessConfig {
         Self {
             kind: "codex".into(),
             idle_shutdown_secs: 0,
+            dynamic_tools: Vec::new(),
+            attestation_provider_command: Vec::new(),
+            external_auth_provider_command: Vec::new(),
         }
     }
 }
@@ -277,6 +283,60 @@ impl Default for HarnessConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_service_provider_commands_are_explicit_opt_in() {
+        let defaults: Config = toml::from_str("").unwrap();
+        assert!(defaults.harness.attestation_provider_command.is_empty());
+        assert!(defaults.harness.external_auth_provider_command.is_empty());
+        let config: Config = toml::from_str(
+            r#"[harness]
+attestation_provider_command = ["/trusted/attestation", "literal argument"]
+external_auth_provider_command = ["/trusted/auth"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.harness.attestation_provider_command,
+            ["/trusted/attestation", "literal argument"]
+        );
+        assert_eq!(
+            config.harness.external_auth_provider_command,
+            ["/trusted/auth"]
+        );
+    }
+
+    #[test]
+    fn dynamic_tool_configuration_roundtrips_with_empty_default_and_explicit_executor_cwd() {
+        assert!(Config::default().harness.dynamic_tools.is_empty());
+        let input = r#"
+[[harness.dynamic_tools]]
+name = "local_tools"
+description = "Installed tools"
+[[harness.dynamic_tools.tools]]
+name = "lookup"
+description = "Lookup reference"
+command = "/opt/tools/lookup"
+cwd = "/opt/tools"
+input_schema = { type = "object", properties = { query = { type = "string" } }, required = ["query"] }
+"#;
+        let config: Config = toml::from_str(input).unwrap();
+        let tool = &config.harness.dynamic_tools[0].tools[0];
+        assert_eq!(tool.timeout_ms, 30000);
+        assert!(tool.args.is_empty());
+        assert_eq!(tool.cwd, std::path::PathBuf::from("/opt/tools"));
+        let decoded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            decoded.harness.dynamic_tools[0].tools[0].input_schema,
+            tool.input_schema
+        );
+        assert!(
+            toml::from_str::<Config>(
+                &input.replace("cwd = \"/opt/tools\"", "unknown_executor_option = true")
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn file_logging_defaults_disabled_and_validates_path() {

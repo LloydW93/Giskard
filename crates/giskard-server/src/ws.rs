@@ -29,7 +29,7 @@ use crate::log_fields::display_opt;
 use crate::routes::{
     ApiError, ReadOnlyProviderContext, UI_VERSION, history_limit_or_default, load_thread,
     normalize_persisted_thread_model, project_model_catalog, provider_is_known, read_only_info,
-    thread_workspace, validate_user_attachments, warning_info,
+    thread_workspace, validate_attachment_modalities, validate_user_attachments, warning_info,
 };
 use crate::thread_graph::effective_thread_workspace_root as effective_workspace_root;
 
@@ -492,6 +492,7 @@ async fn handle_client_msg(
                 .send(ServerMessage::ThreadCapabilities {
                     thread_id,
                     turn_steering: state.registry.turn_steering_supported(thread_id).await,
+                    goals_queue: state.registry.goals_queue_supported(thread_id).await,
                 })
                 .await;
 
@@ -742,6 +743,25 @@ async fn handle_client_msg(
                 .thread(thread_id)
                 .action("send_input")
             })?;
+            let descriptor =
+                crate::models::resolve_catalog_descriptor(&catalog, &app_config, &effective_model);
+            validate_attachment_modalities(&attachments, descriptor.input_modalities.as_deref())
+                .map_err(|error| {
+                    WsError::new(
+                        "unsupported_input_modality",
+                        ErrorSeverity::Error,
+                        error.to_string(),
+                    )
+                    .thread(thread_id)
+                    .action("send_input")
+                })?;
+            crate::models::validate_service_tier(&effective_model, &descriptor).map_err(
+                |message| {
+                    WsError::new("invalid_service_tier", ErrorSeverity::Error, message)
+                        .thread(thread_id)
+                        .action("send_input")
+                },
+            )?;
             let effective_mode = tf.mode.as_known().ok_or_else(|| {
                 WsError::new(
                     "thread_metadata_invalid",
@@ -844,6 +864,13 @@ async fn handle_client_msg(
                 })?;
             let catalog = project_model_catalog(state, &project_config, &config).await;
             let model_ref = crate::models::normalize_model_ref(&config, &catalog, &model_ref);
+            let descriptor =
+                crate::models::resolve_catalog_descriptor(&catalog, &config, &model_ref);
+            crate::models::validate_service_tier(&model_ref, &descriptor).map_err(|message| {
+                WsError::new("invalid_service_tier", ErrorSeverity::Error, message)
+                    .thread(thread_id)
+                    .action("select_model")
+            })?;
 
             let native_model = state
                 .registry

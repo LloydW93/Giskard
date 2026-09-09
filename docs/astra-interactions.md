@@ -52,14 +52,10 @@ activity, permission/command/file approvals, and ordinary MCP elicitation are al
 There is no new Astra toggle needed for those paths. Native `multiAgentMode` is deprecated and
 ignored according to the generated schema; it should not be introduced as a model capability fix.
 
-The broader native client surface also exposes goals, queue management, audio input, service-tier
-selection, `openai/form` elicitation, and client-executed dynamic tools. Those are distinct product
-features rather than prerequisites for this question/steering contract. This change does not
-claim full native UI parity: Giskard still drops model catalog fields such as `serviceTiers`,
-`defaultServiceTier`, `inputModalities`, and `multiAgentVersion`; its dynamic-tool fallback does not
-constitute an execution runtime. Advertising new extensions before implementing their behavior
-would misrepresent client support. Attestation and external authentication refresh likewise need
-real provider implementations before opting in.
+The remaining native client surfaces are implemented in the follow-on
+[native capability work](native-ui-capabilities.md): goals, queues, audio, model capabilities and
+service tiers, rich MCP forms, configured client tools, and host authentication/attestation
+providers. The linked checklist records behavior, validation, and provider prerequisites.
 
 ## Review artifacts and validation
 

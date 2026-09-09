@@ -114,6 +114,7 @@ fn dead_model() -> ModelRef {
         provider: DEAD_PROVIDER.into(),
         model: "@cf/z-ai/glm-4.7".into(),
         reasoning_effort: None,
+        service_tier: None,
     }
 }
 
@@ -122,6 +123,7 @@ fn new_model() -> ModelRef {
         provider: NEW_PROVIDER.into(),
         model: "glm-5.2".into(),
         reasoning_effort: None,
+        service_tier: None,
     }
 }
 
@@ -265,6 +267,7 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
+                service_tier: None,
             },
         },
     )

@@ -8,6 +8,7 @@ pub mod ledger;
 pub mod linkify;
 mod log_fields;
 pub mod markdown;
+mod mcp_forms;
 pub mod models;
 pub mod plan;
 pub mod registry;

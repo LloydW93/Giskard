@@ -9,6 +9,9 @@ pub struct ModelRef {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<Effort>,
+    /// Optional advertised service tier, applied independently to each turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 /// A reasoning-effort level (model-dependent).
@@ -59,6 +62,23 @@ pub struct ModelDescriptor {
     /// never a fallback for a thread that already has one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_default: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tiers: Option<Vec<ModelServiceTier>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_service_tier: Option<String>,
+    /// None means the harness has not reported supported input types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_agent_version: Option<String>,
+}
+
+/// Service tier identifiers and labels are supplied by the model catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelServiceTier {
+    pub id: String,
+    pub name: String,
+    pub description: String,
 }
 
 impl ModelRef {
@@ -83,6 +103,10 @@ impl ModelDescriptor {
             reasoning_efforts: Vec::new(),
             display_name: None,
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }
     }
 }
@@ -97,6 +121,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         assert_eq!(m.key(), "openai/gpt-5.5");
     }
@@ -107,11 +132,13 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let b = ModelRef {
             provider: "cloudflare-litellm".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         assert_ne!(a, b, "same model on different providers must be distinct");
     }
@@ -189,6 +216,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: Some(Effort::new("high")),
+            service_tier: Some("future-tier".into()),
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: ModelRef = serde_json::from_str(&json).unwrap();

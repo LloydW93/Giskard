@@ -694,6 +694,7 @@ mod tests {
             provider: "test".into(),
             model: "model".into(),
             reasoning_effort: None,
+            service_tier: None,
         }
     }
 

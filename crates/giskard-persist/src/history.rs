@@ -821,6 +821,7 @@ mod lazy_diff_tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         });
         known.mode = TurnMode::Known(Mode::Build);
         let value: serde_json::Value = serde_json::from_str(known.line().unwrap().trim()).unwrap();
@@ -856,6 +857,7 @@ mod lazy_diff_tests {
                 provider: "test".into(),
                 model: "test".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             mode: TurnMode::Known(Mode::Build),
             status: TurnStatus {
@@ -955,6 +957,7 @@ mod lazy_diff_tests {
                 provider: "test".into(),
                 model: "test".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             mode: TurnMode::Known(Mode::Build),
             status: TurnStatus {

@@ -18,6 +18,9 @@
 //! * `GISKARD_REPLAY_PASSWORD` — the app password (default `giskard`);
 //! * `GISKARD_REPLAY_WORKSPACE` — the demo project's workspace dir (created if missing).
 
+#[path = "replay/goals_queue.rs"]
+mod goals_queue;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -120,7 +123,7 @@ struct ScriptedHarness {
     // Structural reason: This non-test-gated replay adapter cannot use server authorities.
     // Synchronization: The mutex protects linear lookup, insertion, and removal.
     // Invalidation/removal: Thread close removes state; dropping the harness removes all entries.
-    threads: tokio::sync::Mutex<Vec<(ThreadId, Arc<EventLog>)>>,
+    threads: tokio::sync::Mutex<Vec<ScriptedThreadEntry>>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Translate scripted native thread identifiers to Giskard thread identifiers.
     // Source of truth: Bootstrap and import claims establish the bijective bindings.
@@ -136,6 +139,12 @@ struct ScriptedHarness {
     /// sub-agent's approval is raised from the detached task that drives the child's turn.
     active_approvals: ActiveApprovals,
 }
+
+type ScriptedThreadEntry = (
+    ThreadId,
+    Arc<EventLog>,
+    giskard_core::goals_queue::GoalsQueueSnapshot,
+);
 
 type ActiveApprovals = Arc<tokio::sync::Mutex<HashMap<ApprovalId, (ThreadId, TurnId)>>>;
 
@@ -157,7 +166,7 @@ impl ScriptedHarness {
                 reasoning_effort: true,
                 structured_diffs: true,
                 resumable_threads: true,
-                model_listing: false,
+                model_listing: true,
                 // The scripted harness knows its one provider, so the picker exercises the same
                 // id-validation path the real Codex harness does.
                 provider_listing: true,
@@ -207,8 +216,8 @@ impl ScriptedHarness {
         let threads = self.threads.lock().await;
         threads
             .iter()
-            .find(|(id, _)| *id == thread)
-            .map(|(_, tx)| tx.clone())
+            .find(|(id, _, _)| *id == thread)
+            .map(|(_, tx, _)| tx.clone())
     }
 
     fn subagent_parent(native_thread_id: &str) -> Option<String> {
@@ -231,10 +240,10 @@ impl ScriptedHarness {
         let new_sender = Arc::new(EventLog::new());
         let mut threads = self.threads.lock().await;
         let (sender, is_new) =
-            if let Some((_, existing)) = threads.iter().find(|(id, _)| *id == thread) {
+            if let Some((_, existing, _)) = threads.iter().find(|(id, _, _)| *id == thread) {
                 (existing.clone(), false)
             } else {
-                threads.push((thread, new_sender.clone()));
+                threads.push((thread, new_sender.clone(), Default::default()));
                 (new_sender, true)
             };
         drop(threads);
@@ -437,8 +446,65 @@ impl AgentHarness for ScriptedHarness {
         self.capabilities
     }
 
+    fn goals_queue_supported(&self) -> bool {
+        true
+    }
+
+    async fn goals_queue(
+        &self,
+        thread: &ThreadHandle,
+        command: giskard_core::goals_queue::GoalsQueueCommand,
+        _settings: Option<TurnOverrides>,
+    ) -> Result<giskard_core::goals_queue::GoalsQueueSnapshot, HarnessError> {
+        let mutated = !command.is_read();
+        let (snapshot, start) = {
+            let mut threads = self.threads.lock().await;
+            let (_, log, state) = threads
+                .iter_mut()
+                .find(|(id, _, _)| *id == thread.thread)
+                .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
+            let start = goals_queue::apply(state, command)?;
+            if mutated {
+                let _ = log.append(AgentEvent::GoalsQueueChanged {
+                    thread: thread.thread,
+                });
+            }
+            (state.clone(), start)
+        };
+        if let Some(text) = start {
+            self.start_turn(
+                thread,
+                UserInput::text(text),
+                TurnOverrides {
+                    model: None,
+                    mode: giskard_core::turn::Mode::Build,
+                    permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
+                },
+            )
+            .await?;
+        }
+        Ok(snapshot)
+    }
+
     async fn list_models(&self) -> Result<Vec<giskard_core::model::ModelDescriptor>, HarnessError> {
-        Ok(vec![])
+        let mut model =
+            giskard_core::model::ModelDescriptor::conservative("replay", "replay-model");
+        model.service_tiers = Some(vec![
+            giskard_core::model::ModelServiceTier {
+                id: "default".into(),
+                name: "Standard".into(),
+                description: "Standard speed".into(),
+            },
+            giskard_core::model::ModelServiceTier {
+                id: "priority".into(),
+                name: "Priority".into(),
+                description: "Faster processing".into(),
+            },
+        ]);
+        model.default_service_tier = Some("default".into());
+        model.input_modalities = Some(vec!["text".into(), "image".into(), "audio".into()]);
+        model.multi_agent_version = Some("v2".into());
+        Ok(vec![model])
     }
 
     /// The scripted stand-in for Codex's `[model_providers]` table: one provider, no endpoint, so
@@ -936,7 +1002,7 @@ impl AgentHarness for ScriptedHarness {
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
         if let Ok(threads) = self.threads.try_lock()
-            && let Some((_, tx)) = threads.iter().find(|(id, _)| *id == thread.thread)
+            && let Some((_, tx, _)) = threads.iter().find(|(id, _, _)| *id == thread.thread)
         {
             return AgentEventStream::new(tx.reader());
         }
@@ -1031,7 +1097,7 @@ impl AgentHarness for ScriptedHarness {
         self.threads
             .lock()
             .await
-            .retain(|(thread_id, _)| *thread_id != thread.thread);
+            .retain(|(thread_id, _, _)| *thread_id != thread.thread);
         Ok(())
     }
 

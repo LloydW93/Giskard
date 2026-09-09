@@ -9,7 +9,24 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.91
+**Version:** 1.92
+
+> **Amendment — native client capability support (1.92).** Goals and queue controls, model
+> capability metadata and service tiers, audio input, rich MCP forms, configured client tools,
+> and host authentication/attestation providers follow the contracts in
+> [Native capability support](../docs/native-ui-capabilities.md). Native state remains authoritative;
+> host services are explicit opt-ins, and live authentication requires real configured providers.
+
+> **Amendment — native model capabilities.** Model descriptors preserve optional advertised
+> service tiers (opaque identifiers, names, descriptions), default tier, input modalities, and
+> multi-agent version. Catalog metadata is provider-scoped. `ModelRef.service_tier` is optional,
+> human-selected metadata retained in thread state and the bounded per-turn model record, limited
+> to an advertised nonempty identifier of at most 128 bytes. Thread creation, model selection,
+> and turn submission validate it against the current catalog. The picker resets it on model
+> changes, preserves it on effort changes, and distinguishes Native default (no override) from
+> an advertised Standard tier. Codex receives `serviceTierForTurn` per turn, leaving native thread
+> defaults intact. Capability descriptors preserve future string values and never enable feature
+> flags by themselves.
 
 > **Amendment — asynchronous questions and steering (1.91).** Preserve structured questions on
 > ordinary agent messages, expose explicit choice/free-text answers, and allow guarded text
@@ -230,6 +247,13 @@
     configured `codex_path`, and reports through `log`, which Giskard does not bridge into `tracing`.
   - Both Codex spellings of the extended OpenAI MCP elicitation form (`openai/form` and
     `openaiForm`) preserve request routing and MCP approval promotion.
+    MCP envelopes are now retained raw because the generated bindings omit top-level scope.
+    Nested form fields preserve typed defaults and explicit optional inclusion; array/composite
+    values use a JSON editor retaining the original schema. Accepted responses are validated
+    server-side using the schema's declared standard dialect, including local references and
+    composite/conditional constraints. Remote/file references cannot be fetched. Invalid schemas
+    or content return the pending request to an actionable state with an error, permitting retry,
+    decline, or cancel; they never become a successful empty or partial response.
   Everything else the release adds — paginated `thread/items/list`, `thread/turns/list` and
   `thread/revert`, a typed `turn/steer` helper, `McpServerStatus.runtimeStatus`, the realtime item
   timeline, and the newly typed `project/changed`, `thread/queue/changed`, `thread/reverted`,
@@ -2836,6 +2860,26 @@ state. That exception never starts an idle child or permits unrestricted child s
 See [Astra interactions](../docs/astra-interactions.md) for protocol provenance and the native
 capability audit.
 
+### 7.3.2 Native goals and queued input
+
+Goals and queued submissions are harness-owned state, exposed as fresh snapshots and turnless
+invalidation events. The CodexInstance control lane serializes all native goal/queue RPCs. Giskard
+must not persist a competing snapshot or reserve turns from HTTP handlers. Autonomous turns caused
+by goals or queue start enter the existing forwarder's external-turn admission path. Mutations
+require a loaded writable primary thread and are unavailable while archived; child/orphan reads
+remain permitted. Clients refresh on reconnect and invalidation, preserve queue cursors, and do not
+retry uncertain mutations automatically. Queue editors must mark non-text entries and avoid silently
+replacing their attachment content. Native unsupported/protocol errors remain visible to operators.
+
+Goal/queue launch settings are captured at explicit goal set, queue add and queue start operations.
+The server snapshots persisted selected model/effort/tier, mode and permissions and verifies the
+provider against the loaded native binding. The task-owned adapter sends `thread/settings/update`
+with that snapshot and the loaded cwd, then the mutation without interleaving other controls.
+Failure to synchronize settings prevents the mutation. Native service tier is explicit, including
+null to clear. This changes subsequent native work; it does not change the already-running turn or
+make later selector edits apply automatically. The UI must state this capture boundary and explain
+that settings belong to the thread's subsequent work, not individual queue entries.
+
 ### 7.4 Plan / Build modes
 
 - **Mode is thread state**, persisted, and **switchable at any time within the thread**
@@ -3264,8 +3308,19 @@ read-only sandboxing. The selected permission preset controls what the agent may
    gap later.
 3. User chooses a decision; server calls `respond_approval`.
 
+Codex `item/tool/call` requests execute through operator-configured client tool namespaces in
+`harness.dynamic_tools`. Native namespace/function schemas are registered on `thread/start`;
+resumed threads retain their saved definitions. Each configured tool has an absolute executable,
+fixed argv, an explicit absolute executor cwd, an input JSON schema and a bounded timeout.
+The instance validates arguments, runs process I/O without blocking native traffic, and sends a
+typed success/contentItems result. Unknown tools and execution failures return an explicit failed
+result and visible thread error; the browser cannot fabricate successful execution. Limits are
+16 concurrent calls per process and 1 MiB each for stdin/stdout/stderr. Completion, interruption,
+deletion and shutdown cancel the applicable processes; Unix process groups are killed and direct
+children reaped. Executors run under server OS credentials outside Codex sandbox/approval policy.
+
 Codex also has server-initiated requests that are not approval decisions:
-`item/tool/call`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, auth refresh,
+`item/tool/requestUserInput`, `mcpServer/elicitation/request`, auth refresh,
 attestation, and future method names. These use `AgentEvent::ServerRequestReceived` rather than
 `ApprovalRequested`, are rendered as transcript cards, and must remain pending until the browser
 sends `respond_server_request`. Giskard may provide first-class UI for known methods, but unknown
@@ -3526,6 +3581,20 @@ helpful message if the spawned app-server reports it is unauthenticated.
 
 ---
 
+### 12.3 Native host service integration
+
+Optional `[harness].attestation_provider_command` and `external_auth_provider_command`
+(default empty argv arrays) connect operator-owned providers using the versioned protocol in
+[`docs/native-service-providers.md`](../docs/native-service-providers.md). These native
+connection services bypass browser prompts and persistence. Attestation is negotiated only
+with a configured provider; external auth explicitly initializes and refreshes host-owned
+ChatGPT tokens. Missing providers, malformed output and failed execution receive redacted
+errors. The sole transport task pumps service requests during outstanding RPCs, retaining
+ordinary frames in order with a fatal overflow bound and retaining the task-owned provider and
+response-write future across cancelled reads without reexecution. Shutdown drops that future;
+failed response writes poison the connection. Native signing and credential acquisition remain with the
+configured trusted host provider; Giskard neither synthesizes attestation nor reads auth files.
+
 ## 13. UI / UX
 
 ### 13.1 Stack
@@ -3776,9 +3845,14 @@ held while awaiting harness, persistence, runtime publication, or owner shutdown
 > MIME type, byte size, kind, and base64 bytes in the browser request. The server validates base64,
 > decoded size, bounded metadata, the aggregate limit, and supported image signatures before
 > starting a turn; an image's declared MIME type must match its PNG, JPEG, GIF, or WebP signature.
+> Audio attachments use kind `audio` and a WAV (`audio/wav`) or MP3 (`audio/mpeg`) signature.
+> The browser identifies those containers independently of filename/MIME and shows an Audio
+> chip; other declared audio formats remain ordinary files with a notice. Known model input
+> modalities excluding audio reject the attachment; unknown metadata defers to the provider.
 > Raw bytes are omitted from Giskard history and its parsed in-memory history cache. For the Codex
 > harness,
-> image attachments become `UserInput::Image { url: "data:<mime>;base64,<bytes>" }`; other files
+> image attachments become `UserInput::Image { url: "data:<mime>;base64,<bytes>" }` and audio
+> attachments become `UserInput::Audio` with the same data-URL structure; other files
 > are transferred with Codex `fs/writeFile` to a randomized, per-turn harness-host temp directory,
 > and that path is appended to the text prompt. The Codex adapter removes the directory with
 > `fs/remove` after the turn, an upload/start failure, stream loss, command/control channel closure,

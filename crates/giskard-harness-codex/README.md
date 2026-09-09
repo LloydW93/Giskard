@@ -374,6 +374,10 @@ Giskard receives browser attachments as transient `UserAttachment` values on
 
 - image attachments are sent as Codex `UserInput::Image` values with
   `data:<mime>;base64,<bytes>` URLs;
+- WAV and MP3 audio attachments use Codex `UserInput::Audio` with a base64 data URL.
+  The server checks the container signature and canonical MIME (`audio/wav` or `audio/mpeg`);
+  this is container detection, not a decoder. Unsupported containers remain ordinary files.
+  Native `localAudio` is unnecessary for browser bytes: URLs avoid staging them on either host;
 - other files, including PDFs, are uploaded to the Codex app-server host with
   `fs/createDirectory` and `fs/writeFile`, then the harness-host path is appended
   to the text prompt.
@@ -647,10 +651,34 @@ that Codex did not provide the file list. An optional grant root remains
 separately labeled permission-scope metadata and is never presented as a changed
 target.
 
-MCP elicitation approvals accept Codex's standard `form`, slash-form
-`openai/form`, camel-form `openaiForm`, and URL modes. All four retain `_meta`
-for thread/turn routing and approval promotion; the two OpenAI form spellings
-share the same browser-facing generic server-request and MCP approval behavior.
+MCP elicitation requests preserve their complete raw envelope, including current
+`threadId`, nullable `turnId`, `serverName`, `_meta`, and the untouched
+`requestedSchema`. The generated bindings omit the top-level scope fields and narrow
+standard schemas, so the transport intentionally carries these requests through its raw
+request variant. Direct routing fields take precedence over legacy `_meta` scope. Both
+`openai/form` and `openaiForm` use the same browser form renderer. MCP approval-marker
+promotion still occurs, with structured `serverName` preferred over message parsing.
+
+The browser renders nested object fields and typed primitive controls, applies defaults,
+and distinguishes omitted optional fields from explicit false, zero, and empty strings.
+Arrays and advanced schema layouts use a JSON editor with the original schema available
+for inspection. Every accepted MCP form response is checked server-side against the complete
+original JSON Schema before it reaches the harness. The validator supports standard drafts
+4, 6, 7, 2019-09, and 2020-12 (selected by `$schema`), local references, combinators,
+conditionals, dependent schemas, formats and the standard validation keywords. It does not
+fetch external references: both network/file resolver features are disabled, and an explicit
+retriever rejects external URIs even if another dependency enables those features later.
+Malformed schemas, unknown dialects, unknown formats, external references and invalid content
+produce a visible response error and return the request to Pending for correction or decline.
+Decline and Cancel do not validate content and return null content. The original schema and
+pending request survive reconnects; response delivery retains the existing claim/rollback
+and exact native request-ID correlation semantics.
+
+Current Codex's generated protocol declares extended `requestedSchema` as arbitrary JSON;
+[the official app-server documentation](https://developers.openai.com/codex/app-server/)
+does not specify a richer non-JSON-Schema dialect. Giskard advertises the `openai/form`
+extension for this JSON Schema implementation; an undocumented non-JSON-Schema layout
+cannot be rendered as an invented native form.
 
 ## Code and tests
 
@@ -681,3 +709,122 @@ an automatic retry. Incoming user-message items provide the durable transcript r
 Steering forwards the optional browser client message ID as native `clientUserMessageId`;
 Codex echoes it as `userMessage.clientId`, preserved on user transcript items. Receipt
 matching uses that identity, so identical text sent twice in one turn remains distinct.
+
+### Audio input format evidence
+
+The generated app-server `TurnStartParams` schema (Codex 0.153.4) exposes `audio { url }`
+and `localAudio { path }` without a codec enum. Giskard's initial browser container allowlist is
+WAV/MP3, the encoded input formats documented in the official
+[OpenAI audio input reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
+That API reference does not prove every Codex provider accepts those codecs; the native provider
+still validates decoding and model support. No arbitrary `audio/*` file is relabelled as WAV/MP3.
+## Model capabilities and service tiers
+
+`model/list` preserves `serviceTiers`, `defaultServiceTier`, `inputModalities`, and
+`multiAgentVersion` in harness-neutral descriptors. Catalog modality/version identifiers are
+open strings rather than generated SDK enums so future values do not break catalog loading.
+Capability metadata is scoped to the reported provider route.
+
+`ModelRef.service_tier` maps to `turn/start.serviceTierForTurn`. This applies the persisted UI
+choice independently to each new turn without changing native thread configuration. An absent
+choice omits the override and inherits the native thread's tier; the explicit advertised
+`default` tier means standard speed. Changing effort preserves the selected service tier.
+## Goals and queued input
+
+`goals_queue` controls execute on the owning `CodexInstance` control lane. Native goal state and
+queued submissions remain owned and persisted by Codex; the server reads snapshots and does not
+introduce another goal or queue store. Native `thread/goal/{updated,cleared}` and
+`thread/queue/changed` notifications become turnless `GoalsQueueChanged` invalidations. The browser
+refreshes snapshots on notification and reconnect, including changes initiated by agent tools.
+Queue start and active goals may produce autonomous native turns; the existing event forwarder
+admits those through its external-turn path and remains the only turn-lease owner.
+
+The adapter supports goal create/update/status/budget/clear and queue list/add/update/delete/reorder/
+start. List cursors are opaque and preserved. Queued text uses caller-generated message IDs; a
+mutation timeout is uncertain delivery, never an automatic retry. An accepted mutation followed by
+a failed snapshot read is reported explicitly as accepted with a refresh failure. The text editor
+marks native non-text input so clients can avoid replacing attachments accidentally. Clearing a goal
+clears the entire goal; omitted/null budget in a set request preserves its existing budget.
+## Client-executed dynamic tools
+
+`harness.dynamic_tools` in Giskard's configuration is an explicit operator allowlist of tool
+namespaces and process executors. The adapter validates JSON input schemas before spawning Codex,
+registers native `dynamicTools` namespace/function specifications on every `thread/start`
+(including resume fallback), and automatically services `item/tool/call` using the exact namespace
+and tool name. Native thread resumes retain their previously registered definitions: restart the
+project harness to change executors, and start a new thread to change advertised definitions.
+A missing executor, malformed scope, invalid arguments, process failure, invalid output, timeout,
+or overload returns `success: false` with text and a visible thread error. Browser clients cannot
+approve or fabricate a result for a running client executor.
+
+Each invocation starts the configured absolute executable with fixed argv and an explicitly
+configured absolute `cwd`. The cwd is **executor configuration**, not the originating thread's
+worktree. The child receives one newline-terminated native request JSON object on stdin
+(`namespace`, `tool`, `arguments`, `threadId`, `turnId`, `callId`), then EOF. It must exit and write
+exactly one JSON object to stdout:
+
+```json
+{"success":true,"contentItems":[{"type":"inputText","text":"Result"}]}
+```
+
+`inputImage`/`imageUrl` and `inputAudio`/`audioUrl` are also accepted; malformed variants, missing
+fields and trailing output fail the call. A zero exit code alone never implies successful tool
+execution. A nonzero exit code overrides any stdout success. Stdout, stderr and stdin each have a
+1 MiB limit; at most 16 executions or retained undelivered results occupy executor slots per
+app-server. A failed result write keeps its slot, so further executions cannot accumulate
+unbounded large results. Overload rejections may retain only their small failure response. `timeout_ms` defaults to 30000 and accepts
+1 through 3600000. Diagnostics include scope and outcome without logging input/output or stderr
+contents. Tool-owned `success:false` content is visible to the user and model.
+
+These executors run as the Giskard server OS user, inherit its environment, and are **outside
+Codex's sandbox and approval policy**. Installing an executor authorizes automatic invocation by
+any thread on projects using this server configuration. Only configure trusted programs; enforce
+any finer filesystem/network/credential policy in the executor itself. No command is inferred
+from tool arguments. Programs must not daemonize or escape their process group.
+
+The instance owns request mappings and execution handles. Process tasks only perform I/O; their
+completion re-enters the instance loop for response delivery, so a slow executor does not block
+questions, clock requests, or other thread traffic. Duplicate in-flight request IDs do not
+re-execute. Turn completion, successful interruption and deletion cancel matching executors;
+instance shutdown/drop aborts all I/O workers. On Unix the process group is killed on completion,
+error, timeout or cancellation, with the direct child reaped by Tokio. A response write failure is
+logged and surfaced while retaining the exact output and ownership until a confirmed write or
+connection teardown. A duplicate native request retries only that cached response; the browser
+cannot substitute a result, and interruption does not overwrite an already-executed result.
+Malformed executor JSON diagnostics report only the output location, never arbitrary field names
+or values from the response.
+
+## Host attestation and external authentication
+
+`start_with_service_providers` accepts optional operator-owned provider argv for attestation
+and external ChatGPT auth. See [the provider contract](../../docs/native-service-providers.md)
+for the versioned stdin/stdout protocol and configuration. Attestation is advertised only when
+configured. External auth initialization and subsequent refresh use the same host provider;
+tokens never enter mapper events, browser prompts, or persistence. Providers are bounded by an
+8-second deadline and 64 KiB output limit; failures are redacted JSON-RPC errors.
+
+The task-owned stdio transport pumps its existing inbox reader while a client RPC is pending,
+servicing these connection requests immediately to avoid waiting on an RPC which itself needs
+an auth response. Ordinary frames are retained in an ordered, bounded deferred queue and then
+returned to the instance. Overflow is fatal. The in-flight provider and response-write future
+stays task-owned across cancelled reads, so timer ticks resume the same invocation and writer
+acknowledgment instead of rerunning the provider. Shutdown drops the future and kills its child.
+Failed or uncertain response writes poison the connection rather than retrying credentials.
+No additional worker owns mapper, thread, turn, or connection service state.
+
+### Settings for autonomous work
+
+Before every goal set, queue add or queue start, the same CodexInstance control operation sends
+`thread/settings/update` and waits for its acknowledgment before sending the goal/queue mutation.
+There is no synthetic turn or resume. Settings capture the durable selected model, effort, mode,
+permissions and service tier together with the loaded thread workspace. The server rejects a
+selected provider that differs from the verified loaded native provider. `serviceTier: null`
+explicitly clears a previous captured tier; missing model/settings and settings RPC failures stop
+the subsequent action. The existing native-thread route guard and active-queue-start guard run first.
+
+These settings apply to subsequent native work, including queued prompts and goal continuations;
+they do not rewrite the turn already running. Selector changes alone remain preferences for a later
+explicit operation. Pause and save/resume a goal to apply changed preferences to continuations.
+Captured settings are thread-wide, not per queued entry. If settings succeed but the following
+mutation fails, the acknowledged settings remain native state; the next explicit control captures
+preferences again. Reads, clear, edit, delete and reorder do not change settings.

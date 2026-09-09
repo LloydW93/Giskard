@@ -3839,6 +3839,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
                     provider: "other-provider".into(),
                     model: "other-model".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 },
             },
             "select_model",
@@ -5985,6 +5986,7 @@ async fn subscribe_reopens_persisted_thread() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
 
     let resp = client
@@ -6098,6 +6100,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
 
     let resp = client
@@ -6234,6 +6237,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
 
     let resp = client
@@ -6437,6 +6441,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
 
     let resp = client
@@ -6867,6 +6872,7 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
@@ -6944,6 +6950,7 @@ async fn open_thread_normalization_reuses_live_handle() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
     let pid = ProjectId::new();
     state
@@ -7192,6 +7199,7 @@ async fn start_thread_with_initial_message_uses_selected_provider_and_starts_tur
         provider: "proxy".into(),
         model: "glm-5.2-workers-ai".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
     let resp = client
         .post(format!("{base}/api/projects/{pid}/threads/start"))
@@ -7313,6 +7321,7 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
     state
         .store
@@ -7343,6 +7352,7 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
         provider: "proxy".into(),
         model: "glm-5.2-workers-ai".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::SelectModel {
@@ -7408,6 +7418,7 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
     state
         .store
@@ -7439,6 +7450,7 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
                 provider: "proxy".into(),
                 model: "glm-5.2-workers-ai".into(),
                 reasoning_effort: None,
+                service_tier: None,
             });
         })
         .await
@@ -7706,4 +7718,94 @@ async fn browse_mkdir_creates_directory_and_rejects_escapes() {
         assert_eq!(resp.status(), 400, "name {bad:?} should be rejected");
     }
     assert!(!parent.path().parent().unwrap().join("evil").exists());
+}
+
+#[tokio::test]
+async fn goals_queue_http_rejects_invalid_input_and_managed_mutation() {
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let client = reqwest::Client::new();
+    let cookie = auth::login(&client, &server.base).await;
+    let (project, thread) =
+        create_project_and_thread(&server.state, &client, &server.base, &cookie).await;
+    let url = format!(
+        "{}/api/projects/{project}/threads/{thread}/goals-queue",
+        server.base
+    );
+    let invalid = client
+        .post(&url)
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"action":"set_goal","objective":"", "token_budget": -1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), 400);
+    server
+        .state
+        .store
+        .update_thread(project, thread, |t| {
+            t.kind = giskard_core::ThreadKind::Subagent
+        })
+        .await
+        .unwrap();
+    for action in [
+        serde_json::json!({"action":"clear_goal"}),
+        serde_json::json!({"action":"start","id":null}),
+        serde_json::json!({"action":"add","text":"test","client_message_id":"test-id"}),
+    ] {
+        let blocked = client
+            .post(&url)
+            .header("cookie", &cookie)
+            .json(&action)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), 409);
+        assert!(blocked.text().await.unwrap().contains("read-only"));
+    }
+}
+
+#[tokio::test]
+async fn goals_queue_rejects_metadata_provider_mismatch_before_launch() {
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let client = reqwest::Client::new();
+    let cookie = auth::login(&client, &server.base).await;
+    let (project, thread) =
+        create_project_and_thread(&server.state, &client, &server.base, &cookie).await;
+    assert!(
+        server
+            .state
+            .registry
+            .loaded_thread_binding(thread)
+            .await
+            .and_then(|b| b.native_model().cloned())
+            .is_some()
+    );
+    server
+        .state
+        .store
+        .update_thread(project, thread, |t| {
+            let mut model = t.current_model.as_known().unwrap().clone();
+            model.provider = "different-provider".into();
+            t.current_model = giskard_core::turn::TurnModel::Known(model);
+        })
+        .await
+        .unwrap();
+    for command in [
+        serde_json::json!({"action":"start"}),
+        serde_json::json!({"action":"set_goal","objective":"work"}),
+        serde_json::json!({"action":"add","text":"work","client_message_id":"provider-test"}),
+    ] {
+        let response = client
+            .post(format!(
+                "{}/api/projects/{project}/threads/{thread}/goals-queue",
+                server.base
+            ))
+            .header("cookie", &cookie)
+            .json(&command)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 409);
+        assert!(response.text().await.unwrap().contains("provider differs"));
+    }
 }

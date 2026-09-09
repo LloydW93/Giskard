@@ -121,6 +121,7 @@ async fn open_thread_one_turn_assert_state() {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
+                service_tier: None,
             },
         })
         .await
@@ -142,6 +143,7 @@ async fn open_thread_one_turn_assert_state() {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 mode: Mode::Build,
                 permission_preset: PermissionPreset::AutoApprove,
@@ -257,6 +259,7 @@ async fn replay_persisted_state_roundtrip() {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
+                service_tier: None,
             },
         })
         .await
@@ -315,6 +318,7 @@ async fn replay_persisted_state_roundtrip() {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         }),
         context_window: 262_144,
         model_context_windows: Default::default(),

@@ -448,6 +448,10 @@
   .server-request-field select,
   .server-request-field textarea { width:100%; }
   .server-request-field textarea { min-height:84px; resize:vertical; font-family:var(--mono); }
+  .server-request-field input.server-request-mcp-include { width:auto; margin-right:4px; }
+  .server-request-mcp-field > .server-request-field { margin-top:10px; padding-left:10px; border-left:2px solid var(--border); }
+  .server-request-json-content { width:100%; min-height:100px; resize:vertical; font-family:var(--mono); }
+  .server-request-form-error:not(:empty) { margin-top:8px; color:#ff9b9b; white-space:pre-wrap; overflow-wrap:anywhere; }
   pre.out {
     max-width:100%; margin:0; overflow-x:hidden; font-family:var(--mono); font-size:12.5px;
     white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;
@@ -1107,3 +1111,19 @@
 .question-free-text textarea { width:100%; box-sizing:border-box; resize:vertical; font:inherit; }
 .agent-questions .question-delivery { margin:0; }
 .agent-questions button[type=submit] { align-self:flex-start; }
+
+/* Goal and queue controls share a bounded, keyboard-accessible dialog on desktop and mobile. */
+.goals-queue-dialog { width:min(680px, calc(100vw - 24px)); max-height:calc(var(--app-height, 100dvh) - 32px); }
+.goals-queue-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 20px; }
+.goals-queue-head h2 { margin:0; padding:0; }
+.goals-queue-dialog .content { overflow:auto; }
+.goals-queue-dialog section + section { margin-top:24px; }
+.goals-queue-dialog label { display:flex; flex-direction:column; gap:6px; margin:12px 0; }
+.goals-queue-dialog textarea { width:100%; resize:vertical; min-height:72px; box-sizing:border-box; }
+.goals-queue-fields { display:flex; flex-wrap:wrap; gap:12px; }
+.goals-queue-fields label { flex:1; min-width:150px; }
+.goals-queue-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+#goalQueueList { padding-left:24px; }
+#goalQueueList li { margin:16px 0; }
+.queue-prompt, #goalSummary { white-space:pre-wrap; overflow-wrap:anywhere; }
+#goalsQueueNotice:empty { display:none; }

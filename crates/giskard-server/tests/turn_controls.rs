@@ -161,6 +161,7 @@ async fn modes_models_approvals_and_plan_dump() {
             provider: "cloudflare-litellm".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         },
     )
     .await;
@@ -216,6 +217,7 @@ async fn modes_models_approvals_and_plan_dump() {
             provider: "cloudflare-litellm".into(),
             model: "@cf/z-ai/glm-4.7".into(),
             reasoning_effort: None,
+            service_tier: None,
         },
     }))
     .await

@@ -2319,6 +2319,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         }
     }
 
@@ -2619,6 +2620,7 @@ mod tests {
             provider: "proxy".into(),
             model: "other".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         thread.record_model_context_window(&other, 64_000);
         assert_eq!(thread.context_window, 128_000);

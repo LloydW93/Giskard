@@ -579,6 +579,7 @@ mod tests {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 },
             })
             .await
@@ -642,6 +643,7 @@ mod tests {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 },
             })
             .await

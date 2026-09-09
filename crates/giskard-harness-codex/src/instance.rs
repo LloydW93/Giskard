@@ -4,6 +4,8 @@ use crate::uploads::{cleanup_active_turn_upload, cleanup_all_active_turn_uploads
 
 #[path = "current_time.rs"]
 mod current_time;
+#[path = "dynamic_tool_runtime.rs"]
+mod dynamic_tool_runtime;
 
 /// One task-owned runtime for one Codex app-server process.
 ///
@@ -23,12 +25,19 @@ pub(super) struct CodexInstance<C> {
     workspace_root: PathBuf,
     writable_roots: Vec<PathBuf>,
     mapper: CodexMapper,
+    dynamic_tools: dynamic_tools::Registry,
+    dynamic_calls: dynamic_tool_runtime::Calls,
     active_turns: ActiveTurns,
     pending_compactions: HashMap<ThreadId, PendingCompaction>,
     pending_context_restores: HashMap<NativeThreadId, PendingContextRestore>,
 }
 
 impl<C> CodexInstance<C> {
+    pub(super) fn with_dynamic_tools(mut self, registry: dynamic_tools::Registry) -> Self {
+        self.dynamic_tools = registry;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         client: C,
@@ -50,6 +59,8 @@ impl<C> CodexInstance<C> {
             workspace_root,
             writable_roots,
             mapper,
+            dynamic_tools: dynamic_tools::Registry::default(),
+            dynamic_calls: dynamic_tool_runtime::Calls::default(),
             active_turns: HashMap::new(),
             pending_compactions: HashMap::new(),
             pending_context_restores: HashMap::new(),
@@ -115,12 +126,17 @@ where
             tokio::select! {
                 biased;
                 _ = wait_for_shutdown_request(&mut self.receivers.shutdown) => {
+                    self.dynamic_calls.abort_all("harness shutdown");
+                    self.dynamic_calls.tasks.shutdown().await;
                     cleanup_all_active_turn_uploads(&mut self.client, &mut self.active_turns).await;
                     shutdown_codex_transport(self.client, &self.workspace_root).await;
                     self.worker_queue.close();
                     self.discoveries.close();
                     self.receivers.done.send_replace(true);
                     return;
+                }
+                completion = self.dynamic_calls.tasks.join_next(), if !self.dynamic_calls.tasks.is_empty() => {
+                    self.finish_dynamic_call(completion).await;
                 }
                 msg = self.client.next_message() => {
                     match msg {
@@ -237,6 +253,8 @@ where
                 }
             }
         }
+        self.dynamic_calls.abort_all("Codex stream ended");
+        self.dynamic_calls.tasks.shutdown().await;
         self.worker_queue.close();
         self.discoveries.close();
         self.receivers.done.send_replace(true);
@@ -344,13 +362,27 @@ where
                         opts.project,
                     )
                     .with_thread_id(thread_id);
-                    start_thread(&mut self.client, context, &cwd, &opts.initial_model).await?
+                    start_thread(
+                        &mut self.client,
+                        context,
+                        &cwd,
+                        &opts.initial_model,
+                        self.dynamic_tools.specs(),
+                    )
+                    .await?
                 }
             }
         } else {
             let context = CodexOperationContext::for_project("thread_start", opts.project)
                 .with_thread_id(thread_id);
-            start_thread(&mut self.client, context, &cwd, &opts.initial_model).await?
+            start_thread(
+                &mut self.client,
+                context,
+                &cwd,
+                &opts.initial_model,
+                self.dynamic_tools.specs(),
+            )
+            .await?
         };
 
         // B4: bind the (possibly re-established) native id to the durable ThreadId. A failed
@@ -500,6 +532,14 @@ where
                             })
                             .flatten()
                     });
+                    if matches!(&event, AgentEvent::TurnCompleted { .. }) {
+                        self.cancel_dynamic_calls(
+                            thread,
+                            event.turn(),
+                            "originating turn completed",
+                        )
+                        .await;
+                    }
                     let _ = broadcast_event(&self.senders, thread, || event).await;
                     if let Some(turn) = completed_active_turn {
                         cleanup_active_turn_upload(
@@ -519,6 +559,8 @@ where
                     } else if let Some((turn, message)) = fatal_completion
                         && emit_fatal_turn_completion(&self.senders, thread, turn, message).await
                     {
+                        self.cancel_dynamic_calls(thread, turn, "fatal turn error")
+                            .await;
                         cleanup_active_turn_upload(
                             &mut self.client,
                             &mut self.active_turns,
@@ -564,6 +606,9 @@ where
                         return MessageOutcome::Handled;
                     }
                 }
+                if self.dynamic_call_is_duplicate(&id, &request).await {
+                    return MessageOutcome::Handled;
+                }
                 let Some(event) = self
                     .map_or_discover(
                         |mapper| mapper.try_map_server_request(&id, &request, fallback_thread),
@@ -577,6 +622,9 @@ where
                 let thread = event.thread_id();
                 if let Some(active) = self.active_turns.get_mut(&thread) {
                     active.mark_server_message();
+                }
+                if self.begin_dynamic_call(&request, &event).await {
+                    return MessageOutcome::Handled;
                 }
                 let _ = broadcast_event(&self.senders, thread, || event).await;
                 MessageOutcome::Handled
@@ -631,6 +679,12 @@ where
                 response_payload,
                 response,
             } => {
+                if self.dynamic_calls.owns(&id) {
+                    let _ = response.send(Err(HarnessError::Protocol(
+                        "client executor owns this dynamic tool response".into(),
+                    )));
+                    return;
+                }
                 let result = handle_respond_server_request(
                     &mut self.client,
                     &mut self.mapper,
@@ -639,6 +693,47 @@ where
                     response_payload,
                 )
                 .await;
+                let _ = response.send(result);
+            }
+            ControlCommand::GoalsQueue {
+                thread,
+                command,
+                settings,
+                response,
+            } => {
+                let guard = if !command.is_read() && !self.mapper.has_thread_route(&thread) {
+                    Err(HarnessError::Protocol(
+                        "Thread binding changed; reopen before changing its goal or queue".into(),
+                    ))
+                } else if matches!(
+                    command,
+                    giskard_core::goals_queue::GoalsQueueCommand::Start { .. }
+                ) && self
+                    .mapper
+                    .active_giskard_turn_for_thread(thread.thread)
+                    .is_some()
+                {
+                    Err(HarnessError::ThreadBusy {
+                        thread: thread.thread,
+                    })
+                } else {
+                    Ok(())
+                };
+                let result = if let Err(error) = guard {
+                    Err(error)
+                } else {
+                    timeout_codex_control(
+                        "goals_queue",
+                        Some(&thread),
+                        None,
+                        None,
+                        super::goals_queue::execute(&mut self.client, &thread, command, settings),
+                    )
+                    .await
+                };
+                if let Err(error) = &result {
+                    warn!(thread_id = %thread.thread, %error, "Codex goals/queue control failed");
+                }
                 let _ = response.send(result);
             }
             ControlCommand::SteerTurn {
@@ -682,11 +777,14 @@ where
                 )
                 .await;
                 if result.is_ok() {
+                    self.cancel_dynamic_calls(thread.thread, None, "thread interrupted")
+                        .await;
                     reject_pending_requests_for_interrupted_thread(
                         &mut self.client,
                         &mut self.mapper,
                         &self.senders,
                         thread.thread,
+                        &self.dynamic_calls.undelivered_ids(),
                     )
                     .await;
                 }
@@ -783,6 +881,8 @@ where
                     handle_delete_thread(&mut self.client, &thread).await
                 };
                 if result.is_ok() {
+                    self.cancel_dynamic_calls(thread.thread, None, "thread deleted")
+                        .await;
                     if let Some(log) = lock_senders(&self.senders).remove(&thread.thread) {
                         log.close();
                     }

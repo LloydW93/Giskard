@@ -19,6 +19,26 @@ struct CapturingScript;
 
 #[async_trait]
 impl Script for CapturingScript {
+    fn capabilities(&self) -> giskard_harness::HarnessCapabilities {
+        giskard_harness::HarnessCapabilities {
+            model_listing: true,
+            ..giskard_testenv::fake::caps::TURNS
+        }
+    }
+
+    async fn list_models(
+        &self,
+    ) -> Result<Vec<giskard_core::model::ModelDescriptor>, giskard_core::HarnessError> {
+        let mut descriptor =
+            giskard_core::model::ModelDescriptor::conservative("openai", "gpt-5.5");
+        descriptor.service_tiers = Some(vec![giskard_core::model::ModelServiceTier {
+            id: "future-fast".into(),
+            name: "Future fast".into(),
+            description: "Test tier".into(),
+        }]);
+        Ok(vec![descriptor])
+    }
+
     fn native_thread_id(&self, _thread: giskard_core::ids::ThreadId) -> String {
         "cap".into()
     }
@@ -87,6 +107,7 @@ async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: Some(Effort::new("high")),
+            service_tier: Some("future-fast".into()),
         },
     }))
     .await
@@ -115,6 +136,7 @@ async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: Some(Effort::new("high")),
+            service_tier: Some("future-fast".into()),
         }),
         "fix #1: current model + effort must reach the harness"
     );
@@ -123,6 +145,22 @@ async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
         first.permission_preset,
         PermissionPreset::AskFirst,
         "new threads default to ask first"
+    );
+
+    let persisted = state
+        .store
+        .load_thread(pid, thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted
+            .current_model
+            .as_known()
+            .unwrap()
+            .service_tier
+            .as_deref(),
+        Some("future-fast")
     );
 
     // Now set the thread permission preset and send again.
@@ -173,6 +211,7 @@ async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         },
     }))
     .await
@@ -212,9 +251,50 @@ async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         }),
         "cleared reasoning effort should not be sent to the harness"
     );
+    ws::send(
+        &mut ws,
+        &ClientMessage::SelectModel {
+            thread_id,
+            request_id: "bad-tier".into(),
+            model_ref: ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
+                service_tier: Some("not-advertised".into()),
+            },
+        },
+    )
+    .await;
+    let error = ws::expect_error_for(&mut ws, "select_model", "invalid_service_tier").await;
+    assert_eq!(error.thread_id, Some(thread_id));
+    let persisted = state
+        .store
+        .load_thread(pid, thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        persisted
+            .current_model
+            .as_known()
+            .unwrap()
+            .service_tier
+            .is_none()
+    );
+    let (history, _) = state
+        .store
+        .load_history(pid, thread_id, None, 10)
+        .await
+        .unwrap();
+    assert!(history.iter().any(|turn| {
+        turn.model
+            .as_known()
+            .is_some_and(|model| model.service_tier.as_deref() == Some("future-fast"))
+    }));
 }
 
 /// Wait until at least `n` overrides have been captured, returning the `n`-th (1-based).

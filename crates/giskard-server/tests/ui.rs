@@ -360,11 +360,11 @@ async fn index_page_is_served_and_public() {
         "known unsupported server requests use an explicit error response"
     );
     assert!(
-        body.contains("Giskard cannot refresh ChatGPT auth tokens."),
+        body.contains("This request requires an external-auth provider configured on the host."),
         "auth refresh requests cannot accidentally return empty success"
     );
     assert!(
-        body.contains("Giskard cannot generate client attestation tokens."),
+        body.contains("This request requires an attestation provider configured on the host."),
         "attestation requests cannot accidentally return empty success"
     );
     assert!(
@@ -1092,7 +1092,7 @@ async fn index_page_is_served_and_public() {
             && body.contains(
                 "readOnly || (state.activeTurn && !canSteerTurn()) || !!state.pendingComposerSteer || state.updateRequired || state.uiVersionCheckPending ||"
             )
-            && body.contains("attachmentsLoading || modelUnresolved || nothingToSend ||")
+            && body.contains("attachmentsLoading || modelUnresolved || !!attachmentModalityError() || nothingToSend ||")
             && body.contains("!hasThreadSurface || (!ready && !draft)")
             && body.contains("if (isDraftThread()) {")
             && body.contains("startDraftThread(text, attachments);")
@@ -1800,8 +1800,8 @@ fn browser_has_no_model_list_outside_a_project() {
     );
     assert!(
         composer_controls.contains("const modelCatalogReady = projectModelCatalogReady();")
-            && composer_controls.matches("!modelCatalogReady").count() == 3,
-        "model, picker, and effort controls remain disabled until the active catalog is ready"
+            && composer_controls.matches("!modelCatalogReady").count() == 4,
+        "model, picker, effort, and service tier controls remain disabled until the active catalog is ready"
     );
 
     let render_models = between(

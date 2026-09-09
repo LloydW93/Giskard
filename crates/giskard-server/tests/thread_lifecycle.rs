@@ -78,6 +78,7 @@ async fn thread_lifecycle_native_failure_preserves_local_thread() {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 context_window: 262_144,
                 model_context_windows: Default::default(),

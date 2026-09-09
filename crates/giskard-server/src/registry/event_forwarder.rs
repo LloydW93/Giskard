@@ -1526,6 +1526,7 @@ impl ThreadEventForwarder {
         hub.publish(thread_id, Outbound::RuntimeEffects(applied))
             .await;
         let reaches_transcript = match &event {
+            AgentEvent::GoalsQueueChanged { .. } => true,
             AgentEvent::Error { error, .. } => {
                 warn!(
                     %project_id,
@@ -3148,6 +3149,7 @@ mod tests {
             provider: "openai".into(),
             model: "historical-model".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -3279,6 +3281,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.6-sol".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -3343,6 +3346,7 @@ mod tests {
                 provider: model.provider.clone(),
                 model: "gpt-5.6-pro".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             context_window: Some(400_000),
         }));
@@ -3397,6 +3401,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.6-sol".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -3771,6 +3776,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -3913,6 +3919,7 @@ mod tests {
             provider: "openai".into(),
             model: "initial".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4057,6 +4064,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4255,6 +4263,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4425,6 +4434,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4552,6 +4562,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4707,6 +4718,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4800,6 +4812,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4951,6 +4964,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -5252,6 +5266,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -5394,6 +5409,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -5636,6 +5652,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -5795,6 +5812,7 @@ mod tests {
                     provider: "openai".into(),
                     model: "test".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
             },
             classification,
@@ -5906,6 +5924,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -6098,6 +6117,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -6298,6 +6318,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -6449,6 +6470,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")

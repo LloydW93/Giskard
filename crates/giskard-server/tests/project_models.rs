@@ -43,6 +43,10 @@ fn catalog_model(model: &str, name: &str, efforts: &[&str]) -> ModelDescriptor {
         reasoning_efforts: efforts.iter().map(|e| (*e).to_string()).collect(),
         display_name: Some(name.into()),
         is_default: false,
+        service_tiers: None,
+        default_service_tier: None,
+        input_modalities: None,
+        multi_agent_version: None,
     }
 }
 
@@ -290,6 +294,7 @@ async fn catalog_effort_survives_new_thread_creation() {
                 provider: "mock".into(),
                 model: "glm-5.2".into(),
                 reasoning_effort: Some(Effort::new("medium")),
+                service_tier: None,
             },
         })
         .unwrap()
@@ -440,4 +445,101 @@ async fn unmarked_catalog_exposes_no_default_and_falls_back_to_first() {
         "no model claims to be the default: {catalog}"
     );
     assert_eq!(models[0]["model"], "gpt-5.5", "first entry is the fallback");
+}
+
+#[tokio::test]
+async fn audio_modality_is_enforced_for_first_and_existing_thread_inputs() {
+    use base64::Engine;
+    use futures::StreamExt;
+    for accepts_audio in [false, true] {
+        let mut descriptor = catalog_model("glm-5.2", "Test model", &[]);
+        descriptor.input_modalities = Some(if accepts_audio {
+            vec!["text".into(), "audio".into()]
+        } else {
+            vec!["text".into()]
+        });
+        let fixture = spawn_project(|mock_addr| {
+            let providers = harness_providers(mock_addr);
+            factory::from_fn(move |_, _| {
+                Ok(Arc::new(
+                    ReplayHarness::new()
+                        .with_models(vec![descriptor.clone()])
+                        .with_providers(providers.clone()),
+                ))
+            })
+        })
+        .await;
+        let attachment = giskard_core::UserAttachment {
+            name: "note.wav".into(),
+            mime_type: "audio/wav".into(),
+            size: 12,
+            kind: giskard_core::AttachmentKind::Audio,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(b"RIFF0000WAVE"),
+        };
+        let url = format!(
+            "{}/api/projects/{}/threads/start",
+            fixture.server.base, fixture.project_id
+        );
+        let mut request = serde_json::json!({"text":"Listen", "model_ref":{"provider":"mock","model":"glm-5.2"}, "mode":"build", "permission_preset":"ask_first", "attachments":[{"name":attachment.name,"mime_type":attachment.mime_type,"size":attachment.size,"kind":"audio","data_base64":attachment.data_base64}]});
+        let response = fixture
+            .server
+            .client
+            .post(&url)
+            .header("cookie", &fixture.server.cookie)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if accepts_audio {
+                reqwest::StatusCode::OK
+            } else {
+                reqwest::StatusCode::BAD_REQUEST
+            }
+        );
+        if accepts_audio {
+            continue;
+        }
+        request["attachments"] = serde_json::json!([]);
+        let response = fixture
+            .server
+            .client
+            .post(&url)
+            .header("cookie", &fixture.server.cookie)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let thread_id = response.json::<serde_json::Value>().await.unwrap()["thread_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut socket = fixture.server.ws().await;
+        socket
+            .send(giskard_testenv::ws::text(&ClientMessage::SendInput {
+                thread_id,
+                text: "Listen".into(),
+                attachments: vec![attachment],
+            }))
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = frame
+                    && let Ok(giskard_proto::ServerMessage::Error { error }) =
+                        serde_json::from_str(&text)
+                {
+                    break error;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(error.code, "unsupported_input_modality");
+        assert_eq!(error.action.as_deref(), Some("send_input"));
+    }
 }

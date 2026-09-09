@@ -29,6 +29,10 @@ fn from_config(config: &Config, provider: &str, model: &str) -> Option<ModelDesc
         reasoning_efforts: Vec::new(),
         display_name: m.display_name.clone(),
         is_default: false,
+        service_tiers: None,
+        default_service_tier: None,
+        input_modalities: None,
+        multi_agent_version: None,
     })
 }
 
@@ -44,16 +48,21 @@ pub fn resolve_catalog_descriptor(
     config: &Config,
     model: &ModelRef,
 ) -> ModelDescriptor {
-    from_config(config, &model.provider, &model.model)
-        .or_else(|| {
-            catalog
-                .iter()
-                .find(|descriptor| {
-                    descriptor.provider == model.provider && descriptor.model == model.model
-                })
-                .cloned()
-        })
-        .unwrap_or_else(|| resolve_descriptor(config, model))
+    let catalog_entry = catalog.iter().find(|descriptor| {
+        descriptor.provider == model.provider && descriptor.model == model.model
+    });
+    let mut descriptor = from_config(config, &model.provider, &model.model)
+        .or_else(|| catalog_entry.cloned())
+        .unwrap_or_else(|| resolve_descriptor(config, model));
+    // Config owns its explicitly configurable fields, but does not declare native capabilities.
+    // Preserve those from the composed catalog even when config supplies this model's window.
+    if let Some(native) = catalog_entry {
+        descriptor.service_tiers = native.service_tiers.clone();
+        descriptor.default_service_tier = native.default_service_tier.clone();
+        descriptor.input_modalities = native.input_modalities.clone();
+        descriptor.multi_agent_version = native.multi_agent_version.clone();
+    }
+    descriptor
 }
 
 pub fn normalize_model_ref(
@@ -132,6 +141,10 @@ pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
                 reasoning_efforts: Vec::new(),
                 display_name: m.display_name.clone(),
                 is_default: false,
+                service_tiers: None,
+                default_service_tier: None,
+                input_modalities: None,
+                multi_agent_version: None,
             });
         }
     }
@@ -214,6 +227,10 @@ pub fn apply_harness_metadata(
         // below, both would claim it and the picker would start on whichever came first.
         if h.provider.is_empty() || h.provider == d.provider {
             d.is_default = h.is_default;
+            d.service_tiers = h.service_tiers.clone();
+            d.default_service_tier = h.default_service_tier.clone();
+            d.input_modalities = h.input_modalities.clone();
+            d.multi_agent_version = h.multi_agent_version.clone();
         }
         // Config wins, and so does anything discovery already learned: a provider's own catalog
         // names efforts for *its* model, while `model/list` is keyed by model id alone and knows
@@ -979,6 +996,27 @@ async fn discover_provider(
     (models, warnings)
 }
 
+/// Only an advertised tier may be selected. The cap keeps human-selected model metadata
+/// bounded in the history index even when a provider publishes malformed identifiers.
+pub fn validate_service_tier(model: &ModelRef, descriptor: &ModelDescriptor) -> Result<(), String> {
+    let Some(tier) = model.service_tier.as_deref() else {
+        return Ok(());
+    };
+    if tier.is_empty()
+        || tier.len() > 128
+        || !descriptor
+            .service_tiers
+            .as_ref()
+            .is_some_and(|tiers| tiers.iter().any(|entry| entry.id == tier))
+    {
+        return Err(format!(
+            "Service tier is not available for model {}. Refresh the model list and select an advertised tier or Native default.",
+            model.model
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,6 +1039,60 @@ mod tests {
 
     /// The headline: a provider the harness reports is discovered without config naming it. The
     /// harness table is where a provider is declared; repeating it here bought nothing.
+    #[test]
+    fn service_tiers_validate_against_the_selected_catalog_route() {
+        let mut descriptor = ModelDescriptor::conservative("openai", "astra");
+        descriptor.service_tiers = Some(vec![giskard_core::model::ModelServiceTier {
+            id: "future-fast".into(),
+            name: "Future Fast".into(),
+            description: "Capacity".into(),
+        }]);
+        let mut model = ModelRef {
+            provider: "openai".into(),
+            model: "astra".into(),
+            reasoning_effort: None,
+            service_tier: None,
+        };
+        assert!(validate_service_tier(&model, &descriptor).is_ok());
+        model.service_tier = Some("future-fast".into());
+        assert!(validate_service_tier(&model, &descriptor).is_ok());
+        assert!(
+            validate_service_tier(&model, &ModelDescriptor::conservative("openai", "other"))
+                .is_err()
+        );
+        model.service_tier = Some("unadvertised".into());
+        assert!(validate_service_tier(&model, &descriptor).is_err());
+        model.service_tier = Some("x".repeat(129));
+        descriptor.service_tiers.as_mut().unwrap()[0].id = "x".repeat(129);
+        assert!(validate_service_tier(&model, &descriptor).is_err());
+    }
+
+    #[test]
+    fn native_capability_metadata_stays_on_its_provider_route() {
+        let mut native = ModelDescriptor::conservative("openai", "astra");
+        native.input_modalities = Some(vec!["audio".into()]);
+        native.multi_agent_version = Some("v99".into());
+        native.default_service_tier = Some("future-fast".into());
+        native.service_tiers = Some(vec![giskard_core::model::ModelServiceTier {
+            id: "future-fast".into(),
+            name: "Fast".into(),
+            description: String::new(),
+        }]);
+        let base = vec![
+            ModelDescriptor::conservative("openai", "astra"),
+            ModelDescriptor::conservative("other", "astra"),
+        ];
+        let out = apply_harness_metadata(base, &[native], &Config::default(), &HashSet::new());
+        let exact = out.iter().find(|m| m.provider == "openai").unwrap();
+        assert_eq!(exact.input_modalities.as_ref().unwrap(), &["audio"]);
+        assert_eq!(exact.multi_agent_version.as_deref(), Some("v99"));
+        assert_eq!(exact.default_service_tier.as_deref(), Some("future-fast"));
+        assert_eq!(exact.service_tiers.as_ref().unwrap()[0].id, "future-fast");
+        let other = out.iter().find(|m| m.provider == "other").unwrap();
+        assert!(other.service_tiers.is_none());
+        assert!(other.input_modalities.is_none());
+    }
+
     #[test]
     fn a_provider_absent_from_config_is_still_queried() {
         let config: Config = toml::from_str("").unwrap();
@@ -1107,6 +1199,7 @@ model_listing = true
             provider: "cloudflare-litellm".into(),
             model: "@cf/z-ai/glm-4.7".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let d = resolve_descriptor(&config, &m);
         assert_eq!(d.context_window, 131_072);
@@ -1120,6 +1213,7 @@ model_listing = true
             provider: "cloudflare-litellm".into(),
             model: "@cf/z-ai/glm-4.7".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let stale_catalog = vec![ModelDescriptor {
             provider: model.provider.clone(),
@@ -1129,6 +1223,10 @@ model_listing = true
             reasoning_efforts: vec!["high".into()],
             display_name: Some("Stale".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         let descriptor = resolve_catalog_descriptor(&stale_catalog, &config, &model);
@@ -1143,6 +1241,7 @@ model_listing = true
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         assert_eq!(
             context_window_for(&config, &m),
@@ -1157,6 +1256,7 @@ model_listing = true
             provider: "acme".into(),
             model: "mystery-1".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let d = resolve_descriptor(&config, &m);
         assert_eq!(
@@ -1649,6 +1749,10 @@ model_listing = true
                 reasoning_efforts: Vec::new(),
                 display_name: None,
                 is_default: false,
+                service_tiers: None,
+                default_service_tier: None,
+                input_modalities: None,
+                multi_agent_version: None,
             },
             ModelDescriptor {
                 provider: "cloudflare-litellm".into(),
@@ -1658,6 +1762,10 @@ model_listing = true
                 reasoning_efforts: Vec::new(),
                 display_name: Some("GLM-4.7".into()),
                 is_default: false,
+                service_tiers: None,
+                default_service_tier: None,
+                input_modalities: None,
+                multi_agent_version: None,
             },
         ];
         // Harness catalog is provider-agnostic (empty provider), keyed by model id.
@@ -1670,6 +1778,10 @@ model_listing = true
                 reasoning_efforts: vec!["low".into(), "high".into()],
                 display_name: Some("GPT-5.5".into()),
                 is_default: false,
+                service_tiers: None,
+                default_service_tier: None,
+                input_modalities: None,
+                multi_agent_version: None,
             },
             ModelDescriptor {
                 provider: String::new(),
@@ -1679,6 +1791,10 @@ model_listing = true
                 reasoning_efforts: vec!["medium".into()],
                 display_name: Some("GLM 4.7".into()),
                 is_default: false,
+                service_tiers: None,
+                default_service_tier: None,
+                input_modalities: None,
+                multi_agent_version: None,
             },
         ];
 
@@ -1723,6 +1839,10 @@ model_listing = true
             reasoning_efforts: Vec::new(),
             display_name: None,
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         let out = order_for_picker(
@@ -1757,6 +1877,10 @@ model_listing = true
             reasoning_efforts: Vec::new(),
             display_name: None,
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
         let out = apply_harness_metadata(
             list_descriptors(&config),
@@ -1789,6 +1913,10 @@ model_listing = true
             reasoning_efforts: Vec::new(),
             display_name: Some("GPT-5.5".into()),
             is_default: true,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
         let out = apply_harness_metadata(
             list_descriptors(&config),
@@ -1826,6 +1954,7 @@ model_listing = true
             provider: "openai".into(),
             model: "@cf/z-ai/glm-4.7".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let catalog = vec![ModelDescriptor::conservative(
             "openai".to_string(),
@@ -1859,6 +1988,10 @@ model_listing = true
             reasoning_efforts: vec!["low".into(), "high".into(), "xhigh".into()],
             display_name: Some("GPT-5.5".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         };
         // What `model/list` says about a model with the same id, under no provider at all.
         let harness = vec![ModelDescriptor {
@@ -1869,6 +2002,10 @@ model_listing = true
             reasoning_efforts: vec!["low".into(), "medium".into()],
             display_name: Some("Other".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         // Discovery spoke about this pair, so the overlay must leave its efforts alone.
@@ -1901,6 +2038,10 @@ model_listing = true
             reasoning_efforts: Vec::new(),
             display_name: None,
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         };
         let harness = vec![ModelDescriptor {
             provider: String::new(),
@@ -1910,6 +2051,10 @@ model_listing = true
             reasoning_efforts: vec!["low".into(), "medium".into()],
             display_name: None,
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         let stated = HashSet::from([("opencodex".to_string(), "gpt-5.5".to_string())]);
@@ -1937,6 +2082,10 @@ model_listing = true
             reasoning_efforts: Vec::new(),
             display_name: None,
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         };
         let harness = vec![ModelDescriptor {
             provider: String::new(),
@@ -1946,6 +2095,10 @@ model_listing = true
             reasoning_efforts: vec!["low".into(), "medium".into()],
             display_name: Some("GPT-5.5".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         let out = apply_harness_metadata(vec![discovered], &harness, &config, &HashSet::new());
@@ -1982,6 +2135,10 @@ model_listing = true
             reasoning_efforts: Vec::new(),
             display_name: name.map(str::to_string),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         };
         // Harness catalog entry (empty provider) with a name and effort list.
         let cat = |model: &str, name: &str, efforts: &[&str]| ModelDescriptor {
@@ -1992,6 +2149,10 @@ model_listing = true
             reasoning_efforts: efforts.iter().map(|e| (*e).to_string()).collect(),
             display_name: Some(name.into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         };
 
         let base = vec![
@@ -2063,6 +2224,10 @@ model_listing = true
             reasoning_efforts: Vec::new(),
             display_name: Some("GPT-5.5".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
         let merged = apply_harness_metadata(base.clone(), &unsupported, &config, &HashSet::new());
         assert!(!merged[0].supports_reasoning_effort);
@@ -2076,6 +2241,10 @@ model_listing = true
             reasoning_efforts: Vec::new(),
             display_name: Some("GPT-5.5".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
         let merged = apply_harness_metadata(base, &default_only, &config, &HashSet::new());
         assert!(merged[0].supports_reasoning_effort);
@@ -2088,6 +2257,7 @@ model_listing = true
             provider: "openai".into(),
             model: "gpt-5.6-sol".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let descriptor = ModelDescriptor::conservative("openai", "gpt-5.6-sol");
         let runtime = HashMap::from([
@@ -2121,11 +2291,13 @@ model_listing = true
             provider: "a".into(),
             model: "b/c".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let second = ModelRef {
             provider: "a/b".into(),
             model: "c".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
 
         assert_eq!(
@@ -2169,6 +2341,10 @@ model_listing = true
             reasoning_efforts: vec!["focused".into()],
             display_name: Some("Shared Model".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         let merged = apply_harness_metadata(base, &harness, &config, &HashSet::new());
@@ -2186,6 +2362,7 @@ model_listing = true
                 provider: "openai".into(),
                 model: "@cf/z-ai/glm-4.7".into(),
                 reasoning_effort: Some(giskard_core::model::Effort::new("high")),
+                service_tier: None,
             },
         );
         assert_eq!(normalized.provider, "cloudflare-litellm");
@@ -2212,6 +2389,7 @@ model_listing = true
             provider: "openai".into(),
             model: "@cf/z-ai/glm-4.7".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         assert_eq!(normalize_model_ref(&config, &[], &original), original);
     }

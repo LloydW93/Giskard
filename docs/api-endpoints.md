@@ -43,6 +43,15 @@ so a project-less list could only ever repeat `config.toml` back, which is why n
 `GET /api/models` nor `POST /api/models/refresh` exists. The thread picker's reload button re-runs
 this endpoint for the active project.
 
+Model descriptors preserve optional `service_tiers` (`id`, `name`, `description`),
+`default_service_tier`, `input_modalities`, and `multi_agent_version` from the native catalog.
+Unknown versus explicitly empty capability lists remain distinct. The optional `service_tier`
+field in `model_ref` is accepted by thread start and WebSocket `select_model`, persisted as part
+of model metadata, and passed to each turn. Nonempty selections must match an advertised tier
+and fit in 128 bytes; invalid selections return HTTP 400 or WebSocket `invalid_service_tier`.
+Sending with a tier that was removed from the catalog returns the same structured error.
+Absent/null selects the native thread default; model defaults are descriptive, never inferred.
+
 `POST /api/projects/{id}/threads/start` takes `git_strategy`, which decides where the thread's
 working tree comes from: `shared` (the project's own checkout — the default, and what an omitted
 field means) or `worktree` (a linked Git worktree of its own, §7.1). It is an enum rather than a
@@ -54,7 +63,10 @@ tell.
 attachment set, persists a deterministic title generated from the prompt or first attachment name,
 and returns the title with the new thread and turn identifiers. The request accepts optional
 transient attachment payloads; Giskard validates them and does not persist raw attachment bytes.
-Image MIME types must match PNG, JPEG, GIF, or WebP file signatures. Raw bytes are also redacted
+Attachment kind may be `image`, `audio`, or `file`. Image MIME types must match PNG, JPEG, GIF, or WebP file signatures.
+Audio MIME types must match WAV (`audio/wav`) or MP3 (`audio/mpeg`) signatures. An explicit
+model input-modality list that excludes audio rejects audio attachments before turn admission;
+unknown modality metadata defers to the harness. Raw bytes are also redacted
 before turns enter the parsed in-memory history cache. The Codex adapter transfers non-image files
 into a randomized per-turn directory under the harness host's temporary directory. It removes the
 directory after turn completion, upload/start failure, stream loss, channel closure, or shutdown;
@@ -271,3 +283,37 @@ recorded through provider user-message events. The server supplies native `clien
 payloads. Clients can therefore confirm exact delivery without mistaking another identical message
 for a receipt. The namespace also distinguishes steering from initial input sent by other native
 clients, which may carry their own client IDs.
+
+### Goals and queue
+
+- `GET /api/projects/{id}/threads/{thread_id}/goals-queue?cursor=...` reads the harness-owned goal
+  and one queue page. Response: `{goal, queue, next_cursor}`. Goal fields are `objective`, `status`
+  (`active`, `paused`, `blocked`, `usage_limited`, `budget_limited`, `complete`), `token_budget`,
+  `tokens_used`, `time_used_seconds`, `created_at`, `updated_at`. Queue entries contain `id`,
+  `client_message_id`, `text`, and `has_other_input`.
+- `POST` to the same path accepts tagged actions: `read` (`cursor` optional), `set_goal` (`objective`,
+  `status`, `token_budget` optional), `clear_goal`, `add` (`text`, `client_message_id`), `update`
+  (`id`, `text`), `delete` (`id`), `reorder` (`ids`), `start` (`id` optional). Successful responses
+  contain a refreshed snapshot. Mutations require an opened, non-archived primary thread; managed
+  children and orphans are read-only. Empty text, invalid budgets, and duplicate order IDs fail
+  validation. Null/absent goal budget preserves the existing value. Queue mutations are never
+  automatically retried: timeouts may mean delivery occurred, and accepted mutations whose refresh
+  failed explicitly report that acceptance.
+- WebSocket `thread_capabilities` includes `goals_queue`; `goals_queue_changed` agent events
+  invalidate goal/queue snapshots. Reconnect reads fresh harness state rather than browser storage.
+### MCP form response validation
+
+The existing `server_request_response` WebSocket action validates accepted MCP form content
+against the complete pending request's JSON Schema before delivering it to the harness.
+Invalid content, malformed/unknown schema dialects, and unavailable external references return
+`harness_protocol_error` with action `server_request_response`; the request returns to Pending
+and can be corrected or declined. Decline/Cancel bypass content validation. Validation never
+retrieves remote or local-file schema references.
+
+Goal `set_goal` and queue `add`/`start` capture the current persisted model/effort/service tier,
+mode and permission preset, plus the loaded workspace, through native `thread/settings/update`
+before the action. A provider mismatch or settings failure rejects the action. The capture applies
+to subsequent native queued/goal work for the thread, not per queue entry or the already-running
+turn. Changing selectors alone does not reconfigure autonomous work; save/resume a goal or submit
+queue Add or Start to capture the changed preferences. The browser cannot supply arbitrary launch
+settings through this endpoint.

@@ -16,6 +16,9 @@ use crate::turn::TurnStatus;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEvent {
+    GoalsQueueChanged {
+        thread: ThreadId,
+    },
     ThreadOpened {
         thread: ThreadId,
         harness_thread_id: String,
@@ -112,6 +115,7 @@ impl AgentEvent {
     /// and a wire frame name the same event the same way; the test below pins that.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::GoalsQueueChanged { .. } => "goals_queue_changed",
             Self::ThreadOpened { .. } => "thread_opened",
             Self::TurnStarted { .. } => "turn_started",
             Self::TurnUsageUpdated { .. } => "turn_usage_updated",
@@ -146,7 +150,7 @@ impl AgentEvent {
             | Self::ServerRequestResolved { turn, .. }
             | Self::Error { turn, .. }
             | Self::Notice { turn, .. } => *turn,
-            Self::ThreadOpened { .. } => None,
+            Self::ThreadOpened { .. } | Self::GoalsQueueChanged { .. } => None,
         }
     }
 
@@ -164,7 +168,10 @@ impl AgentEvent {
     /// recorded stream to a fresh thread id.
     pub fn set_thread(&mut self, thread: ThreadId) {
         match self {
-            Self::ThreadOpened {
+            Self::GoalsQueueChanged {
+                thread: event_thread,
+            }
+            | Self::ThreadOpened {
                 thread: event_thread,
                 ..
             }
@@ -221,7 +228,8 @@ impl AgentEvent {
 
     pub fn thread_id(&self) -> ThreadId {
         match self {
-            Self::ThreadOpened { thread, .. }
+            Self::GoalsQueueChanged { thread }
+            | Self::ThreadOpened { thread, .. }
             | Self::TurnStarted { thread, .. }
             | Self::TurnUsageUpdated { thread, .. }
             | Self::ItemStarted { thread, .. }
@@ -254,6 +262,7 @@ mod tests {
         let delta_item_id = ItemId::new();
         let completed_item_id = ItemId::new();
         vec![
+            AgentEvent::GoalsQueueChanged { thread },
             AgentEvent::ThreadOpened {
                 thread,
                 harness_thread_id: "native-thread".into(),
@@ -364,7 +373,7 @@ mod tests {
     #[test]
     fn kind_matches_the_serde_tag_for_every_variant() {
         let events = every_variant(Some(TurnId::new()));
-        assert_eq!(events.len(), 13);
+        assert_eq!(events.len(), 14);
         for event in events {
             let json = serde_json::to_value(&event).unwrap();
             assert_eq!(json["kind"], event.kind());
@@ -375,10 +384,10 @@ mod tests {
     fn turn_is_present_exactly_where_the_variant_carries_one() {
         for optional_turn in [Some(TurnId::new()), None] {
             let events = every_variant(optional_turn);
-            assert_eq!(events.len(), 13);
+            assert_eq!(events.len(), 14);
             for event in events {
                 let expected = match &event {
-                    AgentEvent::ThreadOpened { .. } => None,
+                    AgentEvent::ThreadOpened { .. } | AgentEvent::GoalsQueueChanged { .. } => None,
                     AgentEvent::TurnStarted { turn, .. }
                     | AgentEvent::TurnUsageUpdated { turn, .. }
                     | AgentEvent::ItemStarted { turn, .. }
@@ -400,7 +409,7 @@ mod tests {
     #[test]
     fn item_id_names_the_item_for_the_three_item_events() {
         let events = every_variant(Some(TurnId::new()));
-        assert_eq!(events.len(), 13);
+        assert_eq!(events.len(), 14);
         for event in events {
             let expected = match &event {
                 AgentEvent::ItemStarted { item, .. } => Some(item.id),
@@ -416,7 +425,7 @@ mod tests {
     fn set_thread_readdresses_every_variant() {
         let new_thread = ThreadId::new();
         let events = every_variant(Some(TurnId::new()));
-        assert_eq!(events.len(), 13);
+        assert_eq!(events.len(), 14);
         for mut event in events {
             event.set_thread(new_thread);
             assert_eq!(event.thread_id(), new_thread);

@@ -197,6 +197,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         assert_eq!(
             serde_json::to_value(TurnModel::Known(model.clone())).unwrap(),
@@ -235,6 +236,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: Some(Effort::new("high")),
+                service_tier: None,
             }),
             mode: Mode::Build,
             permission_preset: PermissionPreset::AskFirst,

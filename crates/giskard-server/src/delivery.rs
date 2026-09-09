@@ -287,6 +287,7 @@ mod tests {
                     provider: "test".into(),
                     model: "test".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 context_window: 128_000,
                 permission_preset: PermissionPreset::AskFirst,

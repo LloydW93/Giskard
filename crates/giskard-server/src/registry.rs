@@ -1033,7 +1033,30 @@ impl HarnessRegistry {
             &resolved.authority,
             RuntimeRequestId::Server(request_id.clone()),
         )?;
+        let transition_payload = transition.request_state.payload.clone();
         self.publish_request_transition(thread_id, transition).await;
+
+        if let giskard_proto::RequestPayload::Server { request } = &transition_payload {
+            let request = request.clone();
+            let response_to_validate = response.clone();
+            let validation = tokio::task::spawn_blocking(move || {
+                crate::mcp_forms::validate_response(&request, &response_to_validate)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(HarnessError::Protocol(format!(
+                    "MCP form validation task failed: {error}"
+                )))
+            });
+            if let Err(error) = validation {
+                warn!(%project_id, %thread_id, request_id = %request_id.0,
+                    action = "server_request_response", %error, "server request response validation rejected");
+                if let Some(transition) = claim.rollback() {
+                    self.publish_request_transition(thread_id, transition).await;
+                }
+                return Err(error);
+            }
+        }
 
         if let Err(error) = harness
             .respond_server_request(request_id.clone(), response.clone())
@@ -1117,6 +1140,16 @@ impl HarnessRegistry {
     ) {
         self.publish_request_state(thread_id, &RuntimeRequestId::Approval(request_id))
             .await;
+    }
+
+    pub async fn goals_queue_supported(&self, thread_id: ThreadId) -> bool {
+        let Some(binding) = self.loaded_thread_binding(thread_id).await else {
+            return false;
+        };
+        self.shared
+            .active_harness(binding.project_id)
+            .await
+            .is_some_and(|h| h.goals_queue_supported())
     }
 
     pub async fn turn_steering_supported(&self, thread_id: ThreadId) -> bool {
@@ -2485,6 +2518,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "test".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             context_window: 128_000,
             model_context_windows: Default::default(),
@@ -2652,6 +2686,7 @@ mod tests {
             provider: "openai".into(),
             model: "test".into(),
             reasoning_effort: None,
+            service_tier: None,
         }
     }
 
@@ -3265,6 +3300,7 @@ mod tests {
                                 provider: "openai".into(),
                                 model: "gpt-test".into(),
                                 reasoning_effort: None,
+                                service_tier: None,
                             },
                             updates,
                         })
@@ -3319,6 +3355,7 @@ mod tests {
                     provider: "openai".into(),
                     model: "gpt-test".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 },
             )
             .await;
@@ -3455,6 +3492,7 @@ mod tests {
                             provider: "openai".into(),
                             model: "test".into(),
                             reasoning_effort: None,
+                            service_tier: None,
                         }),
                         context_window: 128_000,
                         model_context_windows: Default::default(),
@@ -3825,6 +3863,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "test".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             mode: TurnMode::Known(Mode::Build),
             kind: TurnContextKind::User,
@@ -4020,6 +4059,7 @@ mod tests {
             provider: "provider-a".into(),
             model: "model-a".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let coordinator_a = Arc::new(super::ThreadCoordinator::new(
             super::LoadedThreadBinding {
@@ -4041,6 +4081,7 @@ mod tests {
             provider: "provider-b".into(),
             model: "model-b".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let coordinator_b = Arc::new(super::ThreadCoordinator::new(
             super::LoadedThreadBinding {
@@ -4105,6 +4146,7 @@ mod tests {
             provider: "provider".into(),
             model: "model".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let known = Arc::new(super::ThreadCoordinator::new(
             super::LoadedThreadBinding {

@@ -1618,6 +1618,7 @@ mod tests {
                 provider: "test".into(),
                 model: "test".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             mode: TurnMode::Known(Mode::Build),
             kind: TurnContextKind::User,

@@ -52,6 +52,7 @@ fn orphaned_model() -> ModelRef {
         provider: "cloudflare-litellm".into(),
         model: "@cf/z-ai/glm-4.7".into(),
         reasoning_effort: None,
+        service_tier: None,
     }
 }
 

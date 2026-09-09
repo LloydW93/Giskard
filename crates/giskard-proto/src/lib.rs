@@ -332,6 +332,8 @@ pub enum ServerMessage {
     ThreadCapabilities {
         thread_id: ThreadId,
         turn_steering: bool,
+        #[serde(default)]
+        goals_queue: bool,
     },
     SteerInputAccepted {
         thread_id: ThreadId,
@@ -1063,6 +1065,7 @@ mod tests {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 context_window: 258_400,
                 permission_preset: PermissionPreset::AskFirst,
@@ -1103,6 +1106,7 @@ mod tests {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 context_window: 258_400,
                 permission_preset: PermissionPreset::AskFirst,

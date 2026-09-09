@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 struct ServerRequestScript {
+    mcp_schema: Mutex<Option<serde_json::Value>>,
     active: Mutex<Option<(ThreadId, TurnId)>>,
     fail_next_response: Mutex<Option<HarnessError>>,
     hang_next_response: Mutex<bool>,
@@ -31,6 +32,7 @@ struct ServerRequestScript {
 impl ServerRequestScript {
     fn new() -> Self {
         Self {
+            mcp_schema: Mutex::new(None),
             active: Mutex::new(None),
             fail_next_response: Mutex::new(None),
             hang_next_response: Mutex::new(false),
@@ -80,6 +82,19 @@ impl Script for ServerRequestScript {
             thread: call.thread,
             turn: call.turn,
         });
+        if let Some(schema) = self.mcp_schema.lock().await.clone() {
+            call.log.append(AgentEvent::ServerRequestReceived {
+                thread: call.thread,
+                turn: Some(call.turn),
+                request: ServerRequest {
+                    id: ServerRequestId("srv_1".into()),
+                    method: "mcpServer/elicitation/request".into(),
+                    params: serde_json::json!({"mode":"openai/form", "requestedSchema":schema}),
+                    received_at: Utc::now(),
+                },
+            });
+            return Ok(());
+        }
         call.log.append(AgentEvent::ServerRequestReceived {
             thread: call.thread,
             turn: Some(call.turn),
@@ -202,6 +217,91 @@ async fn spawn_test_app() -> TestApp {
         harness,
         thread_id,
     }
+}
+
+#[tokio::test]
+async fn mcp_validation_rejection_preserves_pending_request_across_reconnect_and_retry() {
+    let app = spawn_test_app().await;
+    let thread_id = app.thread_id;
+    *app.harness.script.mcp_schema.lock().await = Some(serde_json::json!({
+        "$schema":"https://json-schema.org/draft/2020-12/schema",
+        "$defs":{"count":{"type":"integer","minimum":1}},
+        "type":"object","required":["count"],"properties":{"count":{"$ref":"#/$defs/count"}}
+    }));
+    app.harness.script.suppress_resolution().await;
+    let mut socket = app.server.ws().await;
+    socket
+        .send(ws::text(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        }))
+        .await
+        .unwrap();
+    socket
+        .send(ws::text(&ClientMessage::SendInput {
+            thread_id,
+            text: "ask form".into(),
+            attachments: Vec::new(),
+        }))
+        .await
+        .unwrap();
+    wait_for_server_request(&mut socket).await;
+    socket
+        .send(ws::text(&ClientMessage::ServerRequestResponse {
+            thread_id,
+            request_id: "srv_1".into(),
+            response: ServerRequestResponse::result(
+                serde_json::json!({"action":"accept","content":{"count":0}}),
+            ),
+        }))
+        .await
+        .unwrap();
+    let error = ws::expect_error(&mut socket).await;
+    assert_eq!(error.action.as_deref(), Some("server_request_response"));
+    assert!(
+        error
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("MCP form")
+    );
+    assert!(
+        !app.harness
+            .core
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::RespondServerRequest { .. }))
+    );
+    let mut reconnect = app.server.ws().await;
+    reconnect
+        .send(ws::text(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        }))
+        .await
+        .unwrap();
+    let snapshot = ws::expect_live_snapshot(&mut reconnect).await;
+    let rows = server_request_rows(&snapshot);
+    assert_eq!(rows.len(), 1);
+    assert!(
+        !rows[0].1,
+        "invalid form must remain pending after reconnect"
+    );
+    reconnect
+        .send(ws::text(&ClientMessage::ServerRequestResponse {
+            thread_id,
+            request_id: "srv_1".into(),
+            response: ServerRequestResponse::result(
+                serde_json::json!({"action":"accept","content":{"count":2}}),
+            ),
+        }))
+        .await
+        .unwrap();
+    let (_, response) = wait_for_response(&app.harness.core).await;
+    assert_eq!(
+        response,
+        ServerRequestResponse::result(serde_json::json!({"action":"accept","content":{"count":2}}))
+    );
 }
 
 #[tokio::test]

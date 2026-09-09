@@ -318,6 +318,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             context_window: 128_000,
             model_context_windows: HashMap::new(),
@@ -351,6 +352,7 @@ mod tests {
             provider: "proxy".into(),
             model: "other".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         service
             .mutate(project_id, thread_id, |thread| {
@@ -502,6 +504,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             mode: TurnMode::Known(Mode::Build),
             status: TurnStatus {

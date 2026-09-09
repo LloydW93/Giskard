@@ -7,10 +7,14 @@
 //! See the crate README for Codex-native identifier scopes, item and process
 //! lifecycles, background-command ownership, and termination routing.
 
+mod dynamic_tools;
+mod goals_queue;
 mod instance;
 mod log_fields;
 mod mapping;
 mod native_ids;
+mod native_services;
+pub use native_services::NativeServiceProviders;
 mod native_routes;
 mod queue;
 mod rpc;
@@ -199,6 +203,13 @@ enum HarnessCommand {
 }
 
 enum ControlCommand {
+    GoalsQueue {
+        thread: ThreadHandle,
+        command: giskard_core::goals_queue::GoalsQueueCommand,
+        settings: Option<TurnOverrides>,
+        response:
+            oneshot::Sender<Result<giskard_core::goals_queue::GoalsQueueSnapshot, HarnessError>>,
+    },
     SteerTurn {
         thread: ThreadHandle,
         expected_turn: TurnId,
@@ -456,16 +467,58 @@ impl CodexHarness {
         workspace_root: PathBuf,
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<Self>, HarnessError> {
+        Self::start_with_service_providers(
+            workspace_root,
+            bootstrap,
+            NativeServiceProviders::default(),
+        )
+        .await
+    }
+
+    pub async fn start_with_service_providers(
+        workspace_root: PathBuf,
+        bootstrap: HarnessBootstrap,
+        providers: NativeServiceProviders,
+    ) -> Result<Arc<Self>, HarnessError> {
+        Self::start_with_configuration(workspace_root, bootstrap, Vec::new(), providers).await
+    }
+
+    pub async fn start_with_dynamic_tools(
+        workspace_root: PathBuf,
+        bootstrap: HarnessBootstrap,
+        tools: Vec<giskard_core::dynamic_tool_config::DynamicToolNamespaceConfig>,
+    ) -> Result<Arc<Self>, HarnessError> {
+        Self::start_with_configuration(
+            workspace_root,
+            bootstrap,
+            tools,
+            NativeServiceProviders::default(),
+        )
+        .await
+    }
+
+    /// Validate all configured host integrations before starting the native process.
+    pub async fn start_with_configuration(
+        workspace_root: PathBuf,
+        bootstrap: HarnessBootstrap,
+        tools: Vec<giskard_core::dynamic_tool_config::DynamicToolNamespaceConfig>,
+        providers: NativeServiceProviders,
+    ) -> Result<Arc<Self>, HarnessError> {
+        providers.validate()?;
+        let registry =
+            dynamic_tools::Registry::from_config(tools).map_err(HarnessError::Protocol)?;
         let workspace_root = normalize_workspace_root(workspace_root)?;
         let (mut client, client_version) =
-            start_codex_client(codex_codes::AppServerBuilder::new()).await?;
+            start_codex_client_with_providers(codex_codes::AppServerBuilder::new(), providers)
+                .await?;
         let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
-        Self::spawn_harness(
+        Self::spawn_harness_configured(
             client,
             workspace_root,
             writable_roots,
             client_version,
             bootstrap,
+            registry,
         )
     }
 
@@ -496,6 +549,27 @@ impl CodexHarness {
     where
         C: CodexTransport + 'static,
     {
+        Self::spawn_harness_configured(
+            client,
+            workspace_root,
+            writable_roots,
+            client_version,
+            bootstrap,
+            dynamic_tools::Registry::default(),
+        )
+    }
+
+    fn spawn_harness_configured<C>(
+        client: C,
+        workspace_root: PathBuf,
+        writable_roots: Vec<PathBuf>,
+        client_version: Option<String>,
+        bootstrap: HarnessBootstrap,
+        dynamic_tools: dynamic_tools::Registry,
+    ) -> Result<Arc<Self>, HarnessError>
+    where
+        C: CodexTransport + 'static,
+    {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(64);
         let senders: SenderMap = Arc::new(EventLogs::default());
@@ -518,7 +592,8 @@ impl CodexHarness {
             workspace_root.clone(),
             writable_roots,
             bootstrap,
-        )?;
+        )?
+        .with_dynamic_tools(dynamic_tools);
         let harness = Arc::new(Self {
             workspace_root,
             client_version,
@@ -618,12 +693,21 @@ fn normalize_workspace_root(workspace_root: PathBuf) -> Result<PathBuf, HarnessE
 async fn start_codex_client(
     builder: codex_codes::AppServerBuilder,
 ) -> Result<(StdioTransport, Option<String>), HarnessError> {
+    start_codex_client_with_providers(builder, NativeServiceProviders::default()).await
+}
+
+async fn start_codex_client_with_providers(
+    builder: codex_codes::AppServerBuilder,
+    providers: NativeServiceProviders,
+) -> Result<(StdioTransport, Option<String>), HarnessError> {
     let mut client = StdioTransport::spawn(builder).await?;
+    client.set_native_services(providers.clone());
+    let initialize = build_initialize_params(&providers);
     let response: codex_codes::InitializeResponse = codex_request(
         &mut client,
         CodexOperationContext::new("initialize"),
         codex_codes::protocol::methods::INITIALIZE,
-        &build_initialize_params(),
+        &initialize,
     )
     .await
     .map_err(|e| HarnessError::Spawn(e.to_string()))?;
@@ -631,6 +715,7 @@ async fn start_codex_client(
         .send_notification(codex_codes::protocol::methods::INITIALIZED)
         .await
         .map_err(|e| HarnessError::Spawn(e.to_string()))?;
+    providers.login(&mut client).await?;
     let version = codex_version_from_user_agent(&response.user_agent);
     match version.as_deref() {
         Some(version) => warn_if_codex_is_newer_than_tested(version),
@@ -716,7 +801,7 @@ fn codex_version_from_user_agent(user_agent: &str) -> Option<String> {
     Some(format!("{major}.{minor}.{patch}"))
 }
 
-fn build_initialize_params() -> codex_codes::InitializeParams {
+fn build_initialize_params(providers: &NativeServiceProviders) -> codex_codes::InitializeParams {
     codex_codes::InitializeParams {
         client_info: codex_codes::ClientInfo {
             name: "giskard".into(),
@@ -725,10 +810,14 @@ fn build_initialize_params() -> codex_codes::InitializeParams {
         },
         capabilities: Some(codex_codes::InitializeCapabilities {
             experimental_api: Some(true),
-            extensions: None,
+            extensions: Some(
+                [("openai/form".to_owned(), serde_json::json!({}))]
+                    .into_iter()
+                    .collect(),
+            ),
             mcp_server_openai_form_elicitation: None,
             opt_out_notification_methods: None,
-            request_attestation: None,
+            request_attestation: (!providers.attestation_command.is_empty()).then_some(true),
         }),
     }
 }
@@ -1047,6 +1136,32 @@ impl AgentHarness for CodexHarness {
             ControlCommand::RespondServerRequest {
                 id,
                 response_payload,
+                response: tx,
+            },
+        )
+        .await?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
+    fn goals_queue_supported(&self) -> bool {
+        true
+    }
+
+    async fn goals_queue(
+        &self,
+        thread: &ThreadHandle,
+        command: giskard_core::goals_queue::GoalsQueueCommand,
+        settings: Option<TurnOverrides>,
+    ) -> Result<giskard_core::goals_queue::GoalsQueueSnapshot, HarnessError> {
+        command.validate().map_err(HarnessError::Protocol)?;
+        let (tx, rx) = oneshot::channel();
+        self.enqueue_control(
+            "goals_queue",
+            ControlCommand::GoalsQueue {
+                thread: thread.clone(),
+                command,
+                settings,
                 response: tx,
             },
         )
@@ -1558,6 +1673,7 @@ fn effective_model(
         model: model.to_string(),
         reasoning_effort: reported_effort
             .or_else(|| requested.and_then(|r| r.reasoning_effort.clone())),
+        service_tier: requested.and_then(|r| r.service_tier.clone()),
     })
 }
 
@@ -1616,6 +1732,7 @@ async fn start_thread(
     context: CodexOperationContext<'_>,
     cwd: &str,
     initial_model: &giskard_core::model::ModelRef,
+    dynamic_tools: &[Value],
 ) -> Result<OpenedNativeThread, HarnessError> {
     let params = codex_codes::ThreadStartParams {
         cwd: Some(cwd.to_owned()),
@@ -1623,6 +1740,11 @@ async fn start_thread(
         model_provider: Some(initial_model.provider.clone()),
         ..Default::default()
     };
+    let mut params =
+        serde_json::to_value(params).map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    if !dynamic_tools.is_empty() {
+        params["dynamicTools"] = Value::Array(dynamic_tools.to_vec());
+    }
     let resp: codex_codes::ThreadStartResponse = codex_request(
         client,
         context,
@@ -1744,6 +1866,11 @@ fn build_turn_start_params(
 
     if let Some(model) = overrides.model.as_ref() {
         map.insert("model".into(), serde_json::json!(model.model));
+        // Per-turn selection avoids changing the native thread tier. Returning to Native
+        // default therefore inherits the native configuration, even after a priority turn.
+        if let Some(tier) = model.service_tier.as_ref() {
+            map.insert("serviceTierForTurn".into(), serde_json::json!(tier));
+        }
         if let Some(effort) = effort.as_ref() {
             map.insert("effort".into(), serde_json::json!(effort));
         }
@@ -2098,6 +2225,7 @@ async fn reject_pending_requests_for_interrupted_thread(
     mapper: &mut CodexMapper,
     senders: &SenderMap,
     thread: ThreadId,
+    owned_dynamic_ids: &[ServerRequestId],
 ) {
     let approval_ids = mapper.pending_approval_ids_for_thread(thread);
     let server_request_ids = mapper.pending_server_request_ids_for_thread(thread);
@@ -2141,6 +2269,9 @@ async fn reject_pending_requests_for_interrupted_thread(
     }
 
     for server_request_id in server_request_ids {
+        if owned_dynamic_ids.contains(&server_request_id) {
+            continue;
+        }
         let response = ServerRequestResponse::Error {
             code: -32000,
             message: "Turn interrupted before this server request was answered.".into(),
@@ -2464,6 +2595,42 @@ async fn default_model_provider(
     Ok(non_empty(config.model_provider).unwrap_or_else(|| CODEX_DEFAULT_PROVIDER.to_string()))
 }
 
+// Keep catalog strings open-ended: newer native modalities and agent versions must not
+// invalidate the whole model list when the generated SDK's enums lag behind.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeModelPage {
+    data: Vec<NativeCatalogModel>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeCatalogModel {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    is_default: bool,
+    default_reasoning_effort: codex_codes::ReasoningEffort,
+    #[serde(default)]
+    supported_reasoning_efforts: Vec<codex_codes::ReasoningEffortOption>,
+    #[serde(default)]
+    service_tiers: Option<Vec<giskard_core::model::ModelServiceTier>>,
+    #[serde(default)]
+    default_service_tier: Option<String>,
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    multi_agent_version: Option<String>,
+}
+
 /// List the models Codex advertises over the app-server `model/list` RPC, mapped to Giskard
 /// [`ModelDescriptor`]s so the picker can show Codex's friendly `display_name` instead of raw
 /// model ids.
@@ -2492,7 +2659,7 @@ async fn handle_list_models(
             include_hidden: None,
             limit: None,
         };
-        let page: codex_codes::ModelListResponse = codex_request(
+        let page: NativeModelPage = codex_request(
             client,
             CodexOperationContext::new("list_models"),
             codex_codes::protocol::methods::MODEL_LIST,
@@ -2518,7 +2685,7 @@ async fn handle_list_models(
 /// Map a Codex `model/list` entry to a Giskard [`ModelDescriptor`] under `provider`. See
 /// [`handle_list_models`] for where that provider comes from — the entry itself names none — and
 /// why the context window is conservative.
-fn map_model(model: codex_codes::Model, provider: &str) -> ModelDescriptor {
+fn map_model(model: NativeCatalogModel, provider: &str) -> ModelDescriptor {
     // `model` is the wire slug used in a ModelRef; `id` is the preset id. Prefer the slug, but fall
     // back to the id if an older/edge payload leaves it empty.
     let id = if model.model.is_empty() {
@@ -2551,6 +2718,10 @@ fn map_model(model: codex_codes::Model, provider: &str) -> ModelDescriptor {
         reasoning_efforts,
         display_name,
         is_default: model.is_default,
+        service_tiers: model.service_tiers,
+        default_service_tier: model.default_service_tier,
+        input_modalities: model.input_modalities,
+        multi_agent_version: model.multi_agent_version,
     }
 }
 
@@ -2746,6 +2917,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: effort,
+            service_tier: None,
         }
     }
 
@@ -2755,6 +2927,47 @@ mod tests {
             mode,
             permission_preset: PermissionPreset::AskFirst,
         }
+    }
+
+    #[test]
+    fn catalog_preserves_open_native_capabilities() {
+        let model: NativeCatalogModel = serde_json::from_value(json!({
+            "id": "astra", "model": "gpt-6-astra", "displayName": "Astra",
+            "defaultReasoningEffort": "ultra",
+            "serviceTiers": [{"id":"future-fast","name":"Future Fast","description":"Extra capacity"}],
+            "defaultServiceTier": "future-fast", "inputModalities": ["text", "audio", "future-modality"],
+            "multiAgentVersion": "v99"
+        })).unwrap();
+        let mapped = map_model(model, "openai");
+        assert_eq!(mapped.service_tiers.as_ref().unwrap()[0].id, "future-fast");
+        assert_eq!(mapped.default_service_tier.as_deref(), Some("future-fast"));
+        assert_eq!(
+            mapped.input_modalities.as_ref().unwrap(),
+            &["text", "audio", "future-modality"]
+        );
+        assert_eq!(mapped.multi_agent_version.as_deref(), Some("v99"));
+        let wire = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(wire["service_tiers"][0]["name"], "Future Fast");
+        assert_eq!(wire["input_modalities"][2], "future-modality");
+    }
+
+    #[test]
+    fn service_tier_is_a_per_turn_override_and_native_default_omits_it() {
+        let mut overrides = turn_overrides(Mode::Build, None);
+        overrides.model.as_mut().unwrap().service_tier = Some("future-fast".into());
+        let params =
+            build_turn_start_params(&test_thread(), &UserInput::text("hi"), &overrides, &[])
+                .unwrap();
+        assert_eq!(params["serviceTierForTurn"], "future-fast");
+        assert!(
+            params.get("serviceTier").is_none(),
+            "do not alter native thread defaults"
+        );
+        overrides.model.as_mut().unwrap().service_tier = None;
+        let params =
+            build_turn_start_params(&test_thread(), &UserInput::text("hi"), &overrides, &[])
+                .unwrap();
+        assert!(params.get("serviceTierForTurn").is_none());
     }
 
     #[test]
@@ -2816,6 +3029,8 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct FakeCodexState {
+        goals_queue_failure: Option<String>,
+        settings_update_failure: Option<String>,
         thread_counter: usize,
         turn_counter: usize,
         hang_methods: HashSet<String>,
@@ -2997,6 +3212,28 @@ mod tests {
                 std::future::pending().await
             } else {
                 match method {
+                    "thread/settings/update" => {
+                        if let Some(message) = &state.settings_update_failure {
+                            Err(HarnessError::Protocol(message.clone()))
+                        } else {
+                            Ok(json!({}))
+                        }
+                    }
+                    "thread/goal/get" => {
+                        if let Some(message) = &state.goals_queue_failure {
+                            Err(HarnessError::Protocol(message.clone()))
+                        } else {
+                            Ok(json!({"goal":null}))
+                        }
+                    }
+                    "thread/queue/list" => Ok(json!({"data":[],"nextCursor":null})),
+                    "thread/goal/set"
+                    | "thread/goal/clear"
+                    | "thread/queue/add"
+                    | "thread/queue/update"
+                    | "thread/queue/delete"
+                    | "thread/queue/reorder"
+                    | "thread/queue/start" => Ok(json!({})),
                     "turn/steer" => Ok(json!({"turnId": params["expectedTurnId"]})),
                     codex_codes::protocol::methods::THREAD_START => {
                         state.thread_counter += 1;
@@ -3345,6 +3582,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_turn_maps_audio_attachment_without_host_file_upload() {
+        let (mut transport, controller) = fake_codex();
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = test_thread();
+        let input = UserInput::text_with_attachments(
+            "Inspect this",
+            vec![UserAttachment {
+                name: "recording.wav".into(),
+                mime_type: "audio/wav".into(),
+                size: 5,
+                kind: AttachmentKind::Audio,
+                data_base64: "aW1hZ2U=".into(),
+            }],
+        );
+
+        handle_start_turn(
+            &mut transport,
+            &mut mapper,
+            &thread,
+            &input,
+            &build_turn_overrides(),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let requests = controller.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].method,
+            codex_codes::protocol::methods::TURN_START
+        );
+        assert_eq!(requests[0].params["input"][0]["type"], "text");
+        assert_eq!(requests[0].params["input"][0]["text"], "Inspect this");
+        assert_eq!(requests[0].params["input"][1]["type"], "audio");
+        assert_eq!(
+            requests[0].params["input"][1]["url"],
+            "data:audio/wav;base64,aW1hZ2U="
+        );
+    }
+
+    #[tokio::test]
     async fn start_turn_uploads_and_removes_file_attachment() {
         let (mut transport, controller) = fake_codex();
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
@@ -3550,6 +3829,213 @@ mod tests {
                 message: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn goals_queue_commands_use_native_identity_and_do_not_start_a_second_turn() {
+        use giskard_core::goals_queue::*;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        harness
+            .goals_queue(
+                &thread,
+                GoalsQueueCommand::Add {
+                    text: "queued request".into(),
+                    client_message_id: "receipt-1".into(),
+                },
+                Some(build_turn_overrides()),
+            )
+            .await
+            .unwrap();
+        let requests = controller.requests().await;
+        let add = requests
+            .iter()
+            .find(|r| r.method == "thread/queue/add")
+            .unwrap();
+        assert_eq!(add.params["threadId"], thread.harness_thread_id);
+        assert_eq!(add.params["input"][0]["text"], "queued request");
+        assert_eq!(add.params["clientUserMessageId"], "receipt-1");
+        let settings_index = requests
+            .iter()
+            .position(|r| r.method == "thread/settings/update")
+            .unwrap();
+        let add_index = requests
+            .iter()
+            .position(|r| r.method == "thread/queue/add")
+            .unwrap();
+        assert_eq!(
+            add_index,
+            settings_index + 1,
+            "settings and launch must be adjacent owner operations"
+        );
+        let settings = &requests[settings_index].params;
+        assert_eq!(settings["threadId"], thread.harness_thread_id);
+        assert_eq!(
+            settings["cwd"],
+            thread.workspace_root.to_string_lossy().as_ref()
+        );
+        assert_eq!(settings["permissions"], ":read-only");
+        assert_eq!(settings["approvalPolicy"], "on-request");
+        assert_eq!(settings["collaborationMode"]["mode"], "default");
+        assert!(settings.get("serviceTier").unwrap().is_null());
+        assert!(controller.started_turns().await.is_empty());
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn goals_queue_rejects_stale_routes_and_active_queue_start() {
+        use giskard_core::goals_queue::*;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let mut stale = thread.clone();
+        stale.harness_thread_id = "replaced-native".into();
+        assert!(
+            harness
+                .goals_queue(&stale, GoalsQueueCommand::ClearGoal, None)
+                .await
+                .is_err()
+        );
+        harness
+            .start_turn(&thread, UserInput::text("work"), build_turn_overrides())
+            .await
+            .unwrap();
+        assert!(matches!(
+            harness
+                .goals_queue(
+                    &thread,
+                    GoalsQueueCommand::Start { id: None },
+                    Some(build_turn_overrides())
+                )
+                .await,
+            Err(HarnessError::ThreadBusy { .. })
+        ));
+        assert!(
+            !controller
+                .requests()
+                .await
+                .iter()
+                .any(|r| r.method == "thread/queue/start" || r.method == "thread/goal/clear")
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn goals_queue_settings_failure_prevents_work_and_missing_settings_are_rejected() {
+        use giskard_core::goals_queue::*;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        assert!(
+            harness
+                .goals_queue(&thread, GoalsQueueCommand::Start { id: None }, None)
+                .await
+                .is_err()
+        );
+        controller.state.lock().await.settings_update_failure = Some("rejected permissions".into());
+        for command in [
+            GoalsQueueCommand::Start { id: None },
+            GoalsQueueCommand::Add {
+                text: "work".into(),
+                client_message_id: "settings-test".into(),
+            },
+            GoalsQueueCommand::SetGoal {
+                objective: Some("finish".into()),
+                status: None,
+                token_budget: None,
+            },
+        ] {
+            let error = harness
+                .goals_queue(&thread, command, Some(build_turn_overrides()))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("rejected permissions"));
+        }
+        let requests = controller.requests().await;
+        assert!(!requests.iter().any(|r| matches!(
+            r.method.as_str(),
+            "thread/queue/start" | "thread/queue/add" | "thread/goal/set"
+        )));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn goals_queue_captures_tier_effort_mode_and_then_clears_tier() {
+        use giskard_core::goals_queue::*;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let mut settings = turn_overrides(Mode::Plan, Some(Effort("ultra".into())));
+        settings.permission_preset = PermissionPreset::AskFirst;
+        settings.model.as_mut().unwrap().service_tier = Some("priority".into());
+        harness
+            .goals_queue(
+                &thread,
+                GoalsQueueCommand::SetGoal {
+                    objective: Some("finish".into()),
+                    status: Some(GoalStatus::Paused),
+                    token_budget: None,
+                },
+                Some(settings),
+            )
+            .await
+            .unwrap();
+        harness
+            .goals_queue(
+                &thread,
+                GoalsQueueCommand::Start { id: None },
+                Some(build_turn_overrides()),
+            )
+            .await
+            .unwrap();
+        let requests = controller.requests().await;
+        let updates: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method == "thread/settings/update")
+            .collect();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].params["serviceTier"], "priority");
+        assert_eq!(updates[0].params["effort"], "ultra");
+        assert_eq!(updates[0].params["collaborationMode"]["mode"], "plan");
+        assert_eq!(updates[0].params["approvalPolicy"], "on-request");
+        assert!(updates[1].params.get("serviceTier").unwrap().is_null());
+        assert!(controller.started_turns().await.is_empty());
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn goals_queue_refresh_failure_reports_accepted_mutation() {
+        use giskard_core::goals_queue::*;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        controller.state.lock().await.goals_queue_failure = Some("offline".into());
+        let error = harness
+            .goals_queue(&thread, GoalsQueueCommand::ClearGoal, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Change accepted"));
+        assert_eq!(
+            controller
+                .requests()
+                .await
+                .iter()
+                .filter(|r| r.method == "thread/goal/clear")
+                .count(),
+            1
+        );
+        harness.shutdown().await.unwrap();
     }
 
     #[test]
@@ -3915,6 +4401,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: Some(Effort::new("high")),
+                service_tier: None,
             })
         );
     }
@@ -5688,12 +6175,33 @@ mod tests {
     }
 
     #[test]
+    fn attestation_is_negotiated_only_with_an_explicit_host_provider() {
+        let defaults =
+            serde_json::to_value(build_initialize_params(&NativeServiceProviders::default()))
+                .unwrap();
+        assert_ne!(defaults["capabilities"]["requestAttestation"], true);
+        let configured = NativeServiceProviders {
+            attestation_command: vec!["/trusted/provider".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(build_initialize_params(&configured)).unwrap()["capabilities"]["requestAttestation"],
+            true
+        );
+    }
+
+    #[test]
     fn initialize_params_enable_experimental_app_server_api() {
-        let params = serde_json::to_value(build_initialize_params()).unwrap();
+        let params =
+            serde_json::to_value(build_initialize_params(&NativeServiceProviders::default()))
+                .unwrap();
 
         assert_eq!(params["clientInfo"]["name"], "giskard");
         assert_eq!(params["capabilities"]["experimentalApi"], true);
-        assert!(params["capabilities"].get("extensions").is_none());
+        assert_eq!(
+            params["capabilities"]["extensions"],
+            serde_json::json!({"openai/form": {}})
+        );
     }
 
     #[test]

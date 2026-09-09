@@ -35,6 +35,9 @@ fn path_to_wire(p: &std::path::Path) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WireAgentEvent {
+    GoalsQueueChanged {
+        thread: ThreadId,
+    },
     ThreadOpened {
         thread: ThreadId,
         harness_thread_id: String,
@@ -335,6 +338,7 @@ impl WireAgentEvent {
     ///
     pub fn from_agent_event(e: AgentEvent) -> Option<Self> {
         let event = match e {
+            AgentEvent::GoalsQueueChanged { thread } => Self::GoalsQueueChanged { thread },
             AgentEvent::ThreadOpened {
                 thread,
                 harness_thread_id,
@@ -1099,6 +1103,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
         };
         let wire = WireAgentEvent::from_agent_event(event).unwrap();

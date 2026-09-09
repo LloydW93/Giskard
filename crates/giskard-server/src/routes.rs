@@ -1,3 +1,4 @@
+mod goals_queue;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
@@ -77,6 +78,7 @@ pub(crate) async fn http_request_context_middleware(
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
+        .route("/api/projects/{id}/threads/{thread_id}/goals-queue", get(goals_queue::read).post(goals_queue::change))
         .route("/api/projects", get(list_projects).post(create_project))
         .route(
             "/api/projects/{id}",
@@ -822,6 +824,12 @@ async fn start_thread_with_message(
     let catalog = project_model_catalog(&state, &project_config, &app_config).await;
     let (model_ref, model_descriptor) =
         resolve_initial_thread_model(&app_config, &catalog, req.model_ref);
+    crate::models::validate_service_tier(&model_ref, &model_descriptor)
+        .map_err(ApiError::BadRequest)?;
+    validate_attachment_modalities(
+        &req.attachments,
+        model_descriptor.input_modalities.as_deref(),
+    )?;
     let project_ws_root = project_config
         .workspace_root
         .as_deref()
@@ -1052,6 +1060,20 @@ fn thread_title_from_attachments(attachments: &[UserAttachment]) -> String {
     truncate_title(&title, GENERATED_THREAD_TITLE_CHARS)
 }
 
+pub(crate) fn validate_attachment_modalities(
+    attachments: &[UserAttachment],
+    modalities: Option<&[String]>,
+) -> Result<(), ApiError> {
+    if attachments.iter().any(|a| a.kind == AttachmentKind::Audio)
+        && modalities.is_some_and(|values| !values.iter().any(|value| value == "audio"))
+    {
+        return Err(ApiError::BadRequest(
+            "This model does not accept audio. Choose an audio-capable model or remove the recording.".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_user_attachments(attachments: &[UserAttachment]) -> Result<(), ApiError> {
     if attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE {
         return Err(ApiError::BadRequest(format!(
@@ -1147,7 +1169,43 @@ fn validate_user_attachment(attachment: &UserAttachment) -> Result<usize, ApiErr
             )));
         }
     }
+    if attachment.kind == AttachmentKind::Audio {
+        let detected = detect_supported_audio_mime(&decoded).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "attachment {} must contain WAV or MP3 audio",
+                attachment.name
+            ))
+        })?;
+        if mime_type != detected {
+            return Err(ApiError::BadRequest(format!(
+                "attachment {} MIME type does not match its audio data",
+                attachment.name
+            )));
+        }
+    }
     Ok(decoded.len())
+}
+
+fn detect_supported_audio_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    // MPEG layer III frame sync with a valid version, or an ID3v2 header.
+    if bytes.len() >= 10
+        && bytes.starts_with(b"ID3")
+        && matches!(bytes[3], 2..=4)
+        && bytes[6..10].iter().all(|byte| byte & 0x80 == 0)
+        || bytes.len() >= 4
+            && bytes[0] == 0xff
+            && bytes[1] & 0xe0 == 0xe0
+            && bytes[1] & 0x18 != 0x08
+            && bytes[1] & 0x06 == 0x02
+            && bytes[2] & 0xf0 != 0xf0
+            && bytes[2] & 0x0c != 0x0c
+    {
+        return Some("audio/mpeg");
+    }
+    None
 }
 
 fn is_valid_mime_type(mime_type: &str) -> bool {
@@ -2213,6 +2271,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             context_window: 128_000,
             model_context_windows: Default::default(),
@@ -2586,6 +2645,51 @@ fn main() {}
         ]);
 
         assert_eq!(title, "Attached design.pdf and 1 more");
+    }
+
+    fn audio_attachment() -> UserAttachment {
+        let bytes = b"RIFF\x24\0\0\0WAVEfmt ";
+        UserAttachment {
+            name: "voice.wav".into(),
+            mime_type: "audio/wav".into(),
+            size: bytes.len() as u64,
+            kind: AttachmentKind::Audio,
+            data_base64: BASE64_STANDARD.encode(bytes),
+        }
+    }
+
+    #[test]
+    fn audio_attachment_validation_rejects_mismatch_and_unsupported_container() {
+        let mut attachment = audio_attachment();
+        validate_user_attachments(&[attachment.clone()]).unwrap();
+        attachment.mime_type = "audio/mpeg".into();
+        assert!(
+            validate_user_attachments(&[attachment.clone()])
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+        attachment.data_base64 = BASE64_STANDARD.encode(b"not an audio file");
+        attachment.size = 17;
+        assert!(validate_user_attachments(&[attachment]).is_err());
+        assert_eq!(
+            detect_supported_audio_mime(b"ID3\x04\0\0\0\0\0\0"),
+            Some("audio/mpeg")
+        );
+        assert_eq!(
+            detect_supported_audio_mime(&[0xff, 0xfb, 0x90, 0]),
+            Some("audio/mpeg")
+        );
+        assert_eq!(detect_supported_audio_mime(b"OggSdata"), None);
+    }
+
+    #[test]
+    fn audio_attachment_requires_audio_when_modalities_are_known() {
+        let attachments = [audio_attachment()];
+        assert!(validate_attachment_modalities(&attachments, Some(&["text".into()])).is_err());
+        validate_attachment_modalities(&attachments, Some(&["audio".into()])).unwrap();
+        validate_attachment_modalities(&attachments, None).unwrap();
+        validate_attachment_modalities(&[], Some(&["text".into()])).unwrap();
     }
 
     #[test]

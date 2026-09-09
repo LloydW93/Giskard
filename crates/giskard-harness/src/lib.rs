@@ -640,6 +640,24 @@ pub trait AgentHarness: Send + Sync {
         ))
     }
 
+    fn goals_queue_supported(&self) -> bool {
+        false
+    }
+
+    /// Read or change harness-owned goals and queued input without creating a second state owner.
+    /// Goal set and queue add/start require selected settings, applied before initiating work.
+    /// Other commands do not change native settings, even if a caller supplies them.
+    async fn goals_queue(
+        &self,
+        _thread: &ThreadHandle,
+        _command: giskard_core::goals_queue::GoalsQueueCommand,
+        _settings: Option<TurnOverrides>,
+    ) -> Result<giskard_core::goals_queue::GoalsQueueSnapshot, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "goals and queue controls are not supported".into(),
+        ))
+    }
+
     /// Interrupt the active turn of a thread.
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
 

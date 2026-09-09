@@ -9,7 +9,7 @@ use codex_codes::{Notification, ServerMessage, ServerRequest};
 use giskard_harness::{EventLog, EventLogReader, EventStreamError};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::io::{
@@ -88,7 +88,17 @@ impl Drop for Registration {
     }
 }
 
+type NativeServiceFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HarnessError>> + Send>>;
+
 pub(super) struct StdioTransport {
+    native_services: crate::NativeServiceProviders,
+    deferred_inbox: VecDeque<InboxItem>,
+    // Polled only by the transport owner. Keeping the future (including the child process and
+    // write acknowledgment) here makes next_message cancellation resumable without reexecution.
+    pending_service: Option<NativeServiceFuture>,
+    service_error: Option<HarnessError>,
+    deferred_overflow: bool,
     writer_tx: Option<mpsc::Sender<Frame>>,
     inbox: Arc<EventLog<InboxItem>>,
     inbox_reader: EventLogReader<InboxItem>,
@@ -147,6 +157,11 @@ impl StdioTransport {
         let reader_task = tokio::spawn(read_stdout(reader, inbox.clone(), waiters.clone()));
         let writer_task = tokio::spawn(write_stdin(writer, writer_rx, waiters.clone()));
         Self {
+            native_services: crate::NativeServiceProviders::default(),
+            deferred_inbox: VecDeque::new(),
+            pending_service: None,
+            service_error: None,
+            deferred_overflow: false,
             writer_tx: Some(writer_tx),
             inbox,
             inbox_reader,
@@ -168,7 +183,51 @@ impl StdioTransport {
         Self::from_io(reader, writer, None, None, CODEX_INBOX_RETAIN_LIMIT)
     }
 
-    pub(super) async fn send_notification(&self, method: &str) -> Result<(), HarnessError> {
+    pub(super) fn set_native_services(&mut self, providers: crate::NativeServiceProviders) {
+        self.native_services = providers;
+    }
+
+    // Services may be requested before the response to a client RPC. The same task and inbox
+    // reader service them while waiting, retaining other frames in order for the instance.
+    async fn service_inbox_item(
+        &mut self,
+        item: InboxItem,
+    ) -> Result<Option<InboxItem>, HarnessError> {
+        if let InboxItem::Message(message) = &item
+            && let ServerMessage::Request { id, request } = message.as_ref()
+            && crate::NativeServiceProviders::handles(request)
+        {
+            self.pending_service = Some(Box::pin(run_native_service(
+                self.native_services.clone(),
+                self.writer_tx.as_ref().cloned(),
+                id.clone(),
+                request.clone(),
+            )));
+            self.finish_pending_service().await?;
+            return Ok(None);
+        }
+        Ok(Some(item))
+    }
+
+    async fn finish_pending_service(&mut self) -> Result<(), HarnessError> {
+        if let Some(error) = &self.service_error {
+            return Err(error.clone());
+        }
+        let Some(operation) = self.pending_service.as_mut() else {
+            return Ok(());
+        };
+        let result = operation.await;
+        // A ready future must never be polled again. A failed/uncertain write poisons this
+        // connection instead of invoking the credential provider or sending the reply again.
+        self.pending_service = None;
+        if let Err(error) = &result {
+            self.service_error = Some(error.clone());
+            self.fail_waiters("native service response delivery failed");
+        }
+        result
+    }
+
+    pub(super) async fn send_notification(&mut self, method: &str) -> Result<(), HarnessError> {
         self.send_frame(
             &JsonRpcNotification {
                 method: method.to_owned(),
@@ -180,7 +239,7 @@ impl StdioTransport {
     }
 
     async fn send_frame<T: Serialize>(
-        &self,
+        &mut self,
         value: &T,
         description: String,
     ) -> Result<(), HarnessError> {
@@ -195,38 +254,80 @@ impl StdioTransport {
 #[async_trait]
 impl CodexTransport for StdioTransport {
     async fn request_json(&mut self, method: &str, params: Value) -> Result<Value, HarnessError> {
-        request_json(
+        self.finish_pending_service().await?;
+        let response = request_json(
             self.writer_tx.as_ref().cloned(),
             self.waiters.clone(),
             self.next_id.clone(),
             method,
             params,
             None,
-        )
-        .await
+        );
+        tokio::pin!(response);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut response => return result,
+                item = self.inbox_reader.recv() => {
+                    let item = item.map_err(|error| HarnessError::Transport(format!("Codex service inbox failed: {error:?}")))?;
+                    if let Some(item) = self.service_inbox_item(item).await? {
+                        if self.deferred_inbox.len() >= CODEX_INBOX_RETAIN_LIMIT {
+                            self.deferred_overflow = true;
+                            return Err(HarnessError::Transport("Codex deferred inbox overflowed".into()));
+                        }
+                        self.deferred_inbox.push_back(item);
+                    }
+                }
+            }
+        }
     }
 
     async fn next_message(&mut self) -> Result<Option<ServerMessage>, CodexStreamError> {
-        match self.inbox_reader.recv().await {
-            Ok(InboxItem::Message(message)) => Ok(Some(*message)),
-            Ok(InboxItem::NonJson {
-                parse_error,
-                raw_preview,
-                raw_bytes,
-            }) => Err(CodexStreamError::NonJsonStdout {
-                parse_error,
-                raw_preview,
-                raw_bytes,
-            }),
-            Ok(InboxItem::Fatal(message)) => {
-                Err(CodexStreamError::Fatal(HarnessError::Transport(message)))
-            }
-            Ok(InboxItem::Eof) | Err(EventStreamError::Closed) => Ok(None),
-            Err(EventStreamError::Gap { dropped }) => {
-                Err(CodexStreamError::Fatal(HarnessError::Transport(format!(
-                    "Codex inbox overflowed; {dropped} frames dropped"
-                ))))
-            }
+        if self.deferred_overflow {
+            return Err(CodexStreamError::Fatal(HarnessError::Transport(
+                "Codex deferred inbox overflowed".into(),
+            )));
+        }
+        loop {
+            self.finish_pending_service()
+                .await
+                .map_err(CodexStreamError::Fatal)?;
+            let item = match self.deferred_inbox.pop_front() {
+                Some(item) => Ok(item),
+                None => self.inbox_reader.recv().await,
+            };
+            let item = match item {
+                Ok(item) => match self
+                    .service_inbox_item(item)
+                    .await
+                    .map_err(CodexStreamError::Fatal)?
+                {
+                    Some(item) => Ok(item),
+                    None => continue,
+                },
+                Err(error) => Err(error),
+            };
+            return match item {
+                Ok(InboxItem::Message(message)) => Ok(Some(*message)),
+                Ok(InboxItem::NonJson {
+                    parse_error,
+                    raw_preview,
+                    raw_bytes,
+                }) => Err(CodexStreamError::NonJsonStdout {
+                    parse_error,
+                    raw_preview,
+                    raw_bytes,
+                }),
+                Ok(InboxItem::Fatal(message)) => {
+                    Err(CodexStreamError::Fatal(HarnessError::Transport(message)))
+                }
+                Ok(InboxItem::Eof) | Err(EventStreamError::Closed) => Ok(None),
+                Err(EventStreamError::Gap { dropped }) => {
+                    Err(CodexStreamError::Fatal(HarnessError::Transport(format!(
+                        "Codex inbox overflowed; {dropped} frames dropped"
+                    ))))
+                }
+            };
         }
     }
 
@@ -262,6 +363,8 @@ impl CodexTransport for StdioTransport {
     }
 
     async fn shutdown_transport(mut self) -> Result<(), HarnessError> {
+        // Drop provider I/O before closing the writer: the future owns a writer sender clone.
+        self.pending_service.take();
         self.writer_tx.take();
         self.fail_waiters("Codex transport shut down");
         self.inbox.close();
@@ -287,6 +390,7 @@ impl CodexTransport for StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
+        self.pending_service.take();
         self.writer_tx.take();
         self.fail_waiters("Codex transport shut down");
         self.inbox.close();
@@ -305,6 +409,36 @@ impl Drop for StdioTransport {
             task.abort();
         }
     }
+}
+
+async fn run_native_service(
+    providers: crate::NativeServiceProviders,
+    writer_tx: Option<mpsc::Sender<Frame>>,
+    id: RequestId,
+    request: ServerRequest,
+) -> Result<(), HarnessError> {
+    let method = request.method();
+    let response = match providers.response(&request).await {
+        Ok(result) => serde_json::json!({"id": id, "result": result}),
+        Err(message) => {
+            warn!(action = "native_service_response", method, request_id = %id,
+                error = message, "host provider could not answer Codex service request");
+            serde_json::json!({"id": id, "error": {"code": -32000, "message": message}})
+        }
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        send_frame(
+            writer_tx,
+            &response,
+            format!("native service response id {id}"),
+        ),
+    )
+    .await
+    .map_err(|_| HarnessError::Timeout("native service response write timed out".into()))??;
+    debug!(action = "native_service_response", method, request_id = %id,
+        "answered Codex host service request");
+    Ok(())
 }
 
 async fn request_json(
@@ -472,7 +606,17 @@ where
                 }
             }
             JsonRpcMessage::Request(JsonRpcRequest { id, method, params }) => {
-                match ServerRequest::from_envelope(&method, params) {
+                // Preserve the current MCP envelope: the generated enum omits top-level
+                // routing fields and narrows standard schemas, losing validation keywords.
+                let decoded = if method == "mcpServer/elicitation/request" {
+                    Ok(ServerRequest::Unknown {
+                        method: method.clone(),
+                        params,
+                    })
+                } else {
+                    ServerRequest::from_envelope(&method, params)
+                };
+                match decoded {
                     Ok(request) => {
                         inbox.append(InboxItem::Message(Box::new(ServerMessage::Request {
                             id,
@@ -727,6 +871,387 @@ mod tests {
             self.writer.write_all(value.as_bytes()).await.unwrap();
             self.writer.write_all(b"\n").await.unwrap();
         }
+    }
+
+    fn stub_provider(json: &str) -> Vec<String> {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("cat >/dev/null; printf '%s' '{}'", json),
+        ]
+    }
+
+    #[tokio::test]
+    async fn native_service_can_unblock_client_rpc_and_preserves_other_frames() {
+        let (mut transport, mut peer) = test_transport(CODEX_INBOX_RETAIN_LIMIT);
+        transport.set_native_services(crate::NativeServiceProviders {
+            attestation_command: stub_provider(r#"{"token":"stub-attestation"}"#),
+            ..Default::default()
+        });
+        let client = async {
+            assert_eq!(
+                transport
+                    .request_json("test/request", json!({}))
+                    .await
+                    .unwrap(),
+                json!({"ok": true})
+            );
+            for expected in ["unknown/one", "unknown/two"] {
+                let ServerMessage::Notification(Notification::Unknown { method, .. }) =
+                    transport.next_message().await.unwrap().unwrap()
+                else {
+                    panic!("expected notification")
+                };
+                assert_eq!(method, expected);
+            }
+        };
+        let server = async {
+            let rpc = peer.read_json().await;
+            peer.write_json(json!({"method":"unknown/one"})).await;
+            peer.write_json(
+                json!({"id":"service-1", "method":"attestation/generate", "params":{}}),
+            )
+            .await;
+            let token = peer.read_json().await;
+            assert_eq!(
+                token,
+                json!({"id":"service-1","result":{"token":"stub-attestation"}})
+            );
+            peer.write_json(json!({"method":"unknown/two"})).await;
+            peer.write_json(json!({"id":rpc["id"],"result":{"ok":true}}))
+                .await;
+        };
+        timeout(Duration::from_secs(2), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_auth_login_and_refresh_share_provider_and_stay_off_browser_stream() {
+        let (mut transport, mut peer) = test_transport(CODEX_INBOX_RETAIN_LIMIT);
+        let providers = crate::NativeServiceProviders {
+            external_auth_command: stub_provider(
+                r#"{"accessToken":"stub-token","chatgptAccountId":"stub-account"}"#,
+            ),
+            ..Default::default()
+        };
+        transport.set_native_services(providers.clone());
+        let client = async {
+            providers.login(&mut transport).await.unwrap();
+            let message = transport.next_message().await.unwrap().unwrap();
+            assert!(matches!(message, ServerMessage::Notification(_)));
+        };
+        let server = async {
+            let login = peer.read_json().await;
+            assert_eq!(login["method"], "account/login/start");
+            assert_eq!(
+                login["params"],
+                json!({"type":"chatgptAuthTokens","accessToken":"stub-token","chatgptAccountId":"stub-account","chatgptPlanType":null})
+            );
+            peer.write_json(json!({"id":login["id"],"result":{"type":"chatgptAuthTokens"}}))
+                .await;
+            peer.write_json(json!({"id":42,"method":"account/chatgptAuthTokens/refresh","params":{"reason":"unauthorized","previousAccountId":"stub-account"}})).await;
+            let refreshed = peer.read_json().await;
+            assert_eq!(
+                refreshed,
+                json!({"id":42,"result":{"accessToken":"stub-token","chatgptAccountId":"stub-account","chatgptPlanType":null}})
+            );
+            peer.write_json(json!({"method":"unknown/done"})).await;
+        };
+        timeout(Duration::from_secs(2), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_login_rejection_does_not_echo_native_error_credentials() {
+        let (mut transport, mut peer) = test_transport(CODEX_INBOX_RETAIN_LIMIT);
+        let providers = crate::NativeServiceProviders {
+            external_auth_command: stub_provider(
+                r#"{"accessToken":"stub-secret","chatgptAccountId":"stub-account"}"#,
+            ),
+            ..Default::default()
+        };
+        let client = providers.login(&mut transport);
+        let server = async {
+            let login = peer.read_json().await;
+            peer.write_json(
+                json!({"id":login["id"],"error":{"code":-32000,"message":"rejected stub-secret"}}),
+            )
+            .await;
+        };
+        let (result, ()) = tokio::join!(client, server);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Codex rejected external auth login"));
+        assert!(!error.contains("stub-secret"));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_services_receive_errors_without_browser_actions() {
+        let (mut transport, mut peer) = test_transport(CODEX_INBOX_RETAIN_LIMIT);
+        let client = transport.next_message();
+        let server = async {
+            for (id, method, params) in [
+                (json!(7), "attestation/generate", json!({})),
+                (
+                    json!("auth"),
+                    "account/chatgptAuthTokens/refresh",
+                    json!({"reason":"unauthorized"}),
+                ),
+            ] {
+                peer.write_json(json!({"id":id,"method":method,"params":params}))
+                    .await;
+                let error = peer.read_json().await;
+                assert_eq!(error["id"], id);
+                assert_eq!(error["error"]["code"], -32000);
+                assert!(
+                    error["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("configure a trusted host provider")
+                );
+            }
+            peer.write_json(json!({"method":"unknown/done"})).await;
+        };
+        timeout(Duration::from_secs(2), async {
+            let (message, ()) = tokio::join!(client, server);
+            assert!(matches!(
+                message.unwrap(),
+                Some(ServerMessage::Notification(_))
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_read_cancellation_resumes_one_provider_invocation() {
+        let directory = tempfile::Builder::new()
+            .prefix(".native-service-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let count_path = directory.path().join("invocations");
+        let (mut transport, mut peer) = test_transport(CODEX_INBOX_RETAIN_LIMIT);
+        transport.set_native_services(crate::NativeServiceProviders {
+            attestation_command: vec!["/bin/sh".into(), "-c".into(),
+                "cat >/dev/null; printf 'invoked\n' >> \"$1\"; sleep 0.25; printf '%s' '{\"token\":\"stub-once\"}'".into(),
+                "provider".into(), count_path.to_string_lossy().into_owned()],
+            ..Default::default()
+        });
+        peer.write_json(json!({"id":"cancelled", "method":"attestation/generate", "params":{}}))
+            .await;
+        let client = async {
+            for _ in 0..60 {
+                // This mirrors the instance select loop dropping next_message for timer ticks.
+                match timeout(Duration::from_millis(20), transport.next_message()).await {
+                    Err(_) => {}
+                    Ok(result) => {
+                        assert!(result.unwrap().is_some());
+                        return;
+                    }
+                }
+            }
+            panic!("repeated cancellation starved the provider");
+        };
+        let server = async {
+            assert_eq!(
+                peer.read_json().await,
+                json!({"id":"cancelled","result":{"token":"stub-once"}})
+            );
+            peer.write_json(json!({"method":"unknown/done"})).await;
+        };
+        timeout(Duration::from_secs(2), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
+        assert!(transport.pending_service.is_none());
+        assert_eq!(std::fs::read_to_string(count_path).unwrap(), "invoked\n");
+    }
+
+    #[tokio::test]
+    async fn cancelling_response_write_does_not_enqueue_a_duplicate_frame() {
+        let (writer, receiver) = duplex(1);
+        let mut receiver = BufReader::new(receiver);
+        let mut transport = StdioTransport::from_pipes(tokio::io::empty(), writer);
+        let message = ServerMessage::from_value(
+            json!({"id":"one-write","method":"attestation/generate","params":{}}),
+        )
+        .unwrap();
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                transport.service_inbox_item(InboxItem::Message(Box::new(message)))
+            )
+            .await
+            .is_err()
+        );
+        for _ in 0..3 {
+            assert!(
+                timeout(Duration::from_millis(20), transport.next_message())
+                    .await
+                    .is_err()
+            );
+        }
+        let client = transport.next_message();
+        let reader = async {
+            let mut line = String::new();
+            receiver.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap()["id"],
+                "one-write"
+            );
+        };
+        let (message, ()) = tokio::join!(client, reader);
+        assert!(message.unwrap().is_none());
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                receiver.read_line(&mut String::new())
+            )
+            .await
+            .is_err()
+        );
+        assert!(transport.pending_service.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_drops_and_kills_suspended_provider_future() {
+        let directory = tempfile::Builder::new()
+            .prefix(".native-service-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        for explicit_shutdown in [true, false] {
+            let pid_path = directory.path().join(format!("pid-{explicit_shutdown}"));
+            let (mut transport, mut peer) = test_transport(CODEX_INBOX_RETAIN_LIMIT);
+            transport.set_native_services(crate::NativeServiceProviders {
+                attestation_command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf '%s' \"$$\" > \"$1\"; exec sleep 60".into(),
+                    "provider".into(),
+                    pid_path.to_string_lossy().into_owned(),
+                ],
+                ..Default::default()
+            });
+            peer.write_json(json!({"id":"shutdown","method":"attestation/generate","params":{}}))
+                .await;
+            timeout(Duration::from_secs(2), async {
+                while !pid_path.exists() {
+                    assert!(
+                        timeout(Duration::from_millis(20), transport.next_message())
+                            .await
+                            .is_err()
+                    );
+                }
+            })
+            .await
+            .unwrap();
+            let pid = std::fs::read_to_string(&pid_path).unwrap();
+            let proc_path = std::path::PathBuf::from(format!("/proc/{pid}"));
+            assert!(proc_path.exists());
+            assert!(transport.pending_service.is_some());
+            if explicit_shutdown {
+                timeout(Duration::from_secs(1), transport.shutdown_transport())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            } else {
+                drop(transport);
+            }
+            timeout(Duration::from_secs(2), async {
+                while proc_path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("provider must be killed and reaped when its owning transport shuts down");
+        }
+    }
+
+    #[tokio::test]
+    async fn service_response_write_timeout_poison_connection_and_bounds_owner_wait() {
+        let mut transport = StdioTransport::from_pipes(
+            tokio::io::empty(),
+            GatedWriter {
+                polled: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let message = ServerMessage::from_value(
+            json!({"id":"blocked-writer","method":"attestation/generate","params":{}}),
+        )
+        .unwrap();
+        let result = timeout(
+            Duration::from_secs(2),
+            transport.service_inbox_item(InboxItem::Message(Box::new(message))),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(HarnessError::Timeout(_))));
+        assert!(transport.pending_service.is_none());
+        assert!(matches!(
+            transport.next_message().await,
+            Err(CodexStreamError::Fatal(HarnessError::Timeout(_)))
+        ));
+        assert!(matches!(
+            transport.request_json("never/sent", json!({})).await,
+            Err(HarnessError::Timeout(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn deferred_inbox_overflow_remains_fatal_after_rpc_returns() {
+        let (mut transport, mut peer) = test_transport(CODEX_INBOX_RETAIN_LIMIT);
+        transport
+            .deferred_inbox
+            .resize(CODEX_INBOX_RETAIN_LIMIT, InboxItem::Eof);
+        let client = transport.request_json("test/request", json!({}));
+        let server = async {
+            peer.read_json().await;
+            peer.write_json(json!({"method":"unknown/overflow"})).await;
+        };
+        let (result, ()) = tokio::join!(client, server);
+        assert!(
+            matches!(result, Err(HarnessError::Transport(message)) if message.contains("overflowed"))
+        );
+        assert!(matches!(
+            transport.next_message().await,
+            Err(CodexStreamError::Fatal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_elicitation_preserves_current_envelope_and_schema() {
+        let (mut transport, mut peer) = test_transport(CODEX_INBOX_RETAIN_LIMIT);
+        let params = json!({
+            "mode":"openai/form", "threadId":"native-child", "turnId":null,
+            "serverName":"survey", "message":"Configure", "futureField":{"retained":true},
+            "requestedSchema":{"type":"object", "properties":{"count":{"type":"integer", "minimum":2}}, "required":["count"]}
+        });
+        peer.write_json(
+            json!({"id":"form-1", "method":"mcpServer/elicitation/request", "params":params}),
+        )
+        .await;
+        let message = transport.next_message().await.unwrap().unwrap();
+        let ServerMessage::Request {
+            id,
+            request:
+                ServerRequest::Unknown {
+                    method,
+                    params: actual,
+                },
+        } = message
+        else {
+            panic!("MCP request must retain raw parameters");
+        };
+        assert_eq!(id, RequestId::String("form-1".into()));
+        assert_eq!(method, "mcpServer/elicitation/request");
+        assert_eq!(actual, Some(params));
     }
 
     #[tokio::test]

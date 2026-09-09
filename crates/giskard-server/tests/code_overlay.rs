@@ -80,6 +80,7 @@ fn thread_file(pid: ProjectId, tid: ThreadId) -> giskard_persist::store::ThreadF
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         }),
         context_window: 1,
         model_context_windows: std::collections::HashMap::new(),
@@ -121,6 +122,7 @@ fn command_turn(output: &str, status: Option<&str>) -> (Turn, ItemId) {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             mode: giskard_core::turn::TurnMode::Known(Mode::Build),
             status: TurnStatus {

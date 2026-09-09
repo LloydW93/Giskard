@@ -22,7 +22,7 @@ pub(crate) async fn prepare_user_input_for_codex_uploads(
     }
 
     let mut prepared_text = text.clone();
-    let mut image_attachments = Vec::new();
+    let mut native_attachments = Vec::new();
     let mut uploaded_files = Vec::new();
     let upload_dir = codex_upload_dir(thread);
     let mut ensured_upload_dir = false;
@@ -30,7 +30,9 @@ pub(crate) async fn prepare_user_input_for_codex_uploads(
     let upload_result: Result<(), HarnessError> = async {
         for (index, attachment) in attachments.iter().enumerate() {
             match attachment.kind {
-                AttachmentKind::Image => image_attachments.push(attachment.clone()),
+                AttachmentKind::Image | AttachmentKind::Audio => {
+                    native_attachments.push(attachment.clone());
+                }
                 AttachmentKind::File => {
                     if !ensured_upload_dir {
                         let params = codex_codes::FsCreateDirectoryParams {
@@ -89,7 +91,7 @@ pub(crate) async fn prepare_user_input_for_codex_uploads(
     }
 
     Ok(PreparedUserInput {
-        input: UserInput::text_with_attachments(prepared_text, image_attachments),
+        input: UserInput::text_with_attachments(prepared_text, native_attachments),
         upload_dir: ensured_upload_dir.then_some(upload_dir),
     })
 }
