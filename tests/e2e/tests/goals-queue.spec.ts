@@ -151,3 +151,59 @@ test("closing and reopening discards stale reads and traps keyboard focus", asyn
   await expect(page.locator("#goalsQueueOverlay")).not.toHaveClass(/open/);
   await expect(page.locator("#goalsQueueBtn")).toBeFocused();
 });
+
+test("status and budget edits omit unchanged objective and preserve completed goal usage", async ({ page }) => {
+  await thread(page);
+  await enable(page);
+  const commands: Record<string, unknown>[] = [];
+  let goal = { objective:"Completed review", status:"complete", tokens_used:2400, token_budget:5000, time_used_seconds:90 };
+  await page.route("**/goals-queue", async route => {
+    if (route.request().method() === "POST") {
+      const command = route.request().postDataJSON();
+      commands.push(command);
+      // Native terminal goals reset accounting whenever an objective is explicitly supplied.
+      if (Object.hasOwn(command, "objective")) goal = { ...goal, objective:command.objective, tokens_used:0, time_used_seconds:0 };
+      goal = { ...goal, status:command.status, token_budget:command.token_budget ?? goal.token_budget };
+    }
+    await route.fulfill({ json:{ goal, queue:[], next_cursor:null } });
+  });
+  await page.locator("#goalsQueueBtn").click();
+  await expect(page.locator("#goalObjective")).toHaveValue("Completed review");
+  await page.locator("#goalBudget").fill("6000");
+  await page.locator("#goalSave").click();
+  await expect(page.locator("#goalSummary")).toContainText("2,400 tokens used of 6,000");
+  expect(commands[0]).toEqual({ action:"set_goal", status:"complete", token_budget:6000 });
+  await page.locator("#goalStatus").selectOption("paused");
+  await page.locator("#goalSave").click();
+  await expect(page.locator("#goalSummary")).toContainText("paused");
+  expect(commands[1]).toEqual({ action:"set_goal", status:"paused", token_budget:6000 });
+  await expect(page.locator("#goalSummary")).toContainText("90 seconds");
+  await page.locator("#goalObjective").fill("A new review");
+  await page.locator("#goalSave").click();
+  await expect(page.locator("#goalSummary")).toContainText("A new review");
+  expect(commands[2].objective).toBe("A new review");
+});
+
+test("status-only edits do not overwrite an objective changed by a native update", async ({ page }) => {
+  await thread(page);
+  await enable(page);
+  const commands: Record<string, unknown>[] = [];
+  let goal = { objective:"Original objective", status:"complete", tokens_used:1200 };
+  await page.route("**/goals-queue", async route => {
+    if (route.request().method() === "POST") {
+      const command = route.request().postDataJSON();
+      commands.push(command);
+      goal = { ...goal, ...command };
+    }
+    await route.fulfill({ json:{ goal, queue:[], next_cursor:null } });
+  });
+  await page.locator("#goalsQueueBtn").click();
+  await expect(page.locator("#goalObjective")).toHaveValue("Original objective");
+  await page.locator("#goalStatus").selectOption("paused");
+  goal.objective = "Updated by native client";
+  await page.locator("#goalsQueueRefresh").click();
+  await expect(page.locator("#goalSummary")).toContainText("Updated by native client");
+  await page.locator("#goalSave").click();
+  await expect(page.locator("#goalObjective")).toHaveValue("Updated by native client");
+  expect(commands).toEqual([{ action:"set_goal", status:"paused" }]);
+});
