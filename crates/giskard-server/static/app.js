@@ -293,6 +293,7 @@ async function api(method, path, body, options) {
 // IDs. A user can navigate A → B → A while A's first request is still in flight; matching IDs
 // alone would then let that obsolete response mutate the second visit to A.
 function setActiveViewIdentity(projectId, threadId) {
+  goalsQueue.close();
   state.activeViewGeneration += 1;
   state.projectId = projectId;
   state.threadId = threadId;
@@ -2803,6 +2804,7 @@ async function openThread(pid, tid, title, opts) {
   setActiveViewIdentity(pid, tid);
   state.pendingUserEl = null; state.pendingUserText = null;
   state.turnSteering = !!res.turn_steering;
+  goalsQueue.setSupported(!!res.goals_queue);
   state.pendingSteer = null;
   renderParentThreadButton();
   state.threadReadOnly = false; state.readOnlyProvider = null; state.readOnlyMessage = null;
@@ -3163,6 +3165,7 @@ function updateReadOnlyBanner() {
 }
 
 function updateComposerControls() {
+  goalsQueue.updateControls();
   updateReadOnlyBanner();
   const ready = state.wsStatus==="open";
   const draft = isDraftThread();
@@ -3424,6 +3427,7 @@ function handleServer(msg, ws) {
     return;
   }
   if (!isCurrentThreadServerMessage(msg)) return;
+  goalsQueue.onMessage(msg);
   const messageType = msg && msg.type ? msg.type : "unknown";
   const renderStartedAtMs = browserNowMs();
   recordReconnectMessageReceived(ws, messageType);
@@ -10736,6 +10740,7 @@ async function startDraftThread(text, attachments) {
     }
     state.firstTurnStartingThreadId = String(tid);
     state.turnSteering = !!res.turn_steering;
+    goalsQueue.setSupported(!!res.goals_queue);
     state.threadHarness = res.harness || null;
     clearComposerDraft(draftKey);
     clearPendingAttachments();
@@ -11594,6 +11599,183 @@ function applyAppearance(a) {
 }
 $("appearanceSel").onchange = () => applyAppearance($("appearanceSel").value);
 applyAppearance(localStorage.getItem("giskard.appearance") || "ide");
+
+/* ---------- native goals and queued prompts ---------- */
+// One panel owns the selected view's projection. Native state stays authoritative; reads and
+// mutations carry a view generation so late responses cannot repaint a different thread.
+const goalsQueue = (() => {
+  const button = document.createElement("button");
+  button.id = "goalsQueueBtn"; button.className = "badge"; button.type = "button";
+  button.textContent = "Goal & queue"; button.hidden = true;
+  button.setAttribute("aria-haspopup", "dialog");
+  $("thrHeader").appendChild(button);
+  const overlay = document.createElement("div");
+  overlay.id = "goalsQueueOverlay"; overlay.className = "overlay";
+  overlay.setAttribute("role", "dialog"); overlay.setAttribute("aria-modal", "true");
+  overlay.setAttribute("aria-labelledby", "goalsQueueTitle");
+  overlay.innerHTML = `<div class="dialog goals-queue-dialog">
+    <div class="goals-queue-head"><h2 id="goalsQueueTitle">Goal & queue</h2><button type="button" id="goalsQueueClose">Close</button></div>
+    <div class="content">
+      <p id="goalsQueueNotice" role="status" aria-live="polite"></p>
+      <div class="goals-queue-actions"><button type="button" id="goalsQueueRefresh">Refresh</button><span id="goalsQueueReadOnly" class="muted"></span></div>
+      <section aria-labelledby="goalHeading"><h3 id="goalHeading">Goal</h3>
+        <p id="goalSummary" class="muted">Loading…</p>
+        <form id="goalForm">
+          <label>Objective<textarea id="goalObjective" rows="3" maxlength="4000" required></textarea></label>
+          <div class="goals-queue-fields"><label>Status<select id="goalStatus">
+            <option value="active">Active</option><option value="paused">Paused</option><option value="blocked">Blocked</option>
+            <option value="usage_limited">Usage limited</option><option value="budget_limited">Budget limited</option><option value="complete">Complete</option>
+          </select></label><label>Token budget (optional)<input id="goalBudget" type="number" min="1" step="1" placeholder="No new limit" /></label></div>
+          <div class="goals-queue-actions"><button type="submit" id="goalSave">Save goal</button><button type="button" id="goalClear">Clear goal</button></div>
+        </form>
+      </section>
+      <section aria-labelledby="queueHeading"><h3 id="queueHeading">Queued prompts</h3>
+        <p class="muted">Prompts waiting in this thread. Start runs the next prompt when the thread is idle.</p>
+        <ol id="goalQueueList"></ol><button type="button" id="goalQueueMore" hidden>Load more prompts</button>
+        <form id="queueForm"><label id="queueInputLabel" for="queueText">New queued prompt</label><textarea id="queueText" rows="3" required></textarea>
+          <div class="goals-queue-actions"><button type="submit" id="queueSave">Add to queue</button><button type="button" id="queueCancelEdit" hidden>Cancel edit</button><button type="button" id="queueStart">Start next prompt</button></div>
+        </form>
+      </section>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  let supported = false, opened = false, snapshot = null, busy = false, loading = false;
+  let panelGeneration = 0, readSequence = 0, editingId = null, goalDirty = false, refreshPending = false;
+  function path(view) { return `/api/projects/${encodeURIComponent(view.projectId)}/threads/${encodeURIComponent(view.threadId)}/goals-queue`; }
+  function readOnly() {
+    const meta = state.threadId && threadMetaForId(state.threadId);
+    return state.threadReadOnly || managedThreadReadOnly() || threadMetadataPending() || !!(meta && meta.archived);
+  }
+  function writable() { return !readOnly() && state.wsStatus === "open" && !state.updateRequired; }
+  function errorMessage(error) { return error && error.payload && (error.payload.message || error.payload.error && error.payload.error.message) || apiFailureMessage(error); }
+  function status(text, error = false) { $("goalsQueueNotice").textContent = text; $("goalsQueueNotice").classList.toggle("err", error); }
+  function updateControls() {
+    button.hidden = !supported || !state.threadId || isDraftThread();
+    if (!opened) return;
+    const locked = busy || loading || !writable() || !snapshot;
+    overlay.querySelectorAll("form input, form textarea, form select, form button, [data-queue-action]").forEach(el => { el.disabled = locked; });
+    $("goalClear").disabled = locked || !snapshot || !snapshot.goal;
+    $("queueStart").disabled = locked || state.activeTurn || !snapshot || !snapshot.queue.length;
+    overlay.querySelectorAll('[data-queue-action="up"], [data-queue-action="down"]').forEach(el => {
+      el.disabled = locked || !!(snapshot && snapshot.next_cursor) || el.dataset.boundary === "true";
+    });
+    $("goalQueueMore").disabled = busy || loading;
+    $("goalsQueueRefresh").disabled = busy || loading;
+    $("goalsQueueReadOnly").textContent = readOnly() ? "This thread is read-only." : state.wsStatus !== "open" ? "Reconnect to make changes." : "";
+  }
+  function fillGoal() {
+    const goal = snapshot && snapshot.goal;
+    $("goalObjective").value = goal ? goal.objective : "";
+    $("goalStatus").value = goal ? goal.status : "active";
+    $("goalBudget").value = goal && goal.token_budget != null ? goal.token_budget : "";
+    goalDirty = false;
+  }
+  function render() {
+    const goal = snapshot.goal;
+    $("goalSummary").textContent = goal ? `${goal.objective} · ${goal.status.replaceAll("_", " ")} · ${Number(goal.tokens_used || 0).toLocaleString()} tokens used${goal.token_budget != null ? ` of ${Number(goal.token_budget).toLocaleString()}` : ""} · ${Math.round(goal.time_used_seconds || 0)} seconds` : "No goal set.";
+    if (!goalDirty) fillGoal();
+    const list = $("goalQueueList"); list.replaceChildren();
+    snapshot.queue.forEach((item, index) => {
+      const row = document.createElement("li"); row.dataset.queueId = item.id;
+      const text = document.createElement("p"); text.className = "queue-prompt"; text.textContent = item.text || (item.has_other_input ? "Prompt with attachments or other input" : "Empty prompt"); row.appendChild(text);
+      if (item.has_other_input) { const note = document.createElement("p"); note.className = "muted"; note.textContent = "Contains other input. Text replacement is unavailable to preserve it."; row.appendChild(note); }
+      const actions = document.createElement("div"); actions.className = "goals-queue-actions";
+      for (const [action, label] of [["edit", "Edit"], ["up", "Move up"], ["down", "Move down"], ["delete", "Delete"]]) {
+        if (action === "edit" && item.has_other_input) continue;
+        const control = document.createElement("button"); control.type = "button"; control.textContent = label; control.dataset.queueAction = action;
+        control.dataset.boundary = String(action === "up" && index === 0 || action === "down" && index === snapshot.queue.length - 1);
+        control.onclick = () => {
+          if (action === "edit") { editingId = item.id; $("queueText").value = item.text; $("queueInputLabel").textContent = "Edit queued prompt"; $("queueSave").textContent = "Save prompt"; $("queueCancelEdit").hidden = false; $("queueText").focus(); }
+          else if (action === "delete") mutate({ action:"delete", id:item.id }, () => { if (editingId === item.id) cancelEdit(); });
+          else { const ids = snapshot.queue.map(entry => entry.id), target = action === "up" ? index - 1 : index + 1; [ids[index], ids[target]] = [ids[target], ids[index]]; mutate({ action:"reorder", ids }); }
+        };
+        actions.appendChild(control);
+      }
+      row.appendChild(actions); list.appendChild(row);
+    });
+    if (!snapshot.queue.length) { const empty = document.createElement("p"); empty.className = "muted"; empty.textContent = "No queued prompts."; list.appendChild(empty); }
+    $("goalQueueMore").hidden = !snapshot.next_cursor;
+    $("goalQueueMore").textContent = "Load more prompts (load all to reorder)";
+    updateControls();
+  }
+  async function refresh(more = false) {
+    if (!opened || busy) { refreshPending = opened; return; }
+    const view = captureActiveViewIdentity(), sequence = ++readSequence;
+    const cursor = more && snapshot && snapshot.next_cursor;
+    loading = true; updateControls();
+    try {
+      const result = await api("GET", path(view) + (cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""), undefined, { timeoutMs:30000 });
+      if (!opened || !activeViewIdentityIsCurrent(view) || sequence !== readSequence) return;
+      if (cursor) {
+        const seen = new Set(snapshot.queue.map(item => item.id));
+        result.queue = [...snapshot.queue, ...result.queue.filter(item => !seen.has(item.id))];
+      }
+      snapshot = result; render();
+    } catch (error) {
+      if (opened && activeViewIdentityIsCurrent(view) && sequence === readSequence) status(`Could not refresh goal and queue: ${errorMessage(error)}`, true);
+    } finally {
+      if (opened && activeViewIdentityIsCurrent(view) && sequence === readSequence) { loading = false; updateControls(); }
+    }
+  }
+  async function mutate(command, accepted) {
+    if (busy || loading || !writable() || !snapshot) return;
+    busy = true; status("Saving…"); updateControls();
+    const view = captureActiveViewIdentity(), panel = panelGeneration;
+    try {
+      const result = await api("POST", path(view), command, { timeoutMs:30000 });
+      if (!opened || panel !== panelGeneration || !activeViewIdentityIsCurrent(view)) return;
+      if (accepted) accepted();
+      snapshot = result; status("Saved."); render();
+    } catch (error) {
+      if (opened && panel === panelGeneration && activeViewIdentityIsCurrent(view)) status(`${errorMessage(error)} Check the current goal and queue with Refresh before retrying; the action may have reached the harness.`, true);
+    } finally {
+      if (opened && panel === panelGeneration && activeViewIdentityIsCurrent(view)) { busy = false; updateControls(); if (refreshPending) { refreshPending = false; refresh(); } }
+    }
+  }
+  function cancelEdit() { editingId = null; $("queueText").value = ""; $("queueInputLabel").textContent = "New queued prompt"; $("queueSave").textContent = "Add to queue"; $("queueCancelEdit").hidden = true; }
+  function close() {
+    ++panelGeneration; opened = false; supported = false; snapshot = null; busy = false; loading = false; refreshPending = false; ++readSequence;
+    overlay.classList.remove("open"); button.setAttribute("aria-expanded", "false"); button.hidden = true;
+  }
+  function dismiss() { ++panelGeneration; opened = false; ++readSequence; overlay.classList.remove("open"); button.setAttribute("aria-expanded", "false"); button.focus(); }
+  button.onclick = () => {
+    ++panelGeneration; opened = true; snapshot = null; busy = false; loading = false; goalDirty = false; cancelEdit(); fillGoal();
+    $("goalSummary").textContent = "Loading…"; $("goalQueueList").replaceChildren(); status("");
+    overlay.classList.add("open"); button.setAttribute("aria-expanded", "true"); $("goalsQueueClose").focus(); refresh();
+  };
+  $("goalsQueueClose").onclick = dismiss;
+  overlay.onclick = event => { if (event.target === overlay) dismiss(); };
+  overlay.addEventListener("keydown", event => {
+    if (event.key === "Escape") { event.preventDefault(); dismiss(); }
+    if (event.key === "Tab") {
+      const focusable = [...overlay.querySelectorAll("button, input, textarea, select")].filter(el => !el.disabled && !el.hidden && el.getClientRects().length);
+      const first = focusable[0], last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }
+  });
+  $("goalsQueueRefresh").onclick = () => { status(""); refresh(); };
+  $("goalQueueMore").onclick = () => refresh(true);
+  $("goalForm").oninput = () => { goalDirty = true; };
+  $("goalForm").onsubmit = event => {
+    event.preventDefault();
+    const budget = $("goalBudget").value;
+    const command = { action:"set_goal", objective:$("goalObjective").value.trim(), status:$("goalStatus").value };
+    if (!command.objective) return;
+    if (budget) { const value = Number(budget); if (!Number.isSafeInteger(value) || value < 1) { status("Token budget must be a positive whole number.", true); return; } command.token_budget = value; }
+    mutate(command, () => { goalDirty = false; });
+  };
+  $("goalClear").onclick = () => mutate({ action:"clear_goal" }, () => { goalDirty = false; });
+  $("queueForm").onsubmit = event => {
+    event.preventDefault(); const text = $("queueText").value.trim(); if (!text) return;
+    mutate(editingId ? { action:"update", id:editingId, text } : { action:"add", text, client_message_id:nextMetadataRequestId() }, cancelEdit);
+  };
+  $("queueCancelEdit").onclick = cancelEdit;
+  $("queueStart").onclick = () => mutate({ action:"start" });
+  return { close, updateControls, setSupported(value) { supported = value; updateControls(); }, onMessage(msg) {
+    if (opened && (msg.type === "thread_state" || msg.type === "event" && msg.agent_event && msg.agent_event.kind === "goals_queue_changed")) refresh();
+  } };
+})();
 
 /* Try to enter the app directly if already authenticated. */
 (async () => { try { await api("GET","/api/projects"); startApp(); } catch {} })();

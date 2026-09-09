@@ -647,6 +647,7 @@ pub struct OpenThreadResponse {
     pub harness: String,
     /// Whether this attached harness accepts text input during an active turn.
     pub turn_steering: bool,
+    pub goals_queue: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<ErrorInfo>,
 }
@@ -703,6 +704,7 @@ pub struct StartThreadResponse {
     pub turn_id: TurnId,
     /// Whether this attached harness accepts text input during an active turn.
     pub turn_steering: bool,
+    pub goals_queue: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<ErrorInfo>,
 }
