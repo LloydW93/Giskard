@@ -250,10 +250,11 @@ async fn defaults_and_overrides_reach_native_boundaries_and_stay_session_scoped(
 async fn small_remote_limits_win_and_unknown_maxima_cannot_be_overridden() {
     for maximum in [Some(128_000), None] {
         let opened = Arc::new(Mutex::new(Vec::new()));
+        let launched = Arc::new(Mutex::new(Vec::new()));
         let harness = FakeHarness::new(ContextScript {
             maximum,
             opened: opened.clone(),
-            launched: Default::default(),
+            launched: launched.clone(),
         });
         let server = TestServer::builder(giskard_testenv::fake::factory(harness))
             .start()
@@ -261,6 +262,7 @@ async fn small_remote_limits_win_and_unknown_maxima_cannot_be_overridden() {
         let project = server.create_project("limited context").await;
         let thread = start(&server, project.id).await;
         assert_eq!(*opened.lock().unwrap(), vec![maximum]);
+        assert_eq!(*launched.lock().unwrap(), vec![(thread, maximum)]);
         let path = format!(
             "/api/projects/{}/threads/{thread}/context-window",
             project.id
