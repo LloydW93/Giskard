@@ -26,5 +26,7 @@ maximum. An already-loaded child keeps the configuration it started with.
 
 Changing effort or service tier preserves the override. Changing provider or model clears it so a
 limit chosen against one advertised capacity cannot silently carry to another. If discovery later
-shrinks the maximum, the applied selection is clamped to the current bound. A model with no known
-advertised maximum can use its conservative/default limit but cannot accept a custom value.
+shrinks the maximum, the applied selection is clamped to the current bound. Codex's native catalog
+supplies `contextWindow` as the normal session limit and `maxContextWindow` as the configurable
+ceiling; when only `contextWindow` is present it serves as both values. A model with neither can
+use its conservative/default limit but cannot accept a custom value.
