@@ -191,7 +191,7 @@ let state = {
   subagentImports:new Map(), projectThreads:new Map(), threadIndex:new Map(),
   lastNotificationPromptNoticeAt:0, swRegistration:null, pendingAttachments:[],
   attachmentGeneration:0, pendingAttachmentOperations:new Map(),
-  collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null,
+  collapsedProjects:new Set(loadCollapsedProjects()), expandedArchivedProjects:new Set(), pendingRemoveProject:null,
   pendingRemoveThread:null, removeThreadRequestSeq:0, projectDirs:{}
 };
 const RELOAD_DRAFT_KEY = "giskard.reloadDraft";
@@ -1205,11 +1205,28 @@ function renderProjectThreads(pid) {
     t => t.archived && t.kind !== "subagent"
   );
   if (archived.length) {
-    const label = document.createElement("div");
-    label.className = "thread-section-label";
-    label.textContent = "Archived";
-    box.append(label);
-    appendThreadRows(box, pid, archived);
+    const section = document.createElement("div");
+    section.className = "archived-threads";
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "thread-section-label archived-threads-toggle";
+    const expanded = state.expandedArchivedProjects.has(String(pid));
+    toggle.setAttribute("aria-expanded", String(expanded));
+    toggle.innerHTML = `<span class="archived-threads-caret" aria-hidden="true">${expanded ? "v" : "&gt;"}</span><span>Archived</span>`;
+    const rows = document.createElement("div");
+    rows.className = "archived-thread-rows";
+    rows.hidden = !expanded;
+    toggle.onclick = () => {
+      const expanded = toggle.getAttribute("aria-expanded") !== "true";
+      if (expanded) state.expandedArchivedProjects.add(String(pid));
+      else state.expandedArchivedProjects.delete(String(pid));
+      toggle.setAttribute("aria-expanded", String(expanded));
+      toggle.querySelector(".archived-threads-caret").textContent = expanded ? "v" : ">";
+      rows.hidden = !expanded;
+    };
+    section.append(toggle, rows);
+    box.append(section);
+    appendThreadRows(rows, pid, archived);
   }
   if (quarantined.length) {
     const warning = document.createElement("div");

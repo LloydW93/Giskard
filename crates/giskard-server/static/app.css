@@ -159,6 +159,14 @@
   .thread-menu button { display:block; width:100%; padding:6px 8px; border:0; background:transparent; text-align:left; }
   .thread-menu button:hover { background:var(--panel2); }
   .thread-section-label { margin:8px 0 3px 8px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:0; }
+  .archived-threads-toggle {
+    display:flex; align-items:center; gap:4px; width:calc(100% - 8px); padding:2px 0;
+    border:0; background:transparent; text-align:left;
+  }
+  .archived-threads-toggle:hover { color:var(--fg); }
+  .archived-threads-toggle:focus-visible { outline:2px solid var(--accent); outline-offset:1px; border-radius:4px; }
+  .archived-threads-caret { width:1em; text-align:center; }
+  .archived-thread-rows[hidden] { display:none; }
   .subagent-open-btn { margin-top:8px; padding:4px 8px; font-size:12px; }
 
   /* The thread header (WS state, tasks, sub-agents, MCP, context badges) sits directly above the

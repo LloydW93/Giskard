@@ -781,7 +781,11 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains("function renderProjectThreads(pid) {")
-            && body.contains("appendThreadRows(box, pid, archived);")
+            && body.contains("appendThreadRows(rows, pid, archived);")
+            && body.contains("className = \"thread-section-label archived-threads-toggle\"")
+            && body.contains("state.expandedArchivedProjects.has(String(pid))")
+            && body.contains("toggle.setAttribute(\"aria-expanded\", String(expanded))")
+            && body.contains("rows.hidden = !expanded;")
             && body.contains("syncActiveThreadHighlight();"),
         "reloading a project's threads re-derives the selection highlight, so a reload not driven \
          by opening a thread cannot leave the sidebar with nothing selected"

@@ -40,6 +40,54 @@ test.describe("projects and threads", () => {
     await expect(page.locator(".thread").first()).toBeVisible();
   });
 
+  test("collapses archived threads behind an accessible section toggle", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+    await page.locator("#input").fill("Archive this thread.");
+    await page.locator("#sendBtn").click();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+
+    const thread = project.locator(".thread.active");
+    const threadId = await thread.getAttribute("data-tid");
+    const projectId = await project.getAttribute("data-pid");
+    expect(threadId).toBeTruthy();
+    expect(projectId).toBeTruthy();
+    await page.evaluate(async ({ projectId, threadId }) => {
+      const response = await fetch(`/api/projects/${projectId}/threads`);
+      if (!response.ok) throw new Error(`catalog read failed: ${response.status}`);
+      const catalog = await response.json();
+      const threads = catalog.threads.map((thread: { id: string; revision: number }) => ({
+        ...thread,
+        archived: thread.id === threadId,
+        revision: thread.id === threadId ? thread.revision + 1 : thread.revision,
+      }));
+      const app = window as unknown as {
+        rememberProjectThreads: (pid: string, threads: unknown[]) => void;
+        renderProjectThreads: (pid: string) => void;
+      };
+      app.rememberProjectThreads(projectId!, threads);
+      app.renderProjectThreads(projectId!);
+    }, { projectId, threadId });
+
+    const toggle = project.locator(".archived-threads-toggle");
+    const archivedThread = project.locator(`.archived-thread-rows .thread[data-tid="${threadId}"]`);
+    await expect(toggle).toHaveText(/Archived/);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(archivedThread).toBeHidden();
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(archivedThread).toBeVisible();
+    await page.evaluate((pid) => {
+      (window as unknown as { renderProjectThreads: (pid: string) => void })
+        .renderProjectThreads(pid!);
+    }, projectId);
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(archivedThread).toBeVisible();
+    await toggle.click();
+    await expect(archivedThread).toBeHidden();
+  });
+
   test("stale UI stops before websocket reconnect and preserves its text draft", async ({ page }) => {
     let ticketReads = 0;
     const sockets: string[] = [];
