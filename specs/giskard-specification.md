@@ -9,15 +9,30 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.91
+**Version:** 1.92
 
-> **Amendment — active-turn steering (1.91).** Once a normal user turn has an acknowledged turn
-> ID, the composer may append text to that exact turn through a distinct `SteerInput` action and
-> the harness's same-turn steering operation. Steering never reserves another turn, applies new
-> overrides, or queues a later turn. The expected turn ID is mandatory at the browser, server, and
-> provider boundaries, so completion races fail instead of redirecting input into a successor.
-> Steered messages are ordinary same-turn user-message items in live state and history. This first
-> slice is text-only; attachments remain disabled while a turn is active.
+> **Amendment — native client capability support (1.92).** Goals and queue controls, model
+> capability metadata and service tiers, audio input, rich MCP forms, configured client tools,
+> and host authentication/attestation providers follow the contracts in
+> [Native capability support](../docs/native-ui-capabilities.md). Native state remains authoritative;
+> host services are explicit opt-ins, and live authentication requires real configured providers.
+
+> **Amendment — native model capabilities.** Model descriptors preserve optional advertised
+> service tiers (opaque identifiers, names, descriptions), default tier, input modalities, and
+> multi-agent version. Catalog metadata is provider-scoped. `ModelRef.service_tier` is optional,
+> human-selected metadata retained in thread state and the bounded per-turn model record, limited
+> to an advertised nonempty identifier of at most 128 bytes. Thread creation, model selection,
+> and turn submission validate it against the current catalog. The picker resets it on model
+> changes, preserves it on effort changes, and distinguishes Native default (no override) from
+> an advertised Standard tier. Codex receives `serviceTierForTurn` per turn, leaving native thread
+> defaults intact. Capability descriptors preserve future string values and never enable feature
+> flags by themselves.
+
+> **Amendment — asynchronous questions and steering (1.91).** Preserve structured questions on
+> ordinary agent messages, expose explicit choice/free-text answers, and allow guarded text
+> steering of active turns. Matched active child questions may receive answers without enabling
+> general child input. Native client message IDs correlate exact reply delivery; uncertain replies
+> are never retried automatically. Native external-clock requests receive host responses.
 
 > **Amendment — pasted attachments (1.90).** Files pasted into the focused composer use the same
 > attachment ingestion, validation, limits, and pending tray as files selected with the attachment
@@ -176,16 +191,6 @@
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
 
-**Changelog (1.90 → 1.91), active-turn steering:**
-- **TS1:** `SteerInput { thread_id, turn_id, text }` appends text only to the exact acknowledged
-  active user turn. It is not a second `SendInput`, a new turn, or a queued follow-up.
-- **TS2:** `AgentHarness::steer_turn` is capability-gated. Codex maps it to `turn/steer` with the
-  exact native `expectedTurnId` and verifies the response returns that same turn.
-- **TS3:** While an active steerable turn has composer text, Send appears beside the always-usable
-  Stop control. Only one optimistic steer is pending per browser tab; failures leave the real turn
-  active. Attachments, unacknowledged starts, manual compactions, and persistence-blocked turns are
-  not steerable.
-
 **Changelog (1.89 → 1.90), pasted attachments:**
 - **A2:** The focused composer accepts clipboard files through the existing attachment pipeline.
   Mixed file-and-text clipboard content inserts its plain text and attaches every file, while
@@ -242,8 +247,15 @@
     configured `codex_path`, and reports through `log`, which Giskard does not bridge into `tracing`.
   - Both Codex spellings of the extended OpenAI MCP elicitation form (`openai/form` and
     `openaiForm`) preserve request routing and MCP approval promotion.
+    MCP envelopes are now retained raw because the generated bindings omit top-level scope.
+    Nested form fields preserve typed defaults and explicit optional inclusion; array/composite
+    values use a JSON editor retaining the original schema. Accepted responses are validated
+    server-side using the schema's declared standard dialect, including local references and
+    composite/conditional constraints. Remote/file references cannot be fetched. Invalid schemas
+    or content return the pending request to an actionable state with an error, permitting retry,
+    decline, or cancel; they never become a successful empty or partial response.
   Everything else the release adds — paginated `thread/items/list`, `thread/turns/list` and
-  `thread/revert`, `McpServerStatus.runtimeStatus`, the realtime item
+  `thread/revert`, a typed `turn/steer` helper, `McpServerStatus.runtimeStatus`, the realtime item
   timeline, and the newly typed `project/changed`, `thread/queue/changed`, `thread/reverted`,
   `mcpServer/event/stream/notification`, auth-recovery notifications, asynchronous agent-message
   questions, persisted thread model/reasoning metadata, plugin reconciliation and response-usage
@@ -336,7 +348,7 @@
   `rust-toolchain.toml`, so nothing enforces the manifest's claim — the bump is deliberate.
 
 **Changelog (1.66 → 1.67), per-turn payload files with a versioned header:**
-- **Motivation:** a turn's *count* is human-scaled (someone starts each turn) while a turn's
+- **Motivation:** a turn's *count* is human-scaled (someone types each prompt) while a turn's
   *contents* are agent-driven and unbounded (command output, diffs, tool JSON). Writing both to one
   append-only file put them on the same durability mechanism, and the large one broke it: a whole
   turn written with one `write_all` can be torn by a crash or a full disk, the next append
@@ -1530,7 +1542,7 @@ Robot series). The Cargo workspace uses `giskard-*` crate names throughout (see 
 | **Project** | A working context bound to exactly one filesystem **directory**. Holds metadata, configuration, and a set of threads. Backed by one harness process instance. |
 | **Workspace root** | The directory the agent is allowed to read/write within (the harness sandbox boundary). Defaults to the project directory; overridable per project. |
 | **Thread** | A durable conversation within a project (maps to a Codex *Thread*). Contains an ordered sequence of turns. Resumable across restarts. |
-| **Turn** | One unit of agent work initiated by user input (maps to a Codex *Turn*). It may receive additional steering messages while active, produces a sequence of items, and ends with a completion carrying token usage. |
+| **Turn** | One unit of agent work initiated by a single user input (maps to a Codex *Turn*). Produces a sequence of items and ends with a completion carrying token usage. |
 | **Item** | The atomic unit of agent input/output within a turn: a user message, an agent message, a reasoning note, a command execution, a file change, an approval request, a diff. Has a lifecycle: `started` → optional `delta`s → `completed`. |
 | **Mode** | A thread-level collaboration state: **Plan** (the agent analyzes and proposes) or **Build** (the agent implements). Switchable within a thread (§7.4). |
 | **Approval** | A server-initiated request from the harness asking the user to allow or deny a command execution or file change. Handled per the thread's permission preset (§9). |
@@ -1545,7 +1557,7 @@ Config (global)
     ├── ProjectConfig (workspace root, harness kind, …)
     └── Thread (durable conversation)
         ├── ThreadState (mode, current model, permission preset, token totals, context window)
-        └── Turn (initial user input → agent work + optional steering messages)
+        └── Turn (one user input → agent work)
             └── Item (message / reasoning / command / file-change / diff / approval)
 ```
 
@@ -1759,8 +1771,6 @@ pub struct HarnessCapabilities {
     pub mcp_oauth_login: bool,
     /// Manual context compaction can be requested for a thread.
     pub context_compaction: bool,
-    /// Text can be appended to an exact acknowledged active user turn.
-    pub turn_steering: bool,
 }
 ```
 
@@ -1818,14 +1828,6 @@ pub trait AgentHarness: Send + Sync {
         input: UserInput,
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError>;
-
-    /// Append text to the exact acknowledged active turn without starting another turn.
-    async fn steer_turn(
-        &self,
-        thread: &ThreadHandle,
-        expected_turn: TurnId,
-        text: String,
-    ) -> Result<(), HarnessError>;
 
     /// Subscribe to the stream of neutral events for a thread.
     /// Implemented as a cursor over a retained log of `AgentEvent` values.
@@ -2004,8 +2006,8 @@ pub struct TurnStatus {              // outcome of a completed turn
 pub enum TurnStatusKind { Completed, Interrupted, Failed }
 
 // ---- Turn (B1) ----
-/// One unit of agent work initiated by `user_input` and optionally extended by steering messages.
-/// `user_input` retains the initiating input; later same-turn user messages remain ordered items.
+/// One unit of agent work initiated by a single user input. Persisted inside the thread file
+/// (§5.3) as an element of `Thread.turns`, and the unit the diff viewer / token gauge read from.
 pub struct Turn {
     pub id: TurnId,
     pub user_input: UserInput,
@@ -2281,7 +2283,6 @@ The `CodexHarness` maps the Codex app-server JSON-RPC protocol onto the above. K
 | `initialize` + `initialized` handshake | **once per process** (per project), during process spawn — not per thread (S1) |
 | `thread/start`, `thread/resume` | `open_thread` (S1: this is the per-thread call, distinct from the handshake) |
 | `turn/start` (with model/effort/permissions per turn) | `start_turn` + `TurnOverrides` (P1: effort lives in `ModelRef`, not `TurnOverrides`) |
-| `turn/steer` (with exact `expectedTurnId`) | `steer_turn` on the existing Giskard turn; emitted user messages stay in that turn |
 | `item/started`, `item/*/delta`, `item/completed` | `ItemStarted` / `ItemDelta` / `ItemCompleted` |
 | `turn/diff/updated` | `DiffUpdated` |
 | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval` | `ApprovalRequested` |
@@ -2430,8 +2431,9 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "context_window": 258400,              // CACHE ONLY (C4): effective window for current_model;
                                          //   starts from descriptor metadata and is replaced by a
                                          //   harness-reported runtime value when available.
-  "model_context_windows": {             // C8: harness-reported effective windows retained by
-    "openai": { "gpt-5.5": 258400 }      //   exact provider/model for reloads and model switches.
+  "model_context_windows": {             // C8: first natural effective capacity retained by
+    "openai": { "gpt-5.5": 258400 }      //   exact provider/model for reloads and model switches;
+                                         //   reduced overrides do not replace it.
   },
   "permission_preset": "ask_first",        // permission preset (§9)
   "archived": false,                     // hidden from the active thread group when true
@@ -2469,8 +2471,9 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
 > The thread `tokens` object carries both the aggregate (`total`) **and** the per-model
 > breakdown (`by_model`), matching §10.2. A thread accumulates a distinct `by_model[provider][model]`
 > entry whenever its model changes mid-thread (§8.4). `context_window` is a cache (C4): catalog or
-> config metadata supplies its initial value, while `model_context_windows` retains authoritative
-> effective values reported by the harness for exact provider/model pairs.
+> config metadata supplies its initial value, while `model_context_windows` retains the natural
+> effective capacity first reported by the harness for exact provider/model pairs. The scalar
+> `context_window` continues to track the latest effective gauge denominator.
 
 ```jsonc
 // projects/<id>/tokens.json  and  tokens-global.json
@@ -2769,10 +2772,6 @@ yet, so there is no catalog to choose from (§8.3).
 - **Send input:** user submits a message; server builds a `TurnOverrides` snapshot from the
   thread's persisted state (mode, current model — which carries effort) and calls `start_turn`.
   A turn begins.
-- **Steer:** after a normal user turn has an acknowledged ID, text submitted while it remains
-  active calls `steer_turn` with that exact ID. The harness appends the input as another user
-  message in the same turn. Steering does not snapshot settings again, reserve another lease,
-  create another persisted turn, or fall back to a queued follow-up when it is rejected.
 - **Stream:** `AgentEvent`s flow to the UI (§13.6) and update persisted state.
 - **Complete:** on `TurnCompleted`, token usage is folded into the ledgers (§10) and the
   thread file is rewritten atomically.
@@ -2784,8 +2783,8 @@ yet, so there is no catalog to choose from (§8.3).
   the selected model, then provider/config metadata, then the conservative fallback. A later turn
   replaces that value when the harness reports its effective window.
 - **Interrupt:** user can interrupt an in-flight turn (`turn/interrupt`). The UI exposes this as a
-  live-turn Stop control. For a steerable active turn, non-empty composer text also reveals Send
-  beside Stop; an empty composer retains Stop alone. Steering and interrupt remain independent.
+  live-turn Stop control; sending another user message while a turn is still live is a separate
+  queueing policy and is not implied by interrupt support.
 - **Archive / unarchive:** the thread list exposes an actions menu (`...`) per thread. Archive calls
   the harness lifecycle operation first (Codex `thread/archive`) and marks the local thread
   metadata `archived = true` only after success. Unarchive is the reverse operation (Codex
@@ -2840,6 +2839,48 @@ Auto-generate an initial title from the first user message (truncated); user-edi
   copy button still yields the whole note (RN1, RN2).
 - Each item ends with `ItemCompleted` carrying its final, canonical form (this is what gets
   persisted; deltas are transient).
+
+### 7.3.1 Asynchronous questions and steering
+
+Agent-message payloads may include harness-neutral asynchronous questions, each with a title and
+optional string choices. Preserve them in turn payloads and wire history/live replay; omitted
+questions default to an empty collection. A questions-only message remains visible. These are
+ordinary message items rather than pending server requests or approvals. Never auto-submit a
+preselected option. Always offer free text and require explicit submission.
+
+A harness advertising `turn_steering` accepts text input into an existing active turn. The client
+supplies its expected Giskard turn identity; the adapter validates it and passes the corresponding
+native expected-turn guard. Acceptance is acknowledged without inventing a new `TurnStarted`,
+reserving another turn lease, changing turn overrides, or interrupting work. Failed/stale steering
+preserves the browser draft. Lost acknowledgment produces uncertain delivery and no automatic retry.
+A primary-thread answer after the turn finishes is ordinary new input.
+
+Managed child threads remain read-only for general messages. An active question may receive a
+matched answer only after validating its source item and active turn against authoritative runtime
+state. That exception never starts an idle child or permits unrestricted child steering.
+
+See [Astra interactions](../docs/astra-interactions.md) for protocol provenance and the native
+capability audit.
+
+### 7.3.2 Native goals and queued input
+
+Goals and queued submissions are harness-owned state, exposed as fresh snapshots and turnless
+invalidation events. The CodexInstance control lane serializes all native goal/queue RPCs. Giskard
+must not persist a competing snapshot or reserve turns from HTTP handlers. Autonomous turns caused
+by goals or queue start enter the existing forwarder's external-turn admission path. Mutations
+require a loaded writable primary thread and are unavailable while archived; child/orphan reads
+remain permitted. Clients refresh on reconnect and invalidation, preserve queue cursors, and do not
+retry uncertain mutations automatically. Queue editors must mark non-text entries and avoid silently
+replacing their attachment content. Native unsupported/protocol errors remain visible to operators.
+
+Goal/queue launch settings are captured at explicit goal set, queue add and queue start operations.
+The server snapshots persisted selected model/effort/tier, mode and permissions and verifies the
+provider against the loaded native binding. The task-owned adapter sends `thread/settings/update`
+with that snapshot and the loaded cwd, then the mutation without interleaving other controls.
+Failure to synchronize settings prevents the mutation. Native service tier is explicit, including
+null to clear. This changes subsequent native work; it does not change the already-running turn or
+make later selector edits apply automatically. The UI must state this capture boundary and explain
+that settings belong to the thread's subsequent work, not individual queue entries.
 
 ### 7.4 Plan / Build modes
 
@@ -3269,8 +3310,19 @@ read-only sandboxing. The selected permission preset controls what the agent may
    gap later.
 3. User chooses a decision; server calls `respond_approval`.
 
+Codex `item/tool/call` requests execute through operator-configured client tool namespaces in
+`harness.dynamic_tools`. Native namespace/function schemas are registered on `thread/start`;
+resumed threads retain their saved definitions. Each configured tool has an absolute executable,
+fixed argv, an explicit absolute executor cwd, an input JSON schema and a bounded timeout.
+The instance validates arguments, runs process I/O without blocking native traffic, and sends a
+typed success/contentItems result. Unknown tools and execution failures return an explicit failed
+result and visible thread error; the browser cannot fabricate successful execution. Limits are
+16 concurrent calls per process and 1 MiB each for stdin/stdout/stderr. Completion, interruption,
+deletion and shutdown cancel the applicable processes; Unix process groups are killed and direct
+children reaped. Executors run under server OS credentials outside Codex sandbox/approval policy.
+
 Codex also has server-initiated requests that are not approval decisions:
-`item/tool/call`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, auth refresh,
+`item/tool/requestUserInput`, `mcpServer/elicitation/request`, auth refresh,
 attestation, and future method names. These use `AgentEvent::ServerRequestReceived` rather than
 `ApprovalRequested`, are rendered as transcript cards, and must remain pending until the browser
 sends `respond_server_request`. Giskard may provide first-class UI for known methods, but unknown
@@ -3533,6 +3585,20 @@ helpful message if the spawned app-server reports it is unauthenticated.
 
 ---
 
+### 12.3 Native host service integration
+
+Optional `[harness].attestation_provider_command` and `external_auth_provider_command`
+(default empty argv arrays) connect operator-owned providers using the versioned protocol in
+[`docs/native-service-providers.md`](../docs/native-service-providers.md). These native
+connection services bypass browser prompts and persistence. Attestation is negotiated only
+with a configured provider; external auth explicitly initializes and refreshes host-owned
+ChatGPT tokens. Missing providers, malformed output and failed execution receive redacted
+errors. The sole transport task pumps service requests during outstanding RPCs, retaining
+ordinary frames in order with a fatal overflow bound and retaining the task-owned provider and
+response-write future across cancelled reads without reexecution. Shutdown drops that future;
+failed response writes poison the connection. Native signing and credential acquisition remain with the
+configured trusted host provider; Giskard neither synthesizes attestation nor reads auth files.
+
 ## 13. UI / UX
 
 ### 13.1 Stack
@@ -3576,6 +3642,12 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
   linkified paths — paired with the **context-window gauge** as a persistent, honest read on
   "how full is this conversation." That gauge + linkified transcript is what makes Giskard
   feel purpose-built rather than a generic chat wrapper.
+- The Context control distinguishes three capacities: the provider-advertised maximum, the raw
+  per-session selection, and the effective runtime window used by the gauge. A session defaults to
+  `min(advertised maximum, known non-premium input threshold)`. A writable primary may persist a
+  larger raw selection up to the advertised maximum; changing provider/model clears it. The server
+  applies it at a safe native start or verified cold-resume boundary and never interrupts active
+  work merely to change the limit.
 - Copy is plain and action-named (§ frontend writing guidance): buttons say exactly what
   happens ("Save plan to project", "Switch to Build", "Interrupt"). Empty states invite
   action ("No projects yet — create one to start."). Thread setting controls use visible labels
@@ -3688,7 +3760,8 @@ their bootstrap establishes a new per-connection baseline. A metadata revision d
 `active_turn`, transcript events, tasks, requests, or notices.
 
 `ThreadMetadata` is the only browser projection of persisted thread detail. It contains the thread
-id, revision, title, mode, current model, effective context window, permission preset, and token
+id, revision, title, mode, current model, effective context window, optional raw session context
+override, permission preset, and token
 aggregates. Native harness ids, per-model caches for unselected models, ownership internals, and Git
 workspace records remain server-side. Every project thread-summary row carries that thread's same
 revision so WebSocket detail and HTTP catalog results can be compared without treating their
@@ -3743,7 +3816,6 @@ deletion; all other native deletion errors stop the cascade before deleting that
 **Client → server** (examples): `Subscribe { thread_id, since? }` (`since` is the incremental-resync
 cursor, H8), `Unsubscribe { thread_id }`,
 `SendInput { thread_id, text, attachments? }`,
-`SteerInput { thread_id, turn_id, text }`,
 `SwitchMode { thread_id, request_id, mode }`,
 `SelectModel { thread_id, request_id, model_ref }`,
 `SetPermissionPreset { thread_id, request_id, preset }`,
@@ -3760,15 +3832,6 @@ state: multiple tabs or reconnect races must not be able to start overlapping na
 thread. The browser marks a turn active immediately after successfully sending `SendInput`, before
 any harness `TurnStarted` event, and clears that optimistic state if the server rejects the send for
 anything other than `thread_turn_active`.
-
-`SteerInput` is valid only when `turn_id` is the exact acknowledged active normal user turn and the
-harness advertises `turn_steering`. It carries text only. The server rejects an unacknowledged
-start, manual compaction, persistence-blocked owner, stale/completed turn, read-only thread, or
-unsupported harness without calling `start_turn`. Steering calls the harness directly because it
-does not admit a turn or reserve a lease; both the server runtime and provider re-check the exact
-turn ID across the race. A successful provider `UserMessage` item is the ordered acceptance
-evidence and enters the existing live buffer and completed payload. A steering failure is a direct
-error for the initiating browser and never clears active-turn ownership.
 
 The long-lived event owner serializes primary turn admission with externally observed native turns.
 `SendInput` and `CompactContext` enqueue bounded intents to that owner. The owner rejects overlapping
@@ -3793,17 +3856,21 @@ held while awaiting harness, persistence, runtime publication, or owner shutdown
 > MIME type, byte size, kind, and base64 bytes in the browser request. The server validates base64,
 > decoded size, bounded metadata, the aggregate limit, and supported image signatures before
 > starting a turn; an image's declared MIME type must match its PNG, JPEG, GIF, or WebP signature.
+> Audio attachments use kind `audio` and a WAV (`audio/wav`) or MP3 (`audio/mpeg`) signature.
+> The browser identifies those containers independently of filename/MIME and shows an Audio
+> chip; other declared audio formats remain ordinary files with a notice. Known model input
+> modalities excluding audio reject the attachment; unknown metadata defers to the provider.
 > Raw bytes are omitted from Giskard history and its parsed in-memory history cache. For the Codex
 > harness,
-> image attachments become `UserInput::Image { url: "data:<mime>;base64,<bytes>" }`; other files
+> image attachments become `UserInput::Image { url: "data:<mime>;base64,<bytes>" }` and audio
+> attachments become `UserInput::Audio` with the same data-URL structure; other files
 > are transferred with Codex `fs/writeFile` to a randomized, per-turn harness-host temp directory,
 > and that path is appended to the text prompt. The Codex adapter removes the directory with
 > `fs/remove` after the turn, an upload/start failure, stream loss, command/control channel closure,
 > or shutdown. It never writes upload bytes into the project workspace.
 > The focused browser composer accepts the same files from its attachment button, drag-and-drop,
 > or the clipboard. When clipboard files accompany text, it inserts the plain-text clipboard value
-> at the current selection and attaches every file. Attachment ingestion is disabled during an
-> active turn because `SteerInput` is text-only in this milestone.
+> at the current selection and attaches every file.
 
 **Server → client** (examples): `Event { thread_id, agent_event }` (a serialized
 `WireAgentEvent` — the path-mirrored wire form of `AgentEvent`, §3.5),
@@ -3836,12 +3903,9 @@ control state for commands and tool/MCP calls still known to be running, includi
 outlived an interrupted turn),
 `Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
 
-`OpenThreadResponse` and `StartThreadResponse` carry `turn_steering`, sampled from the attached
-harness capabilities, so the composer does not offer an action the provider cannot perform. A
-read-only degraded open reports `false`. `OpenThreadResponse` may also carry
-`warning: ErrorInfo?` with the same `code` / `severity` / `message` shape when the requested thread
-was opened but degraded (for example, Codex resume failed and Giskard started a fresh native
-session while keeping persisted history).
+`OpenThreadResponse` may also carry `warning: ErrorInfo?` with the same `code` / `severity` /
+`message` shape when the requested thread was opened but degraded (for example, Codex resume
+failed and Giskard started a fresh native session while keeping persisted history).
 
 **Request resolution invariant (RT2):** approval and server requests may be visible in multiple
 tabs. A response first atomically claims the request in its owning thread. Every tab follows the
@@ -4141,8 +4205,6 @@ turn/start { threadId, input:[…], model?, effort?, sandbox? }
     ⇢ item/commandExecution/requestApproval  |  item/fileChange/requestApproval
                                               |  item/permissions/requestApproval   (server→client request)
     ⇠ (client responds with a decision)
-turn/steer { threadId, expectedTurnId, input:[{type:"text",text:…}] }
-    ⇢ item/started + item/completed for another UserMessage in the same turn
 turn/completed { usage, … }
 turn/interrupt { threadId }                            (to cancel)
 ```

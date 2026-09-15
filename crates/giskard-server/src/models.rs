@@ -25,10 +25,15 @@ fn from_config(config: &Config, provider: &str, model: &str) -> Option<ModelDesc
         provider: provider.to_string(),
         model: model.to_string(),
         context_window: m.context_window,
+        advertised_context_window: None,
         supports_reasoning_effort: m.supports_reasoning_effort,
         reasoning_efforts: Vec::new(),
         display_name: m.display_name.clone(),
         is_default: false,
+        service_tiers: None,
+        default_service_tier: None,
+        input_modalities: None,
+        multi_agent_version: None,
     })
 }
 
@@ -44,16 +49,22 @@ pub fn resolve_catalog_descriptor(
     config: &Config,
     model: &ModelRef,
 ) -> ModelDescriptor {
-    from_config(config, &model.provider, &model.model)
-        .or_else(|| {
-            catalog
-                .iter()
-                .find(|descriptor| {
-                    descriptor.provider == model.provider && descriptor.model == model.model
-                })
-                .cloned()
-        })
-        .unwrap_or_else(|| resolve_descriptor(config, model))
+    let catalog_entry = catalog.iter().find(|descriptor| {
+        descriptor.provider == model.provider && descriptor.model == model.model
+    });
+    let mut descriptor = from_config(config, &model.provider, &model.model)
+        .or_else(|| catalog_entry.cloned())
+        .unwrap_or_else(|| resolve_descriptor(config, model));
+    // Config owns its explicitly configurable fields, but does not declare native capabilities.
+    // Preserve those from the composed catalog even when config supplies this model's window.
+    if let Some(native) = catalog_entry {
+        descriptor.advertised_context_window = native.advertised_context_window;
+        descriptor.service_tiers = native.service_tiers.clone();
+        descriptor.default_service_tier = native.default_service_tier.clone();
+        descriptor.input_modalities = native.input_modalities.clone();
+        descriptor.multi_agent_version = native.multi_agent_version.clone();
+    }
+    descriptor
 }
 
 pub fn normalize_model_ref(
@@ -115,7 +126,51 @@ pub fn context_window_with_runtime(
         .and_then(|models| models.get(&model.model))
         .copied()
         .filter(|window| *window > 0)
-        .unwrap_or(descriptor.context_window)
+        .unwrap_or_else(|| descriptor.default_session_context_window())
+}
+
+pub fn runtime_model_context_window(
+    model: &ModelRef,
+    runtime_windows: &HashMap<String, HashMap<String, u32>>,
+) -> Option<u32> {
+    runtime_windows
+        .get(&model.provider)
+        .and_then(|models| models.get(&model.model))
+        .copied()
+        .filter(|window| *window > 0)
+}
+
+/// Resolve a raw session limit only after either catalog metadata or the natural runtime gauge
+/// has established this model's capacity. This avoids manufacturing a 128K override that then
+/// hides the provider's real limit.
+pub fn configured_session_context_window(
+    model: &ModelRef,
+    descriptor: &ModelDescriptor,
+    runtime_windows: &HashMap<String, HashMap<String, u32>>,
+    requested: Option<u32>,
+) -> Option<u32> {
+    let mut resolved = descriptor.clone();
+    if let Some(runtime) = runtime_model_context_window(model, runtime_windows) {
+        resolved.advertised_context_window = resolved
+            .advertised_context_window
+            .filter(|window| *window > 0)
+            .map_or(Some(runtime), |advertised| Some(advertised.min(runtime)));
+    }
+    resolved
+        .advertised_context_window
+        .filter(|window| *window > 0)
+        .map(|_| selected_session_context_window(&resolved, requested))
+}
+
+/// Clamp a session preference to the current advertised maximum; never use runtime usage as max.
+pub fn selected_session_context_window(
+    descriptor: &ModelDescriptor,
+    requested: Option<u32>,
+) -> u32 {
+    let default = descriptor.default_session_context_window();
+    requested
+        .map(|value| value.clamp(default, descriptor.maximum_session_context_window()))
+        .unwrap_or(default)
 }
 
 /// The full static model list offered by the model picker (§8.3): every declared
@@ -128,10 +183,15 @@ pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
                 provider: id.clone(),
                 model: m.id.clone(),
                 context_window: m.context_window,
+                advertised_context_window: None,
                 supports_reasoning_effort: m.supports_reasoning_effort,
                 reasoning_efforts: Vec::new(),
                 display_name: m.display_name.clone(),
                 is_default: false,
+                service_tiers: None,
+                default_service_tier: None,
+                input_modalities: None,
+                multi_agent_version: None,
             });
         }
     }
@@ -184,7 +244,8 @@ pub fn order_for_picker(mut models: Vec<ModelDescriptor>, config: &Config) -> Ve
 ///   provider that advertised its own levels keeps those, and only a model nothing else has
 ///   described takes the harness catalog's.
 ///
-/// The harness never supplies context window (Codex's `model/list` omits it).
+/// A harness may preserve a remotely advertised maximum alongside its native catalog metadata;
+/// the provider's direct discovery result still wins when both supplied one.
 pub fn apply_harness_metadata(
     mut base: Vec<ModelDescriptor>,
     harness_models: &[ModelDescriptor],
@@ -214,6 +275,13 @@ pub fn apply_harness_metadata(
         // below, both would claim it and the picker would start on whichever came first.
         if h.provider.is_empty() || h.provider == d.provider {
             d.is_default = h.is_default;
+            if d.advertised_context_window.is_none() {
+                d.advertised_context_window = h.advertised_context_window;
+            }
+            d.service_tiers = h.service_tiers.clone();
+            d.default_service_tier = h.default_service_tier.clone();
+            d.input_modalities = h.input_modalities.clone();
+            d.multi_agent_version = h.multi_agent_version.clone();
         }
         // Config wins, and so does anything discovery already learned: a provider's own catalog
         // names efforts for *its* model, while `model/list` is keyed by model id alone and knows
@@ -302,9 +370,19 @@ fn model_entries(
     }
 }
 
+/// Input limits bound request capacity even when the full input/output window is larger.
+fn bounded_capacity(window: Option<u32>, input: Option<u32>) -> Option<u32> {
+    match (window, input) {
+        (Some(window), Some(input)) => Some(window.min(input)),
+        (window, input) => window.or(input),
+    }
+}
+
 #[derive(Deserialize)]
 struct OpenAiModel {
     id: String,
+    #[serde(default)]
+    max_context_window: Option<serde_json::Value>,
     #[serde(default)]
     context_window: Option<serde_json::Value>,
     #[serde(default)]
@@ -333,6 +411,8 @@ struct HarnessCatalogModel {
     /// (`ModelInfo::resolved_context_window`), so an entry carrying only the maximum still has one.
     #[serde(default)]
     max_context_window: Option<serde_json::Value>,
+    #[serde(default)]
+    max_input_tokens: Option<serde_json::Value>,
     /// `None` is "said nothing about efforts"; `Some([])` is "said there are none". The two must
     /// stay apart: the harness-catalog overlay fills the first and must not touch the second.
     ///
@@ -457,6 +537,7 @@ pub struct DiscoveredModel {
     pub provider: String,
     pub model: String,
     pub context_window: Option<u32>,
+    pub advertised_context_window: Option<u32>,
     pub display_name: Option<String>,
     /// `None` is "the endpoint said nothing about efforts"; `Some([])` is "it said there are none".
     /// Collapsing the two would let the harness-catalog overlay hand a model effort levels its own
@@ -480,6 +561,14 @@ pub fn merge_models(
         .map(|d| (d.provider.clone(), d.model.clone()))
         .collect();
     for discovered in dynamic {
+        if let Some(existing) = base.iter_mut().find(|descriptor| {
+            descriptor.provider == discovered.provider && descriptor.model == discovered.model
+        }) && let Some(maximum) = discovered
+            .advertised_context_window
+            .filter(|value| *value > 0)
+        {
+            existing.advertised_context_window = Some(maximum);
+        }
         if seen.insert((discovered.provider.clone(), discovered.model.clone())) {
             let mut descriptor = ModelDescriptor::conservative(
                 discovered.provider.clone(),
@@ -488,6 +577,7 @@ pub fn merge_models(
             if let Some(context_window) = discovered.context_window.filter(|window| *window > 0) {
                 descriptor.context_window = context_window;
             }
+            descriptor.advertised_context_window = discovered.advertised_context_window;
             descriptor.display_name = discovered.display_name.clone();
             // An advertised effort list is also the answer to whether the selector is shown at all,
             // so the two move together — including when the answer is "none", which is why this
@@ -612,6 +702,8 @@ fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel
     // Insertion-ordered so the picker keeps the order the provider listed, and so a catalog entry
     // refines an OpenAI one in place rather than jumping to the end.
     let mut out: IndexMap<String, (DiscoveredModel, bool)> = IndexMap::new();
+    let mut input_limits: HashMap<String, u32> = HashMap::new();
+    let mut explicit_maxima: HashMap<String, u32> = HashMap::new();
 
     for entry in openai.unwrap_or_default() {
         let model: OpenAiModel = match serde_json::from_value(entry) {
@@ -628,16 +720,32 @@ fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel
         };
         let context_window = parse_discovered_capacity(model.context_window.as_ref());
         let max_input_tokens = parse_discovered_capacity(model.max_input_tokens.as_ref());
-        let invalid = context_window.is_err() || max_input_tokens.is_err();
+        let max_context_window = parse_discovered_capacity(model.max_context_window.as_ref());
+        let invalid =
+            context_window.is_err() || max_input_tokens.is_err() || max_context_window.is_err();
+        let advertised_context_window = bounded_capacity(
+            max_context_window
+                .ok()
+                .flatten()
+                .or(context_window.ok().flatten()),
+            max_input_tokens.ok().flatten(),
+        );
         if invalid {
             warn!(
                 provider = %provider,
                 model = %model.id,
                 context_window = ?model.context_window,
+                max_context_window = ?model.max_context_window,
                 max_input_tokens = ?model.max_input_tokens,
                 action = "discover_models",
                 "ignoring invalid model capacity metadata"
             );
+        }
+        if let Ok(Some(maximum)) = max_context_window {
+            explicit_maxima.insert(model.id.clone(), maximum);
+        }
+        if let Ok(Some(limit)) = max_input_tokens {
+            input_limits.insert(model.id.clone(), limit);
         }
         out.insert(
             model.id.clone(),
@@ -645,6 +753,7 @@ fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel
                 DiscoveredModel {
                     provider: provider.to_string(),
                     model: model.id,
+                    advertised_context_window,
                     context_window: context_window
                         .ok()
                         .flatten()
@@ -676,13 +785,32 @@ fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel
             out.shift_remove(&model.slug);
             continue;
         }
-        let (context_window, invalid_window) = model.context_window();
+        let (context_window, mut invalid_window) = model.context_window();
+        let maximum = parse_discovered_capacity(model.max_context_window.as_ref());
+        let input_maximum = parse_discovered_capacity(model.max_input_tokens.as_ref());
+        invalid_window |= maximum.is_err() || input_maximum.is_err();
+        let advertised_context_window = bounded_capacity(
+            maximum
+                .ok()
+                .flatten()
+                .or_else(|| explicit_maxima.get(&model.slug).copied())
+                .or(context_window)
+                .or_else(|| {
+                    out.get(&model.slug)
+                        .and_then(|entry| entry.0.advertised_context_window)
+                }),
+            input_maximum
+                .ok()
+                .flatten()
+                .or_else(|| input_limits.get(&model.slug).copied()),
+        );
         if invalid_window {
             warn!(
                 provider = %provider,
                 model = %model.slug,
                 context_window = ?model.context_window,
                 max_context_window = ?model.max_context_window,
+                max_input_tokens = ?model.max_input_tokens,
                 action = "discover_models",
                 "ignoring invalid model capacity metadata"
             );
@@ -699,6 +827,9 @@ fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel
         });
         // Field by field: the catalog wins where it says something, and leaves what it does not
         // mention as the OpenAI entry had it.
+        if let Some(maximum) = advertised_context_window {
+            entry.0.advertised_context_window = Some(maximum);
+        }
         if let Some(window) = context_window {
             entry.0.context_window = Some(window);
         }
@@ -979,6 +1110,27 @@ async fn discover_provider(
     (models, warnings)
 }
 
+/// Only an advertised tier may be selected. The cap keeps human-selected model metadata
+/// bounded in the history index even when a provider publishes malformed identifiers.
+pub fn validate_service_tier(model: &ModelRef, descriptor: &ModelDescriptor) -> Result<(), String> {
+    let Some(tier) = model.service_tier.as_deref() else {
+        return Ok(());
+    };
+    if tier.is_empty()
+        || tier.len() > 128
+        || !descriptor
+            .service_tiers
+            .as_ref()
+            .is_some_and(|tiers| tiers.iter().any(|entry| entry.id == tier))
+    {
+        return Err(format!(
+            "Service tier is not available for model {}. Refresh the model list and select an advertised tier or Native default.",
+            model.model
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,6 +1153,60 @@ mod tests {
 
     /// The headline: a provider the harness reports is discovered without config naming it. The
     /// harness table is where a provider is declared; repeating it here bought nothing.
+    #[test]
+    fn service_tiers_validate_against_the_selected_catalog_route() {
+        let mut descriptor = ModelDescriptor::conservative("openai", "astra");
+        descriptor.service_tiers = Some(vec![giskard_core::model::ModelServiceTier {
+            id: "future-fast".into(),
+            name: "Future Fast".into(),
+            description: "Capacity".into(),
+        }]);
+        let mut model = ModelRef {
+            provider: "openai".into(),
+            model: "astra".into(),
+            reasoning_effort: None,
+            service_tier: None,
+        };
+        assert!(validate_service_tier(&model, &descriptor).is_ok());
+        model.service_tier = Some("future-fast".into());
+        assert!(validate_service_tier(&model, &descriptor).is_ok());
+        assert!(
+            validate_service_tier(&model, &ModelDescriptor::conservative("openai", "other"))
+                .is_err()
+        );
+        model.service_tier = Some("unadvertised".into());
+        assert!(validate_service_tier(&model, &descriptor).is_err());
+        model.service_tier = Some("x".repeat(129));
+        descriptor.service_tiers.as_mut().unwrap()[0].id = "x".repeat(129);
+        assert!(validate_service_tier(&model, &descriptor).is_err());
+    }
+
+    #[test]
+    fn native_capability_metadata_stays_on_its_provider_route() {
+        let mut native = ModelDescriptor::conservative("openai", "astra");
+        native.input_modalities = Some(vec!["audio".into()]);
+        native.multi_agent_version = Some("v99".into());
+        native.default_service_tier = Some("future-fast".into());
+        native.service_tiers = Some(vec![giskard_core::model::ModelServiceTier {
+            id: "future-fast".into(),
+            name: "Fast".into(),
+            description: String::new(),
+        }]);
+        let base = vec![
+            ModelDescriptor::conservative("openai", "astra"),
+            ModelDescriptor::conservative("other", "astra"),
+        ];
+        let out = apply_harness_metadata(base, &[native], &Config::default(), &HashSet::new());
+        let exact = out.iter().find(|m| m.provider == "openai").unwrap();
+        assert_eq!(exact.input_modalities.as_ref().unwrap(), &["audio"]);
+        assert_eq!(exact.multi_agent_version.as_deref(), Some("v99"));
+        assert_eq!(exact.default_service_tier.as_deref(), Some("future-fast"));
+        assert_eq!(exact.service_tiers.as_ref().unwrap()[0].id, "future-fast");
+        let other = out.iter().find(|m| m.provider == "other").unwrap();
+        assert!(other.service_tiers.is_none());
+        assert!(other.input_modalities.is_none());
+    }
+
     #[test]
     fn a_provider_absent_from_config_is_still_queried() {
         let config: Config = toml::from_str("").unwrap();
@@ -1107,6 +1313,7 @@ model_listing = true
             provider: "cloudflare-litellm".into(),
             model: "@cf/z-ai/glm-4.7".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let d = resolve_descriptor(&config, &m);
         assert_eq!(d.context_window, 131_072);
@@ -1120,15 +1327,21 @@ model_listing = true
             provider: "cloudflare-litellm".into(),
             model: "@cf/z-ai/glm-4.7".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let stale_catalog = vec![ModelDescriptor {
             provider: model.provider.clone(),
             model: model.model.clone(),
             context_window: 64_000,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["high".into()],
             display_name: Some("Stale".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         let descriptor = resolve_catalog_descriptor(&stale_catalog, &config, &model);
@@ -1143,6 +1356,7 @@ model_listing = true
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         assert_eq!(
             context_window_for(&config, &m),
@@ -1157,6 +1371,7 @@ model_listing = true
             provider: "acme".into(),
             model: "mystery-1".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let d = resolve_descriptor(&config, &m);
         assert_eq!(
@@ -1203,6 +1418,110 @@ model_listing = true
                 "{unusable:?} should not reach the query"
             );
         }
+    }
+
+    #[test]
+    fn advertised_capacity_preserves_larger_maximum_and_respects_input_bound() {
+        for body in [
+            br#"{"models":[{"slug":"gpt-6-astra","context_window":272000,"max_context_window":1050000,"max_input_tokens":922000}]}"#.as_slice(),
+            br#"{"data":[{"id":"gpt-6-astra","context_window":272000,"max_context_window":1050000,"max_input_tokens":922000}]}"#.as_slice(),
+            br#"{"data":[{"id":"gpt-6-astra","max_input_tokens":922000}],"models":[{"slug":"gpt-6-astra","context_window":272000,"max_context_window":1050000}]}"#.as_slice(),
+            br#"{"data":[{"id":"gpt-6-astra","max_input_tokens":922000,"max_context_window":1050000}],"models":[{"slug":"gpt-6-astra","context_window":272000}]}"#.as_slice(),
+            br#"{"data":[{"id":"gpt-6-astra","context_window":272000,"max_input_tokens":922000,"max_context_window":1050000}],"models":[{"slug":"gpt-6-astra","display_name":"Astra"}]}"#.as_slice(),
+        ] {
+            let parsed = parse_models_body(body, "provider").unwrap();
+            assert_eq!(parsed[0].0.context_window, Some(272_000));
+            assert_eq!(parsed[0].0.advertised_context_window, Some(922_000));
+            assert!(!parsed[0].1);
+        }
+    }
+
+    #[test]
+    fn malformed_maximum_keeps_valid_remote_capacity_and_warns() {
+        let parsed = parse_models_body(br#"{"models":[{"slug":"gpt-6-astra","context_window":400000,"max_context_window":"invalid"}]}"#, "provider").unwrap();
+        assert_eq!(parsed[0].0.advertised_context_window, Some(400_000));
+        assert!(parsed[0].1);
+    }
+
+    #[test]
+    fn configured_window_does_not_erase_remote_maximum() {
+        let config: Config = toml::from_str("[providers.provider]\n[[providers.provider.models]]\nid = \"gpt-6-astra\"\ncontext_window = 100000\n").unwrap();
+        let parsed = parse_models_body(br#"{"models":[{"slug":"gpt-6-astra","context_window":272000,"max_context_window":1050000}]}"#, "provider").unwrap();
+        let dynamic: Vec<_> = parsed.into_iter().map(|(model, _)| model).collect();
+        let merged = merge_models(list_descriptors(&config), &dynamic);
+        let model = ModelRef {
+            provider: "provider".into(),
+            model: "gpt-6-astra".into(),
+            reasoning_effort: None,
+            service_tier: None,
+        };
+        let descriptor = resolve_catalog_descriptor(&merged, &config, &model);
+        assert_eq!(descriptor.context_window, 100_000);
+        assert_eq!(descriptor.maximum_session_context_window(), 1_050_000);
+        assert_eq!(descriptor.default_session_context_window(), 272_000);
+    }
+
+    #[test]
+    fn harness_maximum_fills_only_the_matching_providers_missing_capacity() {
+        let config: Config = toml::from_str(
+            "[providers.openai]\n[[providers.openai.models]]\nid = \"gpt-6-astra\"\ncontext_window = 272000\n[providers.proxy]\n[[providers.proxy.models]]\nid = \"gpt-6-astra\"\ncontext_window = 272000\n",
+        )
+        .unwrap();
+        let harness_capacity = {
+            let mut model = ModelDescriptor::conservative("openai", "gpt-6-astra");
+            model.advertised_context_window = Some(1_000_000);
+            model
+        };
+        let filled = apply_harness_metadata(
+            list_descriptors(&config),
+            std::slice::from_ref(&harness_capacity),
+            &config,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            filled
+                .iter()
+                .find(|model| model.provider == "openai")
+                .and_then(|model| model.advertised_context_window),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            filled
+                .iter()
+                .find(|model| model.provider == "proxy")
+                .and_then(|model| model.advertised_context_window),
+            None
+        );
+
+        let mut base = list_descriptors(&config);
+        base.iter_mut()
+            .find(|model| model.provider == "openai")
+            .unwrap()
+            .advertised_context_window = Some(922_000);
+        let out = apply_harness_metadata(base, &[harness_capacity], &config, &HashSet::new());
+        let capacity = |provider: &str| {
+            out.iter()
+                .find(|model| model.provider == provider)
+                .and_then(|model| model.advertised_context_window)
+        };
+        assert_eq!(capacity("openai"), Some(922_000));
+        assert_eq!(capacity("proxy"), None);
+    }
+
+    #[test]
+    fn saved_session_limit_is_clamped_when_remote_capacity_shrinks() {
+        let mut descriptor = ModelDescriptor::conservative("provider", "gpt-6-astra");
+        descriptor.advertised_context_window = Some(1_000_000);
+        assert_eq!(
+            selected_session_context_window(&descriptor, Some(900_000)),
+            900_000
+        );
+
+        descriptor.advertised_context_window = Some(512_000);
+        assert_eq!(
+            selected_session_context_window(&descriptor, Some(900_000)),
+            512_000
+        );
     }
 
     /// The shape a provider serves a harness that identified itself: the metadata Giskard otherwise
@@ -1576,6 +1895,7 @@ model_listing = true
             provider: "opencodex".into(),
             model: "gpt-5.5".into(),
             context_window: Some(262_144),
+            advertised_context_window: Some(262_144),
             display_name: Some("GPT-5.5".into()),
             reasoning_efforts: Some(vec!["low".into(), "high".into()]),
             priority: None,
@@ -1645,19 +1965,29 @@ model_listing = true
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 context_window: 262_144,
+                advertised_context_window: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
                 display_name: None,
                 is_default: false,
+                service_tiers: None,
+                default_service_tier: None,
+                input_modalities: None,
+                multi_agent_version: None,
             },
             ModelDescriptor {
                 provider: "cloudflare-litellm".into(),
                 model: "@cf/z-ai/glm-4.7".into(),
                 context_window: 131_072,
+                advertised_context_window: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
                 display_name: Some("GLM-4.7".into()),
                 is_default: false,
+                service_tiers: None,
+                default_service_tier: None,
+                input_modalities: None,
+                multi_agent_version: None,
             },
         ];
         // Harness catalog is provider-agnostic (empty provider), keyed by model id.
@@ -1666,19 +1996,29 @@ model_listing = true
                 provider: String::new(),
                 model: "gpt-5.5".into(),
                 context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+                advertised_context_window: None,
                 supports_reasoning_effort: true,
                 reasoning_efforts: vec!["low".into(), "high".into()],
                 display_name: Some("GPT-5.5".into()),
                 is_default: false,
+                service_tiers: None,
+                default_service_tier: None,
+                input_modalities: None,
+                multi_agent_version: None,
             },
             ModelDescriptor {
                 provider: String::new(),
                 model: "@cf/z-ai/glm-4.7".into(),
                 context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+                advertised_context_window: None,
                 supports_reasoning_effort: true,
                 reasoning_efforts: vec!["medium".into()],
                 display_name: Some("GLM 4.7".into()),
                 is_default: false,
+                service_tiers: None,
+                default_service_tier: None,
+                input_modalities: None,
+                multi_agent_version: None,
             },
         ];
 
@@ -1719,10 +2059,15 @@ model_listing = true
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             context_window: 128_000,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: None,
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         let out = order_for_picker(
@@ -1753,10 +2098,15 @@ model_listing = true
             provider: "openai".into(),
             model: "from-catalog".into(),
             context_window: 128_000,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: None,
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
         let out = apply_harness_metadata(
             list_descriptors(&config),
@@ -1785,10 +2135,15 @@ model_listing = true
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             context_window: 128_000,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: Some("GPT-5.5".into()),
             is_default: true,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
         let out = apply_harness_metadata(
             list_descriptors(&config),
@@ -1826,6 +2181,7 @@ model_listing = true
             provider: "openai".into(),
             model: "@cf/z-ai/glm-4.7".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let catalog = vec![ModelDescriptor::conservative(
             "openai".to_string(),
@@ -1855,20 +2211,30 @@ model_listing = true
             provider: "opencodex".into(),
             model: "gpt-5.5".into(),
             context_window: 262_144,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["low".into(), "high".into(), "xhigh".into()],
             display_name: Some("GPT-5.5".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         };
         // What `model/list` says about a model with the same id, under no provider at all.
         let harness = vec![ModelDescriptor {
             provider: String::new(),
             model: "gpt-5.5".into(),
             context_window: 0,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["low".into(), "medium".into()],
             display_name: Some("Other".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         // Discovery spoke about this pair, so the overlay must leave its efforts alone.
@@ -1897,19 +2263,29 @@ model_listing = true
             provider: "opencodex".into(),
             model: "gpt-5.5".into(),
             context_window: 262_144,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: None,
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         };
         let harness = vec![ModelDescriptor {
             provider: String::new(),
             model: "gpt-5.5".into(),
             context_window: 0,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["low".into(), "medium".into()],
             display_name: None,
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         let stated = HashSet::from([("opencodex".to_string(), "gpt-5.5".to_string())]);
@@ -1933,19 +2309,29 @@ model_listing = true
             provider: "litellm".into(),
             model: "gpt-5.5".into(),
             context_window: 128_000,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: None,
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         };
         let harness = vec![ModelDescriptor {
             provider: String::new(),
             model: "gpt-5.5".into(),
             context_window: 0,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["low".into(), "medium".into()],
             display_name: Some("GPT-5.5".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         let out = apply_harness_metadata(vec![discovered], &harness, &config, &HashSet::new());
@@ -1978,20 +2364,30 @@ model_listing = true
             provider: "p".into(),
             model: model.into(),
             context_window: 1000,
+            advertised_context_window: None,
             supports_reasoning_effort: supports,
             reasoning_efforts: Vec::new(),
             display_name: name.map(str::to_string),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         };
         // Harness catalog entry (empty provider) with a name and effort list.
         let cat = |model: &str, name: &str, efforts: &[&str]| ModelDescriptor {
             provider: String::new(),
             model: model.into(),
             context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            advertised_context_window: None,
             supports_reasoning_effort: !efforts.is_empty(),
             reasoning_efforts: efforts.iter().map(|e| (*e).to_string()).collect(),
             display_name: Some(name.into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         };
 
         let base = vec![
@@ -2059,10 +2455,15 @@ model_listing = true
             provider: String::new(),
             model: "gpt-5.5".into(),
             context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            advertised_context_window: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: Some("GPT-5.5".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
         let merged = apply_harness_metadata(base.clone(), &unsupported, &config, &HashSet::new());
         assert!(!merged[0].supports_reasoning_effort);
@@ -2072,10 +2473,15 @@ model_listing = true
             provider: String::new(),
             model: "gpt-5.5".into(),
             context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: Vec::new(),
             display_name: Some("GPT-5.5".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
         let merged = apply_harness_metadata(base, &default_only, &config, &HashSet::new());
         assert!(merged[0].supports_reasoning_effort);
@@ -2088,6 +2494,7 @@ model_listing = true
             provider: "openai".into(),
             model: "gpt-5.6-sol".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let descriptor = ModelDescriptor::conservative("openai", "gpt-5.6-sol");
         let runtime = HashMap::from([
@@ -2121,11 +2528,13 @@ model_listing = true
             provider: "a".into(),
             model: "b/c".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let second = ModelRef {
             provider: "a/b".into(),
             model: "c".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
 
         assert_eq!(
@@ -2165,10 +2574,15 @@ model_listing = true
             provider: String::new(),
             model: "shared-model".into(),
             context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            advertised_context_window: None,
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["focused".into()],
             display_name: Some("Shared Model".into()),
             is_default: false,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            multi_agent_version: None,
         }];
 
         let merged = apply_harness_metadata(base, &harness, &config, &HashSet::new());
@@ -2186,6 +2600,7 @@ model_listing = true
                 provider: "openai".into(),
                 model: "@cf/z-ai/glm-4.7".into(),
                 reasoning_effort: Some(giskard_core::model::Effort::new("high")),
+                service_tier: None,
             },
         );
         assert_eq!(normalized.provider, "cloudflare-litellm");
@@ -2212,6 +2627,7 @@ model_listing = true
             provider: "openai".into(),
             model: "@cf/z-ai/glm-4.7".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         assert_eq!(normalize_model_ref(&config, &[], &original), original);
     }

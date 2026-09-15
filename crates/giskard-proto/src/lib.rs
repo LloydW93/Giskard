@@ -57,18 +57,19 @@ pub enum ClientMessage {
     Unsubscribe {
         thread_id: ThreadId,
     },
+    SteerInput {
+        thread_id: ThreadId,
+        expected_turn_id: TurnId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question_item_id: Option<ItemId>,
+        request_id: String,
+        text: String,
+    },
     SendInput {
         thread_id: ThreadId,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<UserAttachment>,
-    },
-    /// Append text to an already acknowledged active turn. `turn_id` is an exact precondition:
-    /// a late frame must fail rather than steering whichever turn happens to be active next.
-    SteerInput {
-        thread_id: ThreadId,
-        turn_id: TurnId,
-        text: String,
     },
     SwitchMode {
         thread_id: ThreadId,
@@ -123,6 +124,8 @@ pub struct ThreadMetadata {
     pub mode: giskard_core::turn::TurnMode,
     pub current_model: giskard_core::turn::TurnModel,
     pub context_window: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_override: Option<u32>,
     pub permission_preset: PermissionPreset,
     pub tokens: TokenLedger,
 }
@@ -328,6 +331,17 @@ pub struct ErrorInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    ThreadCapabilities {
+        thread_id: ThreadId,
+        turn_steering: bool,
+        #[serde(default)]
+        goals_queue: bool,
+    },
+    SteerInputAccepted {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        request_id: String,
+    },
     Event {
         thread_id: ThreadId,
         agent_event: Box<WireAgentEvent>,
@@ -535,8 +549,6 @@ pub struct OpenSubagentLinkResponse {
 pub struct OpenThreadResponse {
     pub thread_id: ThreadId,
     pub harness_thread_id: String,
-    /// Whether this attached harness accepts text input during an active turn.
-    pub turn_steering: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<ErrorInfo>,
 }
@@ -585,8 +597,6 @@ pub struct StartThreadResponse {
     pub title: String,
     pub harness_thread_id: String,
     pub turn_id: TurnId,
-    /// Whether this attached harness accepts text input during an active turn.
-    pub turn_steering: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<ErrorInfo>,
 }
@@ -755,6 +765,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn steering_wire_requires_expected_turn_and_preserves_correlation() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let question = ItemId::new();
+        let request = serde_json::json!({"type":"steer_input", "thread_id":thread,
+            "expected_turn_id":turn, "question_item_id":question, "request_id":"steer-1", "text":"answer"});
+        assert!(
+            matches!(serde_json::from_value::<ClientMessage>(request.clone()).unwrap(),
+            ClientMessage::SteerInput { expected_turn_id, question_item_id: Some(item), request_id, .. }
+            if expected_turn_id == turn && item == question && request_id == "steer-1")
+        );
+        let mut missing_turn = request;
+        missing_turn
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_turn_id");
+        assert!(serde_json::from_value::<ClientMessage>(missing_turn).is_err());
+        let accepted = serde_json::to_value(ServerMessage::SteerInputAccepted {
+            thread_id: thread,
+            turn_id: turn,
+            request_id: "steer-1".into(),
+        })
+        .unwrap();
+        assert_eq!(accepted["type"], "steer_input_accepted");
+        assert_eq!(accepted["request_id"], "steer-1");
+    }
+
+    #[test]
     fn client_message_send_input_serde() {
         let msg = ClientMessage::SendInput {
             thread_id: ThreadId::new(),
@@ -794,36 +832,6 @@ mod tests {
                 assert_eq!(attachments.len(), 1);
                 assert_eq!(attachments[0].kind, AttachmentKind::Image);
                 assert_eq!(attachments[0].data_base64, "aW1hZ2U=");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn client_message_steer_input_serde() {
-        let thread_id = ThreadId::new();
-        let turn_id = TurnId::new();
-        let msg = ClientMessage::SteerInput {
-            thread_id,
-            turn_id,
-            text: "Use the existing helper instead".into(),
-        };
-        let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "steer_input");
-        assert_eq!(json["thread_id"], thread_id.to_string());
-        assert_eq!(json["turn_id"], turn_id.to_string());
-        assert!(json.get("attachments").is_none());
-
-        let back: ClientMessage = serde_json::from_value(json).unwrap();
-        match back {
-            ClientMessage::SteerInput {
-                thread_id: actual_thread,
-                turn_id: actual_turn,
-                text,
-            } => {
-                assert_eq!(actual_thread, thread_id);
-                assert_eq!(actual_turn, turn_id);
-                assert_eq!(text, "Use the existing helper instead");
             }
             _ => panic!("wrong variant"),
         }
@@ -1051,6 +1059,7 @@ mod tests {
         let tid = ThreadId::new();
         let msg = ServerMessage::ThreadState(ThreadState {
             metadata: ThreadMetadata {
+                context_window_override: None,
                 thread_id: tid,
                 revision: 7,
                 title: "Typed state".into(),
@@ -1059,6 +1068,7 @@ mod tests {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 context_window: 258_400,
                 permission_preset: PermissionPreset::AskFirst,
@@ -1091,6 +1101,7 @@ mod tests {
         let msg = ServerMessage::ThreadMetadataResult {
             request_id: "metadata-7".into(),
             metadata: ThreadMetadata {
+                context_window_override: None,
                 thread_id: tid,
                 revision: 7,
                 title: "Committed state".into(),
@@ -1099,6 +1110,7 @@ mod tests {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 context_window: 258_400,
                 permission_preset: PermissionPreset::AskFirst,

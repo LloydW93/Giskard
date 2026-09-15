@@ -26,11 +26,10 @@ use crate::AppState;
 use crate::auth::{TokenPurpose, get_session_token_from_header, sign_token, verify_token};
 use crate::hub::Outbound;
 use crate::log_fields::display_opt;
-use crate::registry::SteerTurnError;
 use crate::routes::{
     ApiError, ReadOnlyProviderContext, UI_VERSION, history_limit_or_default, load_thread,
     normalize_persisted_thread_model, project_model_catalog, provider_is_known, read_only_info,
-    thread_workspace, validate_user_attachments, warning_info,
+    thread_workspace, validate_attachment_modalities, validate_user_attachments, warning_info,
 };
 use crate::thread_graph::effective_thread_workspace_root as effective_workspace_root;
 
@@ -203,24 +202,6 @@ fn harness_error_means_command_unmanaged(error: &HarnessError) -> bool {
         || message.contains("no active turn to interrupt")
 }
 
-fn steer_ws_error(error: SteerTurnError, thread_id: ThreadId) -> WsError {
-    let (code, message) = match &error {
-        SteerTurnError::NotSteerable { .. }
-        | SteerTurnError::Harness(HarnessError::Unsupported(_)) => (
-            "turn_not_steerable",
-            "The running turn cannot accept that message.",
-        ),
-        _ => (
-            "turn_steer_failed",
-            "The message was not added to the running turn.",
-        ),
-    };
-    WsError::new(code, ErrorSeverity::Error, message)
-        .detail(error.to_string())
-        .thread(thread_id)
-        .action("steer_input")
-}
-
 /// Tell a just-connected client which threads are already waiting on it.
 ///
 /// Cross-thread activity is broadcast live and never replayed, so a browser that was closed or
@@ -385,8 +366,9 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                         continue;
                     }
                 };
-                let metadata_request_id = match &msg {
-                    ClientMessage::SwitchMode { request_id, .. }
+                let client_request_id = match &msg {
+                    ClientMessage::SteerInput { request_id, .. }
+                    | ClientMessage::SwitchMode { request_id, .. }
                     | ClientMessage::SelectModel { request_id, .. }
                     | ClientMessage::SetPermissionPreset { request_id, .. } => {
                         Some(request_id.clone())
@@ -394,7 +376,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                     _ => None,
                 };
                 if let Err(mut e) = handle_client_msg(&state, client_id, &tx, msg).await {
-                    e.info.request_id = metadata_request_id;
+                    e.info.request_id = e.info.request_id.or(client_request_id);
                     error!(
                         %client_id,
                         code = %e.info.code,
@@ -506,6 +488,14 @@ async fn handle_client_msg(
                 ))
                 .await;
 
+            let _ = tx
+                .send(ServerMessage::ThreadCapabilities {
+                    thread_id,
+                    turn_steering: state.registry.turn_steering_supported(thread_id).await,
+                    goals_queue: state.registry.goals_queue_supported(thread_id).await,
+                })
+                .await;
+
             // Initial/reconnect history remains a temporary bootstrap-only delta. Only older-page
             // pagination is fetched over HTTP and kept out of the ordered socket lane.
             //
@@ -605,6 +595,57 @@ async fn handle_client_msg(
         ClientMessage::Unsubscribe { thread_id } => {
             state.hub.unsubscribe(thread_id, client_id).await;
         }
+        ClientMessage::SteerInput {
+            thread_id,
+            expected_turn_id,
+            question_item_id,
+            request_id,
+            text,
+        } => {
+            let result: Result<(), WsError> = async {
+                if text.trim().is_empty() {
+                    return Err(WsError::new(
+                        "empty_input",
+                        ErrorSeverity::Error,
+                        "Send a message to steer the active turn.",
+                    )
+                    .thread(thread_id)
+                    .action("steer_input"));
+                }
+                tokio::time::timeout(
+                    HARNESS_CONTROL_TIMEOUT,
+                    state.registry.steer_turn(
+                        thread_id,
+                        expected_turn_id,
+                        question_item_id,
+                        UserInput::text(text),
+                        Some(format!("giskard-steer:{request_id}")),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    WsError::from_harness(
+                        HarnessError::Timeout("steering timed out; delivery is unknown".into()),
+                        "steer_input",
+                        Some(thread_id),
+                    )
+                })?
+                .map_err(|error| WsError::from_harness(error, "steer_input", Some(thread_id)))
+            }
+            .await;
+            if let Err(mut error) = result {
+                error.info.request_id = Some(request_id);
+                warn!(%thread_id, turn_id = %expected_turn_id, error = %error.info.message, "steering request failed");
+                return Err(error);
+            }
+            let _ = tx
+                .send(ServerMessage::SteerInputAccepted {
+                    thread_id,
+                    turn_id: expected_turn_id,
+                    request_id,
+                })
+                .await;
+        }
         ClientMessage::SendInput {
             thread_id,
             text,
@@ -702,6 +743,25 @@ async fn handle_client_msg(
                 .thread(thread_id)
                 .action("send_input")
             })?;
+            let descriptor =
+                crate::models::resolve_catalog_descriptor(&catalog, &app_config, &effective_model);
+            validate_attachment_modalities(&attachments, descriptor.input_modalities.as_deref())
+                .map_err(|error| {
+                    WsError::new(
+                        "unsupported_input_modality",
+                        ErrorSeverity::Error,
+                        error.to_string(),
+                    )
+                    .thread(thread_id)
+                    .action("send_input")
+                })?;
+            crate::models::validate_service_tier(&effective_model, &descriptor).map_err(
+                |message| {
+                    WsError::new("invalid_service_tier", ErrorSeverity::Error, message)
+                        .thread(thread_id)
+                        .action("send_input")
+                },
+            )?;
             let effective_mode = tf.mode.as_known().ok_or_else(|| {
                 WsError::new(
                     "thread_metadata_invalid",
@@ -718,6 +778,12 @@ async fn handle_client_msg(
             //    Codex on whatever model was set at `thread/start`.
             //  - the thread's persisted permission preset (§9).
             let overrides = TurnOverrides {
+                context_window: crate::models::configured_session_context_window(
+                    &effective_model,
+                    &descriptor,
+                    &tf.model_context_windows,
+                    tf.context_window_override,
+                ),
                 model: Some(effective_model.clone()),
                 mode: effective_mode,
                 permission_preset: tf.permission_preset,
@@ -733,61 +799,6 @@ async fn handle_client_msg(
                 )
                 .await
                 .map_err(|e| WsError::from_harness(e, "send_input", Some(thread_id)))?;
-        }
-        ClientMessage::SteerInput {
-            thread_id,
-            turn_id,
-            text,
-        } => {
-            let project_id = project_for_readonly(state, thread_id, "steer_input").await?;
-            state
-                .registry
-                .ensure_thread_writable(project_id, thread_id)
-                .await
-                .map_err(|error| WsError::from_harness(error, "steer_input", Some(thread_id)))?;
-            let text = text.trim().to_string();
-            if text.is_empty() {
-                return Err(WsError::new(
-                    "empty_input",
-                    ErrorSeverity::Error,
-                    "Type a message to steer the running turn.",
-                )
-                .thread(thread_id)
-                .action("steer_input"));
-            }
-
-            // Do not hold this connection's receive loop while the harness answers. The user must
-            // still be able to press Stop from the same tab while steering is pending. Codex bounds
-            // its own JSON-RPC request; dropping an outer timeout future could report failure while
-            // the already-queued provider request later succeeds.
-            let state = state.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                if let Err(error) = state.registry.steer_turn(thread_id, turn_id, text).await {
-                    warn!(
-                        %project_id,
-                        %thread_id,
-                        %turn_id,
-                        action = "steer_input",
-                        %error,
-                        "steering input failed"
-                    );
-                    if tx
-                        .send(steer_ws_error(error, thread_id).into_server_message())
-                        .await
-                        .is_err()
-                    {
-                        debug!(
-                            %client_id,
-                            %project_id,
-                            %thread_id,
-                            %turn_id,
-                            action = "steer_input",
-                            "steering error could not be delivered because the WebSocket writer ended"
-                        );
-                    }
-                }
-            });
         }
         ClientMessage::SwitchMode {
             thread_id,
@@ -859,6 +870,13 @@ async fn handle_client_msg(
                 })?;
             let catalog = project_model_catalog(state, &project_config, &config).await;
             let model_ref = crate::models::normalize_model_ref(&config, &catalog, &model_ref);
+            let descriptor =
+                crate::models::resolve_catalog_descriptor(&catalog, &config, &model_ref);
+            crate::models::validate_service_tier(&model_ref, &descriptor).map_err(|message| {
+                WsError::new("invalid_service_tier", ErrorSeverity::Error, message)
+                    .thread(thread_id)
+                    .action("select_model")
+            })?;
 
             let native_model = state
                 .registry
@@ -1398,7 +1416,7 @@ async fn ensure_thread_open(
         %action,
         "reopening persisted thread"
     );
-    let binding = if thread_file.kind == ThreadKind::Subagent {
+    let handle = if thread_file.kind == ThreadKind::Subagent {
         state
             .registry
             .attach_subagent_thread(&project_config, &thread_file)
@@ -1425,7 +1443,6 @@ async fn ensure_thread_open(
             .await
     }
     .map_err(|e| WsError::from_harness(e, action, Some(thread_id)))?;
-    let handle = binding.handle().clone();
 
     if handle.thread != thread_id {
         return Err(WsError::new(
@@ -1694,7 +1711,7 @@ async fn switch_provider_cold(
         "attempting verified cold-resume provider switch"
     );
 
-    let binding = state
+    let handle = state
         .registry
         .open_thread(
             &project_config,
@@ -1705,7 +1722,6 @@ async fn switch_provider_cold(
         )
         .await
         .map_err(|e| WsError::from_harness(e, "select_model", Some(thread_id)))?;
-    let handle = binding.handle().clone();
 
     let confirmed = handle.resumed_model.as_ref().is_some_and(|effective| {
         effective.provider == requested.provider && effective.model == requested.model
@@ -1931,45 +1947,4 @@ async fn save_plan(
         .strip_prefix(&workspace_root)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| target.to_string_lossy().to_string()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use giskard_core::ids::TurnId;
-
-    #[test]
-    fn steering_error_codes_distinguish_authority_and_harness_failures() {
-        let thread_id = ThreadId::new();
-        let expected_turn = TurnId::new();
-        let authority_error = steer_ws_error(
-            SteerTurnError::NotSteerable {
-                thread_id,
-                expected_turn,
-                active_turn: None,
-            },
-            thread_id,
-        );
-        assert_eq!(authority_error.info.code, "turn_not_steerable");
-        assert!(
-            !authority_error
-                .info
-                .detail
-                .as_deref()
-                .unwrap_or_default()
-                .contains("capability not offered")
-        );
-
-        let unsupported = steer_ws_error(
-            SteerTurnError::Harness(HarnessError::Unsupported("steering disabled".into())),
-            thread_id,
-        );
-        assert_eq!(unsupported.info.code, "turn_not_steerable");
-
-        let provider_failure = steer_ws_error(
-            SteerTurnError::Harness(HarnessError::Protocol("provider rejected steering".into())),
-            thread_id,
-        );
-        assert_eq!(provider_failure.info.code, "turn_steer_failed");
-    }
 }

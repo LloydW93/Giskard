@@ -160,6 +160,7 @@ let state = {
   // streamed); `newestPersistedTurnId` is the id of the newest turn known to have completed — the
   // high-water mark a future resync will use as its "give me turns after this" cursor.
   currentRenderTurnId:null, newestPersistedTurnId:null,
+  turnSteering:false, pendingComposerSteer:null, questionAnswers:new Map(),
   models:[], modelsProject:null, modelsLoadingProject:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(), requestStates:new Map(), runtimeOverviewRevision:-1,
@@ -174,7 +175,7 @@ let state = {
   // point: a resync rebuilds the same items under the same keys, so the choices still apply. They
   // are dropped only when the thread they belong to is left (see clearReasoningChoices).
   reasoningChoicesByRowKey:new Map(),
-  linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, outputOverlayRequestSeq:0, activeTurn:false, turnSteering:false, pendingSteer:null, interruptPending:false, compactPending:false,
+  linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, outputOverlayRequestSeq:0, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
   threadAuthorities:new Map(), pendingDetailConflictResyncs:new Set(),
   pendingMetadataActions:new Map(), threadListRefreshes:new Map(),
@@ -276,6 +277,7 @@ async function api(method, path, body, options) {
 // IDs. A user can navigate A → B → A while A's first request is still in flight; matching IDs
 // alone would then let that obsolete response mutate the second visit to A.
 function setActiveViewIdentity(projectId, threadId) {
+  goalsQueue.close();
   state.activeViewGeneration += 1;
   state.projectId = projectId;
   state.threadId = threadId;
@@ -936,6 +938,7 @@ function normalizedThreadProjection(kind, payload, threadId, revision) {
       mode:payload.mode,
       current_model:payload.current_model,
       context_window:payload.context_window,
+      context_window_override:payload.context_window_override || null,
       permission_preset:payload.permission_preset,
       tokens:payload.tokens
     };
@@ -2126,8 +2129,6 @@ function clearThreadView(tid) {
   state.draftThread = null;
   state.firstTurnStartingThreadId = null;
   state.pendingUserEl = null; state.pendingUserText = null;
-  state.turnSteering = false;
-  state.pendingSteer = null;
   state.compactPending = false;
   state.currentModel = null;
   state.currentModelUnreported = false;
@@ -2415,7 +2416,8 @@ function normalizeDraftModel(model) {
   return {
     provider:String(model.provider),
     model:String(model.model),
-    reasoning_effort:model.reasoning_effort || null
+    reasoning_effort:model.reasoning_effort || null,
+    service_tier:model.service_tier || null
   };
 }
 
@@ -2533,6 +2535,7 @@ function openDraftThread(pid) {
     try { oldWs.close(); } catch {}
   }
 
+  markQuestionDeliveryUncertain();
   setActiveViewIdentity(pid, null);
   renderParentThreadButton();
   // `modelLoading` until the project's default arrives; `currentModel` stays null until then so a
@@ -2542,8 +2545,6 @@ function openDraftThread(pid) {
   state.firstTurnStartingThreadId = null;
   state.pendingUserEl = null;
   state.pendingUserText = null;
-  state.turnSteering = false;
-  state.pendingSteer = null;
   state.compactPending = false;
   state.currentModel = null;
   state.currentModelUnreported = false;
@@ -2567,6 +2568,7 @@ function openDraftThread(pid) {
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
+  state.turnSteering = false;
   state.currentRenderTurnId = null; state.newestPersistedTurnId = null;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
@@ -2621,10 +2623,9 @@ async function openThread(pid, tid, title, opts) {
   // a notification click can even land in another project. Close it rather than leave it showing
   // one workspace's file while the app is somewhere else.
   closeCodeOverlay();
+  markQuestionDeliveryUncertain();
   setActiveViewIdentity(pid, tid);
   state.pendingUserEl = null; state.pendingUserText = null;
-  state.turnSteering = !!res.turn_steering;
-  state.pendingSteer = null;
   renderParentThreadButton();
   state.threadReadOnly = false; state.readOnlyProvider = null; state.readOnlyMessage = null;
   updateReadOnlyBanner();
@@ -2650,6 +2651,7 @@ async function openThread(pid, tid, title, opts) {
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
+  state.turnSteering = false;
   state.currentRenderTurnId = null; state.newestPersistedTurnId = null;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
@@ -2889,6 +2891,7 @@ async function connectWs(opts) {
     clearWsProbeTimer();
     state.ws = null;
     clearPendingMetadataActions();
+    markQuestionDeliveryUncertain();
     if (ws._giskardExpectedClose) return;
     const reason = ev.reason ? ` ${ev.reason}` : "";
     const code = ev.code ? ` (${ev.code})` : "";
@@ -2976,7 +2979,9 @@ function updateReadOnlyBanner() {
 }
 
 function updateComposerControls() {
+  goalsQueue.updateControls();
   updateReadOnlyBanner();
+  refreshQuestionControls();
   const ready = state.wsStatus==="open";
   const draft = isDraftThread();
   const hasThreadSurface = !!state.threadId || draft;
@@ -2985,32 +2990,25 @@ function updateComposerControls() {
   const attachmentsLoading = pendingAttachmentOperationCount() > 0;
   const attachmentInputAllowed = composerCanAcceptAttachments();
   const modelUnresolved = draftModelUnresolved();
-  const steering = state.activeTurn && !draft;
-  const steeringText = $("input").value.trim();
-  const canSteer = steering && state.turnSteering;
   // An empty composer with nothing attached has nothing to send. That was previously a silent
   // early return in `sendInput`: the button looked live, the click did nothing, and no message
   // said why — so a composer emptied unexpectedly (as one used to be by a draft opening mid-typing)
   // read as a dead button. Disabling it puts the state on screen instead.
   const nothingToSend = !$("input").value.trim() && state.pendingAttachments.length === 0;
-  $("sendBtn").disabled = steering
-    ? readOnly || !canSteer || !state.currentRenderTurnId || !!state.pendingSteer ||
-      state.updateRequired || state.uiVersionCheckPending || !steeringText || !ready
-    : readOnly || state.updateRequired || state.uiVersionCheckPending ||
-      attachmentsLoading || modelUnresolved || nothingToSend ||
-      !hasThreadSurface || (!ready && !draft);
-  // A steering-capable active turn keeps Stop available and adds Send only while there is text to
-  // steer with. Unsupported turns retain the single Stop control, as do empty active composers.
-  $("sendBtn").hidden = steering && (!canSteer || !steeringText);
+  $("sendBtn").disabled =
+    readOnly || (state.activeTurn && !canSteerTurn()) || !!state.pendingComposerSteer || state.updateRequired || state.uiVersionCheckPending ||
+    attachmentsLoading || modelUnresolved || !!attachmentModalityError() || nothingToSend ||
+    !hasThreadSurface || (!ready && !draft);
+  // A steering harness keeps Send alongside Stop so the user can speak while the agent works.
+  // Other harnesses show only Stop until the turn finishes.
+  $("sendBtn").hidden = state.activeTurn && !draft && !canSteerTurn();
   $("sendBtn").title = managedReadOnly ? "Agent-owned threads are read-only." :
     readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." :
-    steering && state.pendingSteer ? "Wait for the current steering input to be accepted." :
-    steering && !state.currentRenderTurnId ? "Wait for the running turn to be acknowledged." :
-    steering ? "Send input to the running turn" :
     attachmentsLoading ? "Wait for attached files to finish loading." :
     modelUnresolved ? draftModelUnavailableReason() :
-    nothingToSend ? "Type a message, or attach a file, to send." : "Send";
-  $("sendBtn").setAttribute("aria-label", steering ? "Send input to the running turn" : "Send");
+    attachmentModalityError() ? attachmentModalityError() :
+    nothingToSend ? "Type a message, or attach a file, to send." :
+    state.activeTurn ? "Send to the running turn" : "Send";
   $("stopBtn").hidden = !state.activeTurn || draft;
   $("stopBtn").disabled = !ready || state.interruptPending;
   // The stop button shows a Unicode black square (■) glyph; the "stopping" state is conveyed via
@@ -3025,6 +3023,7 @@ function updateComposerControls() {
   const modelMutationPending = !draft && pendingMetadataGroup(state.threadId, "model");
   $("modelSel").disabled = managedReadOnly || !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
   $("modelPickerBtn").disabled = managedReadOnly || !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
+  $("serviceTierSel").disabled = managedReadOnly || !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
   $("effortSel").disabled = managedReadOnly || !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
   const compactBtn = $("compactBtn");
   if (compactBtn) {
@@ -3035,8 +3034,7 @@ function updateComposerControls() {
   $("input").placeholder =
     managedReadOnly ? "Agent-owned threads are read-only." :
     readOnly ? "Read-only thread — pick a model above to reactivate it." :
-    state.activeTurn && state.turnSteering ? "Send input to the running turn…" :
-    state.activeTurn ? "Draft your next message…" :
+    state.activeTurn ? (canSteerTurn() ? "Message the agent…" : "Draft your next message…") :
     draft ? `Ask Giskard…  (${COMPOSER_HINT})` :
     state.wsStatus==="open" ? `Ask Giskard…  (${COMPOSER_HINT})` :
     state.wsStatus==="connecting" ? "Connecting to agent…" :
@@ -3152,20 +3150,6 @@ function failPendingUserMessage(text) {
   if (text) notice(text, "error");
 }
 
-// A steering send is browser-local until Codex echoes it as a same-turn user_message. Keep that
-// optimistic row separate from the ordinary turn-start row: a steer rejection must never make the
-// real turn look idle or fail the prompt that started it.
-function failPendingSteer() {
-  const pending = state.pendingSteer;
-  if (!pending) return;
-  if (pending.element && pending.element.isConnected) {
-    pending.element.classList.remove("pending");
-    pending.element.classList.add("failed");
-  }
-  state.pendingSteer = null;
-  updateComposerControls();
-}
-
 function serverMessageThreadId(msg) {
   if (!msg) return null;
   if (msg.thread_id !== undefined && msg.thread_id !== null) return String(msg.thread_id);
@@ -3177,6 +3161,8 @@ function serverMessageThreadId(msg) {
 function isThreadScopedServerMessage(msg) {
   if (!msg) return false;
   switch (msg.type) {
+    case "thread_capabilities":
+    case "steer_input_accepted":
     case "thread_state":
     case "thread_metadata_result":
     case "history_delta":
@@ -3214,10 +3200,18 @@ function handleServer(msg, ws) {
     return;
   }
   if (!isCurrentThreadServerMessage(msg)) return;
+  goalsQueue.onMessage(msg);
   const messageType = msg && msg.type ? msg.type : "unknown";
   const renderStartedAtMs = browserNowMs();
   recordReconnectMessageReceived(ws, messageType);
   switch (msg.type) {
+    case "thread_capabilities":
+      state.turnSteering = msg.turn_steering === true;
+      updateComposerControls();
+      break;
+    case "steer_input_accepted":
+      settleSteering(msg, true);
+      break;
     case "thread_state": renderThreadState(msg, msg.active_turn); break;
     case "thread_metadata_result":
       applyThreadMetadata(msg);
@@ -3237,7 +3231,8 @@ function handleServer(msg, ws) {
     case "request_state": handleRequestState(msg); break;
     case "error":
       finishMetadataAction(msg.request_id);
-      if (msg.action==="steer_input") failPendingSteer();
+      if (msg.action === "steer_input") settleSteering(msg, false);
+      if (msg.action === "send_input") settleIdleQuestion(false, msg);
       if (msg.code === "thread_read_only") {
         state.threadReadOnly = true;
         state.readOnlyMessage = msg.message || state.readOnlyMessage || "This thread is read-only.";
@@ -3786,6 +3781,20 @@ function renderCurrentThreadMetadata() {
   if (effective.tokens) renderTokens(effective.tokens);
   updateGauge(state.contextUsed, effective.context_window || 0);
   updateComposerControls();
+  if (!$("usageMenu").hidden && contextWindowEditor &&
+      contextWindowEditor.scope !== contextWindowScope()) {
+    // A save broadcasts metadata before returning HTTP. Keep its in-flight editor owned until
+    // settlement, then refetch; a provider/model or view change still invalidates it immediately.
+    if (contextWindowEditor.saving && contextWindowIdentity() === contextWindowEditor.identity) {
+      contextWindowEditor.scope = contextWindowScope();
+      contextWindowEditor.refreshAfterSave = true;
+    } else {
+      const editor = contextWindowEditor;
+      const savedSelectionMatches = editor.identity === contextWindowIdentity() && editor.config &&
+        (editor.config.override_window || null) === (effective.context_window_override || null);
+      loadContextWindowEditor(savedSelectionMatches ? editor.feedback : "");
+    }
+  }
 }
 
 function applyThreadMetadata(s, recoverConflict) {
@@ -3886,7 +3895,6 @@ function resetTranscriptForAuthoritativeSnapshot() {
   $("transcript").innerHTML="";
   state.pendingUserEl = null;
   state.pendingUserText = null;
-  state.pendingSteer = null;
   state.pendingOlder = false;
   state.loadingHistory = false;
   state.oldestTurnId = null;
@@ -4131,7 +4139,6 @@ function reconcileInFlightTurn() {
   rebuildRenderTrackingFromDom();
   state.pendingUserEl = null;
   state.pendingUserText = null;
-  state.pendingSteer = null;
   state.currentRenderTurnId = null;
   setTurnActive(false);
   state.streamEl = null;
@@ -4292,16 +4299,17 @@ function renderPersistedTurn(turn) {
   const prevRenderTurnId = state.currentRenderTurnId;
   state.currentRenderTurnId = turn.id;
   const items = turn.items || [];
-  const hasUserItem = items.some(it => ((it.payload||it).kind) === "user_message");
+  const hasUserItem = items.some(it => ((it.payload||it).kind) === "user_message" && !isSteeredUserMessage(it.payload||it));
   const inputText = persistedUserInputDisplayText(turn.user_input);
   const hasAttachments = !!(turn.user_input && (turn.user_input.attachments || []).length);
+  if (inputText) confirmQuestionEcho(turn.user_input.text || "", turn.id);
   if (!hasUserItem && inputText) {
     renderItemBody(bubble("user","you"), { kind:"user_message", text: inputText });
   }
   let replacedUserItem = false;
   for (const it of items) {
     const payload = it.payload || it;
-    if (hasAttachments && !replacedUserItem && payload.kind === "user_message") {
+    if (hasAttachments && !replacedUserItem && payload.kind === "user_message" && !isSteeredUserMessage(payload)) {
       addItem(userMessageItemWithText(it, inputText), turn.id, true);
       replacedUserItem = true;
     } else {
@@ -4385,8 +4393,6 @@ function handleEvent(ev) {
       break;
     case "turn_completed":
       state.firstTurnStartingThreadId = null;
-      // Without its user_message acknowledgement, a pending steer lost the completion race.
-      failPendingSteer();
       // This turn is now persisted; advance the high-water cursor and stop stamping rows to it.
       if (ev.turn) state.newestPersistedTurnId = ev.turn;
       state.currentRenderTurnId = null;
@@ -4441,7 +4447,6 @@ function handleEvent(ev) {
         setTurnActive(false);
       }
       failPendingUserMessage(null);   // resolve the optimistic bubble to a failed state
-      failPendingSteer();
       errorBubble(errorText(ev.error));
       break;
     // A non-fatal advisory: show it as a warning, and do NOT fail the pending message — otherwise
@@ -4570,21 +4575,39 @@ function outstandingServerRequests(snap) {
 function renderLiveTurnUserInput(turnId, userInput) {
   const text = persistedUserInputDisplayText(userInput);
   if (!turnId || !text) return;
+  confirmQuestionEcho(text, turnId);
   const exists = Array.from(document.querySelectorAll(".msg.user")).some(
     row => row.dataset && String(row.dataset.turn || "") === String(turnId)
   );
   if (exists) return;
   const body = bubble("user","you");
   body.parentElement.dataset.liveUserInput = "true";
+  body.parentElement.dataset.liveUserText = userInput.text || "";
   markAttachmentUserInput(body.parentElement, userInput && userInput.attachments);
   renderItemBody(body, { kind:"user_message", text });
 }
 
-function provisionalUserBodyForTurn(turnId) {
+function provisionalUserBodyForTurn(turnId, text) {
   const target = renderTarget();
   return Array.from(target.querySelectorAll(".msg.user[data-live-user-input='true'] .body")).find(
-    body => body.parentElement && String(body.parentElement.dataset.turn || "") === String(turnId || "")
+    body => body.parentElement && String(body.parentElement.dataset.turn || "") === String(turnId || "") &&
+      (text === undefined || provisionalInputMatches(body.parentElement, text))
   ) || null;
+}
+
+function provisionalInputMatches(row, text) {
+  const original = row.dataset.liveUserText || "";
+  if (original === text) return true;
+  // The Codex file adapter appends a host-file manifest to the native prompt. Keep the original
+  // attachment display while distinguishing subsequent, independent user messages in the turn.
+  const manifestPrefix = (original ? original + "\n\n" : "") + "Attached files available on the harness host:\n";
+  return preservesUserInputDisplay(row) && String(text || "").startsWith(manifestPrefix);
+}
+
+function isSteeredUserMessage(payload) {
+  // Native clients may also identify initial turn/start inputs. Only our steering namespace marks
+  // an additional user message that must never replace the turn's original prompt display.
+  return typeof payload.client_id === "string" && payload.client_id.startsWith("giskard-steer:");
 }
 
 function isSyntheticSubagentPrompt(item) {
@@ -4878,10 +4901,10 @@ function renderServerRequest(request) {
   else if (method === "mcpServer/elicitation/request") renderMcpElicitationRequest(body, id, request);
   else if (method === "item/tool/call") renderDynamicToolCallRequest(body, id, request);
   else if (method === "account/chatgptAuthTokens/refresh") {
-    renderUnsupportedServerRequest(body, id, request, "Giskard cannot refresh ChatGPT auth tokens.");
+    renderUnsupportedServerRequest(body, id, request, "This request requires an external-auth provider configured on the host.");
   }
   else if (method === "attestation/generate") {
-    renderUnsupportedServerRequest(body, id, request, "Giskard cannot generate client attestation tokens.");
+    renderUnsupportedServerRequest(body, id, request, "This request requires an attestation provider configured on the host.");
   }
   else renderUnknownServerRequest(body, id, request);
 
@@ -4960,10 +4983,6 @@ function renderDynamicToolCallRequest(body, id, request) {
       success:false,
       contentItems:[{ type:"inputText", text:"Tool call rejected from Giskard." }]
     }
-  }));
-  addServerRequestButton(actions, id, "Success Empty", "", () => ({
-    kind:"result",
-    value:{ success:true, contentItems:[] }
   }));
   body.append(actions);
 }
@@ -5054,7 +5073,7 @@ function collectToolQuestionAnswers(fields) {
   return result;
 }
 function renderMcpElicitationRequest(body, id, request) {
-  const p = objectValue(request.params);
+  const p = objectValue(request.params) || {};
   const url = safeHttpUrl(stringValue(p.url));
   if (url) {
     const a = document.createElement("a");
@@ -5064,92 +5083,221 @@ function renderMcpElicitationRequest(body, id, request) {
     a.textContent = url;
     body.append(a);
   }
-  const fields = renderMcpSchemaFields(body, p.requestedSchema);
+  let fields;
+  let unsupported = "";
+  try {
+    if (p.mode === "url") {
+      if (!url) throw new Error("The MCP server supplied an invalid web URL.");
+    } else {
+      if (!["form", "openai/form", "openaiForm"].includes(p.mode)) throw new Error("Unsupported MCP elicitation mode.");
+      fields = renderMcpSchemaFields(body, p.requestedSchema);
+    }
+  } catch (error) {
+    unsupported = error.message;
+    const warning = document.createElement("div");
+    warning.className = "server-request-form-error";
+    warning.setAttribute("role", "alert");
+    warning.textContent = `This form cannot be submitted: ${unsupported}`;
+    body.append(warning);
+    appendJsonPreviewIfMeaningful(body, p.requestedSchema);
+  }
   const actions = serverRequestActions();
-  addServerRequestButton(actions, id, "Continue", "primary", () => ({
+  if (!unsupported) addServerRequestButton(actions, id, "Continue", "primary", () => ({
     kind:"result",
-    value:{ action:"accept", content: collectMcpElicitationContent(fields) }
+    value:{ action:"accept", content: p.mode === "url" ? null : collectMcpElicitationContent(fields) }
   }));
   addServerRequestButton(actions, id, "Decline", "danger", () => ({
-    kind:"result",
-    value:{ action:"decline" }
+    kind:"result", value:{ action:"decline", content:null }
   }));
   addServerRequestButton(actions, id, "Cancel", "", () => ({
-    kind:"result",
-    value:{ action:"cancel" }
+    kind:"result", value:{ action:"cancel", content:null }
   }));
   body.append(actions);
 }
-function renderMcpSchemaFields(body, schemaValue) {
-  const schema = objectValue(schemaValue);
-  const properties = objectValue(schema.properties);
-  if (!properties || !Object.keys(properties).length) {
-    return null;
+
+// Simple object shapes get native controls. Any schema requiring a richer layout keeps its
+// complete typed value in a JSON editor. The server validates the original schema with a full
+// JSON Schema validator before delivering any accepted response to Codex.
+function mcpSchemaHasRichLayout(schema, depth = 0) {
+  if (depth > 32 || !objectValue(schema)) return true;
+  const visualKeys = new Set(["type", "title", "description", "default", "properties", "required", "additionalProperties", "enum", "enumNames", "const", "items", "minItems", "maxItems", "uniqueItems", "minLength", "maxLength", "pattern", "format", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "minProperties", "maxProperties"]);
+  if (Object.keys(schema).some(key => !visualKeys.has(key))) return true;
+  if (schema.type === "object") {
+    if (!objectValue(schema.properties) || (schema.required !== undefined && !Array.isArray(schema.required))) return true;
+    return Object.values(schema.properties).some(child => mcpSchemaHasRichLayout(child, depth + 1));
   }
+  return !["string", "number", "integer", "boolean", "array"].includes(schema.type);
+}
+function mcpJsonEqual(a, b) {
+  if (a === b) return true;
+  if (Array.isArray(a)) return Array.isArray(b) && a.length === b.length && a.every((v, i) => mcpJsonEqual(v, b[i]));
+  if (!objectValue(a) || !objectValue(b)) return false;
+  return Object.keys(a).length === Object.keys(b).length && Object.keys(a).every(k => Object.hasOwn(b, k) && mcpJsonEqual(a[k], b[k]));
+}
+function mcpSchemaDefault(schema) {
+  if (!objectValue(schema)) return undefined;
+  if (Object.hasOwn(schema, "default")) return schema.default;
+  if (Object.hasOwn(schema, "const")) return schema.const;
+  if (schema.type === "object") {
+    const result = Object.create(null);
+    for (const [key, child] of Object.entries(schema.properties || {})) {
+      const value = mcpSchemaDefault(child);
+      if (value !== undefined) result[key] = value;
+    }
+    return Object.keys(result).length ? result : undefined;
+  }
+  return undefined;
+}
+function renderMcpSchemaFields(body, schemaValue) {
+  if (schemaValue === undefined) throw new Error("The MCP server omitted its form schema.");
   const fields = document.createElement("div");
   fields.className = "server-request-fields";
-  for (const [key, raw] of Object.entries(properties)) {
-    const prop = objectValue(raw) || {};
-    const field = document.createElement("div");
-    field.className = "server-request-field server-request-mcp-field";
-    field.dataset.fieldKey = key;
-    field.dataset.fieldType = stringValue(prop.type) || "string";
-    const label = document.createElement("label");
-    label.textContent = stringValue(prop.title) || key;
-    field.append(label);
-    let input;
-    if (prop.type === "boolean") {
-      input = document.createElement("input");
-      input.type = "checkbox";
-    } else if (prop.enum && Array.isArray(prop.enum)) {
-      input = document.createElement("select");
-      for (const value of prop.enum) {
-        const opt = document.createElement("option");
-        opt.value = String(value);
-        opt.textContent = String(value);
-        input.append(opt);
-      }
-    } else {
-      input = document.createElement("input");
-      input.type = prop.type === "number" || prop.type === "integer" ? "number" : "text";
+  fields.mcpSchema = schemaValue;
+  if (objectValue(schemaValue)) {
+    for (const text of [schemaValue.title, schemaValue.description]) {
+      if (!stringValue(text)) continue;
+      const description = document.createElement("div");
+      description.className = "meta";
+      description.textContent = text;
+      fields.append(description);
     }
-    input.className = "server-request-mcp-value";
-    field.append(input);
-    if (prop.description) {
-      const desc = document.createElement("div");
-      desc.className = "meta";
-      desc.textContent = stringValue(prop.description);
-      field.append(desc);
-    }
-    fields.append(field);
   }
+  const initial = mcpSchemaDefault(schemaValue);
+  if (mcpSchemaHasRichLayout(schemaValue)) {
+    const label = document.createElement("label");
+    label.textContent = "Form content (JSON)";
+    const input = document.createElement("textarea");
+    input.className = "server-request-json-content";
+    input.rows = 8;
+    input.value = JSON.stringify(initial ?? {}, null, 2);
+    label.append(input); fields.append(label);
+    fields.mcpRead = () => {
+      try { return JSON.parse(input.value); } catch { throw new Error("Form content must be valid JSON."); }
+    };
+    const hint = document.createElement("div");
+    hint.className = "meta";
+    hint.textContent = "The complete form schema is checked by the server before submission is delivered.";
+    fields.append(hint);
+    appendJsonPreviewIfMeaningful(fields, schemaValue);
+  } else fields.mcpRead = renderMcpValueControl(fields, schemaValue, "form", initial);
+  const error = document.createElement("div");
+  error.className = "server-request-form-error";
+  error.setAttribute("role", "alert");
+  fields.append(error);
   body.append(fields);
   return fields;
 }
+function renderMcpValueControl(container, schema, name, initial) {
+  const prop = objectValue(schema) || {};
+  const field = document.createElement("div");
+  field.className = "server-request-field server-request-mcp-field";
+  field.dataset.fieldKey = name;
+  container.append(field);
+  // Composite schemas retain their complete structure in a typed JSON editor. All branches
+  // are still validated; the UI never guesses a branch and drops the other constraints.
+  if (prop.type === "object" && !prop.oneOf && !prop.anyOf && !prop.allOf) {
+    const read = [];
+    for (const [key, child] of Object.entries(prop.properties || {})) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "server-request-field";
+      const required = (prop.required || []).includes(key);
+      const childInitial = objectValue(initial) && Object.hasOwn(initial, key) ? initial[key] : mcpSchemaDefault(child);
+      const childTitle = stringValue(child.title) || key;
+      const title = document.createElement("div");
+      title.textContent = `${childTitle}${required ? " (required)" : " (optional)"}`;
+      wrapper.append(title);
+      let include;
+      if (!required) {
+        const label = document.createElement("label");
+        include = document.createElement("input");
+        include.type = "checkbox";
+        include.className = "server-request-mcp-include";
+        include.checked = childInitial !== undefined;
+        label.append(include, document.createTextNode(` Include ${childTitle}`));
+        wrapper.append(label);
+      }
+      const controls = document.createElement("div");
+      wrapper.append(controls);
+      const getter = renderMcpValueControl(controls, child, `${name}.${key}`, childInitial);
+      if (include) {
+        controls.hidden = !include.checked;
+        include.onchange = () => { controls.hidden = !include.checked; };
+      }
+      read.push({ key, getter, include });
+      field.append(wrapper);
+    }
+    // Additional properties have no predetermined controls. Preserve server-supplied defaults
+    // here; schemas that require more fields use the complete JSON editor below.
+    const extra = Object.fromEntries(Object.entries(objectValue(initial) || {}).filter(([key]) => !Object.hasOwn(prop.properties || {}, key)));
+    if ((prop.required || []).some(key => !Object.hasOwn(prop.properties || {}, key)) || prop.minProperties > Object.keys(prop.properties || {}).length) {
+      field.replaceChildren();
+    } else return () => {
+      const value = Object.assign(Object.create(null), extra);
+      for (const { key, getter, include } of read) if (!include || include.checked) value[key] = getter();
+      return value;
+    };
+  }
+  const label = document.createElement("label");
+  label.textContent = stringValue(prop.title) || name;
+  let input;
+  const choices = prop.enum || (prop.oneOf?.every(p => objectValue(p) && Object.hasOwn(p, "const")) ? prop.oneOf.map(p => p.const) : null);
+  const scalar = !prop.anyOf && !prop.allOf && (!prop.oneOf || choices) && ["string", "number", "integer", "boolean"].includes(prop.type);
+  if (choices || (scalar && prop.type === "boolean")) {
+    input = document.createElement("select");
+    input.mcpChoices = choices || [true, false];
+    const blank = document.createElement("option");
+    blank.value = ""; blank.textContent = "Choose a value"; input.append(blank);
+    input.mcpChoices.forEach((value, i) => {
+      const option = document.createElement("option");
+      option.value = String(i);
+      option.textContent = prop.enumNames?.[i] || prop.oneOf?.[i]?.title || String(value);
+      input.append(option);
+    });
+    if (initial !== undefined) input.value = String(input.mcpChoices.findIndex(v => mcpJsonEqual(v, initial)));
+  } else if (scalar) {
+    input = document.createElement("input");
+    input.type = ["number", "integer"].includes(prop.type) ? "number" : "text";
+    if (input.type === "number") input.step = prop.type === "integer" ? "1" : "any";
+    if (initial !== undefined) input.value = String(initial);
+  } else {
+    input = document.createElement("textarea");
+    input.className = "server-request-json-content";
+    input.rows = 5;
+    input.value = JSON.stringify(initial ?? (prop.type === "array" ? [] : prop.type === "object" ? {} : null), null, 2);
+    label.textContent += " (JSON)";
+  }
+  input.classList.add("server-request-mcp-value");
+  label.append(input); field.append(label);
+  if (prop.description) {
+    const desc = document.createElement("div");
+    desc.className = "meta"; desc.textContent = stringValue(prop.description); field.append(desc);
+  }
+  return () => {
+    if (input.tagName === "TEXTAREA") {
+      try { return JSON.parse(input.value); } catch { throw new Error(`${name}: enter valid JSON.`); }
+    }
+    if (input.mcpChoices) {
+      if (input.value === "") throw new Error(`${name}: choose a value.`);
+      return input.mcpChoices[Number(input.value)];
+    }
+    if (["number", "integer"].includes(prop.type)) {
+      if (input.value === "") throw new Error(`${name}: enter a number.`);
+      return Number(input.value);
+    }
+    return input.value;
+  };
+}
 function collectMcpElicitationContent(fields) {
   if (!fields) return {};
-  const textarea = fields.querySelector(".server-request-json-content");
-  if (textarea) {
-    try { return JSON.parse(textarea.value || "{}"); }
-    catch (e) {
-      notice("MCP content JSON is invalid: "+e.message, "error");
-      throw e;
-    }
+  const error = fields.querySelector(".server-request-form-error");
+  try {
+    const content = fields.mcpRead();
+    error.textContent = "";
+    return content;
+  } catch (e) {
+    error.textContent = e.message;
+    throw e;
   }
-  const content = {};
-  fields.querySelectorAll(".server-request-mcp-field").forEach(field => {
-    const key = field.dataset.fieldKey || "";
-    if (!key) return;
-    const type = field.dataset.fieldType || "string";
-    const input = field.querySelector(".server-request-mcp-value");
-    if (!input) return;
-    if (input.type === "checkbox") content[key] = input.checked;
-    else if (type === "number" || type === "integer") {
-      const n = Number(input.value);
-      content[key] = Number.isFinite(n) ? n : null;
-    } else content[key] = input.value;
-  });
-  return content;
 }
 function renderUnknownServerRequest(body, id, request) {
   appendJsonPreviewIfMeaningful(body, request.params);
@@ -7257,9 +7405,10 @@ function addItem(item, turnId, fromHistory) {
     return;
   }
   const key = scopedItemKey(turnId, item && item.id);
-  const hasPreservedUserDisplay = p.kind === "user_message" &&
+  if (p.kind === "user_message") confirmQuestionEcho(p.text, turnId, p.client_id);
+  const hasPreservedUserDisplay = p.kind === "user_message" && !isSteeredUserMessage(p) &&
     ((state.pendingUserEl && preservesUserInputDisplay(state.pendingUserEl)) ||
-     !!provisionalUserBodyForTurn(turnId));
+     !!provisionalUserBodyForTurn(turnId, p.text));
   const visible = hasVisiblePayload(p) || hasPreservedUserDisplay;
   if (isRenderedItem(item, turnId)) {
     // Upsert: a repeated item id within the same turn refreshes the existing row.
@@ -7308,14 +7457,11 @@ function addItem(item, turnId, fromHistory) {
     return;
   }
   if (p.kind==="user_message") {
-    // UserMessage events are ordered within the turn. Reconcile the initiating prompt first: a
-    // user can steer with identical text before its delayed initial echo arrives, and matching the
-    // steer first would attach that initial item to the later optimistic row.
     if (state.pendingUserEl && !state.pendingUserEl.isConnected) {
       state.pendingUserEl = null;
       state.pendingUserText = null;
     }
-    if (state.pendingUserEl &&
+    if (!isSteeredUserMessage(p) && state.pendingUserEl &&
         (p.text===state.pendingUserText || preservesUserInputDisplay(state.pendingUserEl))) {
       state.pendingUserEl.classList.remove("pending");
       const pendingBody = state.pendingUserEl.querySelector(".body");
@@ -7328,23 +7474,7 @@ function addItem(item, turnId, fromHistory) {
       markRenderedItem(item, turnId);
       return;
     }
-    if (state.pendingSteer && state.pendingSteer.element &&
-        !state.pendingSteer.element.isConnected) {
-      state.pendingSteer = null;
-    }
-    if (state.pendingSteer && String(turnId || "") === state.pendingSteer.turnId &&
-        p.text === state.pendingSteer.text) {
-      const pending = state.pendingSteer;
-      pending.element.classList.remove("pending");
-      const pendingBody = pending.element.querySelector(".body");
-      renderItemBodyForItem(pendingBody, item, turnId);
-      registerRenderedItemBody(pendingBody, item, turnId);
-      state.pendingSteer = null;
-      updateComposerControls();
-      markRenderedItem(item, turnId);
-      return;
-    }
-    const provisionalBody = provisionalUserBodyForTurn(turnId);
+    const provisionalBody = !isSteeredUserMessage(p) && provisionalUserBodyForTurn(turnId, p.text);
     if (provisionalBody) {
       delete provisionalBody.parentElement.dataset.liveUserInput;
       if (!preservesUserInputDisplay(provisionalBody)) {
@@ -7514,6 +7644,7 @@ function hasVisiblePayload(p) {
     const descriptor = commandOutputDescriptor(p.output);
     return Boolean((p.command||"").trim() || (descriptor ? descriptor.preview : p.output || ""));
   }
+  if (p.kind==="agent_message" && Array.isArray(p.questions) && p.questions.length) return true;
   if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") return Boolean((p.text||"").trim());
   if (p.kind==="file_change") return Boolean((p.path||"").trim() || (p.changes||[]).length || p.status);
   if (p.kind==="tool_call") return Boolean((p.name||"").trim() || (p.server||"").trim() || p.status || p.error || p.input || p.output);
@@ -7574,7 +7705,11 @@ function renderItemBody(body, p) {
   } else if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") {
     // User messages get the same server-rendered, sanitized Markdown as agent text, so pasted code
     // fences, lists and emphasis format the same on both sides of the conversation.
-    renderMarkdown(body, p.text || "");
+    if (p.kind === "agent_message" && p.questions && p.questions.length) {
+      const prose = document.createElement("div");
+      body.append(prose);
+      renderMarkdown(prose, p.text || "");
+    } else renderMarkdown(body, p.text || "");
   } else if (p.kind==="file_change") {
     renderFileChange(body, p);
   } else if (p.kind==="tool_call") {
@@ -7603,6 +7738,188 @@ function renderItemBodyForItem(body, item, turnId) {
     return;
   }
   renderItemBody(body, p);
+  if (p && p.kind === "agent_message" && p.questions && p.questions.length) {
+    renderAgentQuestions(body, p.questions, item, turnId);
+  }
+  if (p && p.kind === "user_message") confirmQuestionEcho(p.text, turnId, p.client_id);
+}
+// Async questions are ordinary agent messages, not blocking server requests. Keep browser-local
+// delivery receipts through replay/reload; they are not a claim that another client has answered.
+function canSteerTurn() {
+  return state.turnSteering && state.activeTurn && !!state.currentRenderTurnId;
+}
+function questionStorageKey(key) { return "giskard.questionAnswer." + key; }
+function questionAnswer(key) {
+  if (state.questionAnswers.has(key)) return state.questionAnswers.get(key);
+  let saved = {};
+  try { saved = JSON.parse(sessionStorage.getItem(questionStorageKey(key)) || "{}"); } catch {}
+  if (saved.status === "pending") saved.status = "uncertain";
+  state.questionAnswers.set(key, saved);
+  return saved;
+}
+function saveQuestionAnswer(key, answer) {
+  state.questionAnswers.set(key, answer);
+  try { sessionStorage.setItem(questionStorageKey(key), JSON.stringify(answer)); }
+  catch (error) { console.warn("Question answer receipt could not be saved for reload", error); }
+}
+function questionWritable(form) {
+  if (!state.threadId || state.threadReadOnly || threadMetadataPending()) return false;
+  if (!managedThreadReadOnly()) return true;
+  // A child may receive an answer only to its own question in its current active turn.
+  return !!form && canSteerTurn() && form.dataset.questionTurn === String(state.currentRenderTurnId);
+}
+function refreshQuestionControls(root = document) {
+  root.querySelectorAll(".agent-questions").forEach(form => {
+    const answer = questionAnswer(form.dataset.questionKey);
+    const delivered = answer.status === "accepted";
+    const waiting = answer.status === "pending" || answer.status === "uncertain";
+    const writable = questionWritable(form);
+    const transportReady = wsCanSend() && !state.updateRequired && !state.uiVersionCheckPending;
+    form.querySelectorAll("input, textarea").forEach(el => { el.disabled = delivered || waiting || !writable; });
+    const retry = form.querySelector(".question-retry");
+    retry.hidden = answer.status !== "uncertain";
+    retry.disabled = !writable;
+    form.querySelector("button[type=submit]").disabled = delivered || waiting || !writable || !transportReady || (state.activeTurn && !canSteerTurn());
+    form.querySelector(".question-delivery").textContent = delivered ? "Answer sent from this browser." :
+      answer.status === "uncertain" ? "Delivery is uncertain. Check the transcript before sending another answer." :
+      waiting ? "Sending answer…" : !writable ? "This thread is read-only; answers cannot be sent here." :
+      !transportReady ? "Reconnect to send your answer." :
+      state.activeTurn && !canSteerTurn() ? "You can answer when the current turn finishes." :
+      "The agent can continue working while you choose. Submit to send your answer.";
+  });
+}
+function renderAgentQuestions(body, questions, item, turnId) {
+  const key = [state.threadId, turnId, item.harness_item_id || item.id].map(idKey).join(":");
+  const answer = questionAnswer(key);
+  const form = document.createElement("form");
+  form.className = "agent-questions";
+  form.dataset.questionKey = key;
+  form.dataset.questionTurn = String(turnId);
+  const fields = questions.map((question, index) => {
+    const field = document.createElement("fieldset");
+    const legend = document.createElement("legend");
+    legend.textContent = question.title || "Question";
+    field.append(legend);
+    const saved = (answer.drafts || [])[index] || {};
+    const options = Array.isArray(question.options) ? question.options : [];
+    options.forEach((option, optionIndex) => {
+      const label = document.createElement("label");
+      label.className = "question-option";
+      const input = document.createElement("input");
+      input.type = "radio";
+      input.name = key + ":" + index;
+      input.value = String(option);
+      input.checked = saved.choice === undefined ? optionIndex === 0 : saved.choice === String(option);
+      label.append(input, document.createTextNode(String(option)));
+      field.append(label);
+    });
+    const label = document.createElement("label");
+    label.className = "question-free-text";
+    label.textContent = options.length ? "Or write your own answer" : "Your answer";
+    const free = document.createElement("textarea");
+    free.rows = 2;
+    free.value = saved.free || "";
+    label.append(free);
+    field.append(label);
+    form.append(field);
+    return { field, free, title:question.title || "Question" };
+  });
+  const drafts = () => fields.map(({field, free}) => ({ choice:field.querySelector("input:checked")?.value, free:free.value }));
+  form.addEventListener("input", () => saveQuestionAnswer(key, { ...questionAnswer(key), drafts:drafts() }));
+  const status = document.createElement("p");
+  status.className = "question-delivery meta";
+  status.setAttribute("role", "status");
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.textContent = "Send answer";
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "question-retry";
+  retry.textContent = "I checked the transcript — edit and retry";
+  retry.hidden = true;
+  retry.onclick = () => {
+    if (!questionWritable(form) || questionAnswer(key).status !== "uncertain") return;
+    saveQuestionAnswer(key, { ...questionAnswer(key), status:"draft" });
+    refreshQuestionControls();
+  };
+  form.append(status, submit, retry);
+  form.onsubmit = event => {
+    event.preventDefault();
+    const previous = questionAnswer(key);
+    if (["pending", "accepted", "uncertain"].includes(previous.status)) return;
+    if (!questionWritable(form) || !wsCanSend() || state.updateRequired || state.uiVersionCheckPending) return;
+    if (state.activeTurn && !canSteerTurn()) return;
+    const values = fields.map(({field, free}) => free.value.trim() || field.querySelector("input:checked")?.value || "");
+    if (values.some(value => !value)) { notice("Answer each question before submitting.", "warning"); return; }
+    const text = fields.map(({title}, index) => title + "\n" + values[index]).join("\n\n");
+    const steering = state.activeTurn;
+    const requestId = crypto.randomUUID();
+    const message = steering
+      ? { type:"steer_input", thread_id:state.threadId, expected_turn_id:state.currentRenderTurnId, request_id:requestId, text,
+          question_item_id:String(turnId) === String(state.currentRenderTurnId) ? item.id : null }
+      : { type:"send_input", thread_id:state.threadId, text, attachments:[] };
+    if (!send(message)) { notice("Answer not sent. Your choices are preserved.", "warning"); return; }
+    saveQuestionAnswer(key, { status:"pending", requestId, threadId:state.threadId, text, steering, expectedTurnId:String(state.currentRenderTurnId || ""),
+      afterTurnId:String(state.newestPersistedTurnId || turnId), drafts:drafts() });
+    if (!steering) {
+      const pendingBody = bubble("user pending", "you");
+      pendingBody.textContent = text;
+      state.pendingUserEl = pendingBody.parentElement;
+      state.pendingUserText = text;
+      setTurnActive(true);
+    }
+    refreshQuestionControls();
+  };
+  body.append(form);
+  refreshQuestionControls(body);
+}
+function settleSteering(message, accepted) {
+  for (const [key, answer] of state.questionAnswers) {
+    if (answer.requestId !== message.request_id || answer.threadId !== message.thread_id) continue;
+    if (!accepted && answer.status === "accepted") continue;
+    const uncertain = ["harness_timeout", "harness_transport_error", "harness_protocol_error"].includes(message.code);
+    saveQuestionAnswer(key, { ...answer, status:accepted ? "accepted" : uncertain ? "uncertain" : "draft" });
+  }
+  const pending = state.pendingComposerSteer;
+  if (pending && pending.requestId === message.request_id && pending.threadId === message.thread_id) {
+    if (accepted && composerDraftKey() === pending.draftKey && $("input").value === pending.value) clearComposerDraft(pending.draftKey);
+    state.pendingComposerSteer = null;
+  }
+  updateComposerControls();
+}
+function settleIdleQuestion(accepted, message = {}) {
+  for (const [key, answer] of state.questionAnswers) {
+    if (answer.threadId !== state.threadId || answer.steering || answer.status !== "pending") continue;
+    const uncertain = ["harness_timeout", "harness_transport_error", "harness_protocol_error"].includes(message.code);
+    saveQuestionAnswer(key, { ...answer, status:accepted ? "accepted" : uncertain ? "uncertain" : "draft" });
+  }
+  refreshQuestionControls();
+}
+function confirmQuestionEcho(text, turnId, clientId) {
+  const pending = state.pendingComposerSteer;
+  if (pending && pending.threadId === state.threadId && "giskard-steer:" + pending.requestId === clientId && pending.expectedTurnId === String(turnId)) {
+    settleSteering({ thread_id:state.threadId, request_id:pending.requestId }, true);
+  }
+  for (const [key, answer] of state.questionAnswers) {
+    if (answer.threadId !== state.threadId || answer.text !== text || !["pending", "uncertain"].includes(answer.status)) continue;
+    // Turn IDs are ULIDs. Idle replies must belong to a turn admitted after submission's history
+    // cursor; an old identical answer replayed during reconnect must not acknowledge this send.
+    if (!turnId || (answer.steering
+      ? String(turnId) !== answer.expectedTurnId || clientId !== "giskard-steer:" + answer.requestId
+      : String(turnId) <= answer.afterTurnId)) continue;
+    saveQuestionAnswer(key, { ...answer, status:"accepted" });
+  }
+  refreshQuestionControls();
+}
+function markQuestionDeliveryUncertain() {
+  for (const [key, answer] of state.questionAnswers) {
+    if (answer.threadId === state.threadId && answer.status === "pending") saveQuestionAnswer(key, { ...answer, status:"uncertain" });
+  }
+  if (state.pendingComposerSteer && state.pendingComposerSteer.threadId === state.threadId) {
+    notice("Message delivery is uncertain. Your draft is preserved; check the transcript before sending it again.", "warning");
+    state.pendingComposerSteer = null;
+  }
+  refreshQuestionControls();
 }
 function normalizeCommandDuration(durationMs, startedAtMs) {
   const provided = Number(durationMs);
@@ -9509,11 +9826,8 @@ $("codeOverlay").addEventListener("click", (e) => { if (e.target === $("codeOver
 function sendInput() {
   const ta = $("input");
   const text = ta.value.trim();
-  if (state.activeTurn) {
-    steerInput(text);
-    return;
-  }
   const attachments = state.pendingAttachments.slice();
+  if (attachmentModalityError()) { notice(attachmentModalityError(), "error"); return; }
   if (pendingAttachmentOperationCount() > 0) {
     notice("Wait for attached files to finish loading.", "warning");
     return;
@@ -9527,6 +9841,17 @@ function sendInput() {
   // — no title is set for it, since a hidden button's tooltip is not something a user can read.
   if (!state.threadId && !isDraftThread()) return;
   if (state.updateRequired || state.uiVersionCheckPending) return;
+  if (state.activeTurn) {
+    if (attachments.length) { notice("Attachments cannot be sent to a running turn. Remove them or wait for the turn to finish.", "warning"); return; }
+    if (!canSteerTurn()) { notice("Wait for the current turn to finish, or stop it first.", "warning"); return; }
+    if (state.pendingComposerSteer) { notice("The previous message is awaiting confirmation. Your draft is preserved.", "warning"); return; }
+    const requestId = crypto.randomUUID();
+    if (send({ type:"steer_input", thread_id:state.threadId, expected_turn_id:state.currentRenderTurnId, request_id:requestId, text })) {
+      state.pendingComposerSteer = { requestId, threadId:state.threadId, expectedTurnId:String(state.currentRenderTurnId), draftKey:composerDraftKey(), value:ta.value };
+      updateComposerControls();
+    } else notice("Message not sent. Reconnect and try again; your draft is preserved.", "warning");
+    return;
+  }
   if (isDraftThread()) {
     startDraftThread(text, attachments);
     return;
@@ -9552,41 +9877,6 @@ function sendInput() {
   state.pendingUserText = text;
   clearComposerDraft(draftKey);
   clearPendingAttachments();
-}
-
-function steerInput(text) {
-  if (!text || !state.threadId || isDraftThread()) return;
-  if (!state.turnSteering) {
-    notice("This agent does not support input during an active turn.", "warning");
-    return;
-  }
-  if (!state.currentRenderTurnId) {
-    notice("Wait for the running turn to be acknowledged before sending more input.", "warning");
-    return;
-  }
-  if (state.pendingSteer) {
-    notice("Wait for the current steering input to be accepted.", "warning");
-    return;
-  }
-  if (!wsCanSend()) {
-    notice(`Steering input not sent: WebSocket is ${state.wsStatus}.`, "warning");
-    reconnectIfNeeded("steering requested while disconnected");
-    return;
-  }
-  const turnId = String(state.currentRenderTurnId);
-  const draftKey = composerDraftKey();
-  const body = bubble("user pending", "you");
-  body.textContent = text;
-  const element = body.parentElement;
-  if (!send({ type:"steer_input", thread_id:state.threadId, turn_id:turnId, text })) {
-    element.classList.remove("pending");
-    element.classList.add("failed");
-    notice(`Steering input not sent: WebSocket is ${state.wsStatus}.`, "error");
-    return;
-  }
-  state.pendingSteer = { turnId, text, element };
-  clearComposerDraft(draftKey);
-  updateComposerControls();
 }
 $("sendBtn").onclick = sendInput;
 $("input").addEventListener("keydown", (e) => {
@@ -9698,7 +9988,6 @@ async function startDraftThread(text, attachments) {
       return;
     }
     state.firstTurnStartingThreadId = String(tid);
-    state.turnSteering = !!res.turn_steering;
     clearComposerDraft(draftKey);
     clearPendingAttachments();
     state.draftThread = null;
@@ -9793,13 +10082,17 @@ async function ingestAttachmentBatch(files, generation, draftKey) {
       const declaredMime = normalizedAttachmentMime(file.type);
       const detectedMime = detectSupportedImageMime(new Uint8Array(header));
       const imageMime = detectedMime;
+      const audioMime = detectSupportedAudioMime(new Uint8Array(header));
+      if (!audioMime && declaredMime.startsWith("audio/")) {
+        notice(`${file.name}: this audio format is attached as a file; native audio input accepts WAV and MP3.`, "warning");
+      }
       const fileMime = declaredMime.startsWith("image/")
         ? "application/octet-stream" : declaredMime;
       state.pendingAttachments.push({
         name: file.name || "attachment",
-        mime_type: imageMime || fileMime,
+        mime_type: imageMime || audioMime || fileMime,
         size: file.size,
-        kind: imageMime ? "image" : "file",
+        kind: imageMime ? "image" : audioMime ? "audio" : "file",
         data_base64
       });
     } catch (e) {
@@ -9808,6 +10101,27 @@ async function ingestAttachmentBatch(files, generation, draftKey) {
     }
   }
   renderPendingAttachments();
+}
+
+// Unknown modality catalogs defer to the native provider. Known catalogs fail visibly
+// before Send, including when the model changes after an audio file was attached.
+function attachmentModalityError() {
+  if (!state.pendingAttachments.some(a => a.kind === "audio")) return "";
+  const model = selectedModelFromControl();
+  const desc = model && findModelDescriptor(model.provider, model.model);
+  return desc && Array.isArray(desc.input_modalities) && !desc.input_modalities.includes("audio")
+    ? "This model does not accept audio. Choose an audio-capable model or remove the recording." : "";
+}
+
+function detectSupportedAudioMime(bytes) {
+  if (bytes.length >= 12 && String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" &&
+      String.fromCharCode(...bytes.slice(8, 12)) === "WAVE") return "audio/wav";
+  const id3 = bytes.length >= 10 && String.fromCharCode(...bytes.slice(0, 3)) === "ID3" &&
+    bytes[3] >= 2 && bytes[3] <= 4 && bytes.slice(6, 10).every(b => !(b & 0x80));
+  const frame = bytes.length >= 4 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0 &&
+    (bytes[1] & 0x18) !== 0x08 && (bytes[1] & 0x06) === 0x02 &&
+    (bytes[2] & 0xf0) !== 0xf0 && (bytes[2] & 0x0c) !== 0x0c;
+  return id3 || frame ? "audio/mpeg" : null;
 }
 
 function attachmentOperationIsCurrent(generation, draftKey) {
@@ -9820,7 +10134,7 @@ function composerCanAcceptAttachments() {
   const managedReadOnly = managedThreadReadOnly() && !draft;
   const readOnly = (state.threadReadOnly || managedReadOnly || threadMetadataPending()) && !draft;
   return hasThreadSurface && !readOnly && !state.updateRequired &&
-    !state.uiVersionCheckPending && !state.activeTurn;
+    !state.uiVersionCheckPending && !(draft && state.activeTurn);
 }
 
 function initComposerFileTransfers() {
@@ -9947,7 +10261,7 @@ function renderPendingAttachments() {
     chip.className = "attachment-chip";
     const name = document.createElement("span");
     name.className = "attachment-chip-name";
-    name.textContent = attachment.name;
+    name.textContent = attachment.kind === "audio" ? `Audio: ${attachment.name}` : attachment.name;
     const size = document.createElement("span");
     size.className = "attachment-chip-size";
     size.textContent = formatAttachmentSize(attachment.size);
@@ -10185,9 +10499,14 @@ function updateModelButton() {
     const eff = EFFORT_OPTIONS.find(o => o.value === m.reasoning_effort);
     txt += " · " + (m.reasoning_effort ? (eff ? eff.label : m.reasoning_effort) : "Default");
   }
+  if (m.service_tier) {
+    const tier = desc?.service_tiers?.find(t => t.id === m.service_tier);
+    txt += " · " + (tier?.name || m.service_tier);
+  }
   label.textContent = txt;
 }
 function syncEffortControl() {
+  syncServiceTierControl();
   updateModelButton();
   const control = $("effortControl");
   const sel = $("effortSel");
@@ -10215,6 +10534,61 @@ function syncEffortControl() {
     : "";
   sel.onchange = sendSelectedEffort;
 }
+function syncServiceTierControl() {
+  const model = selectedModelFromControl();
+  const desc = model ? findModelDescriptor(model.provider, model.model) : null;
+  const tiers = (desc?.service_tiers || []).filter(t => t.id && new TextEncoder().encode(t.id).length <= 128);
+  const sel = $("serviceTierSel");
+  const selected = state.currentModel && modelKey(state.currentModel) === modelKey(model)
+    ? state.currentModel.service_tier || "" : "";
+  $("serviceTierControl").hidden = !tiers.length && !selected;
+  sel.replaceChildren();
+  const nativeDefault = document.createElement("option");
+  nativeDefault.value = "";
+  nativeDefault.textContent = "Native default";
+  nativeDefault.title = "Inherit the native thread's configured service tier";
+  sel.append(nativeDefault);
+  for (const tier of tiers) {
+    const option = document.createElement("option");
+    option.value = tier.id;
+    option.textContent = tier.name || tier.id;
+    option.title = tier.description || "";
+    sel.append(option);
+  }
+  if (selected && !tiers.some(t => t.id === selected)) {
+    const stale = document.createElement("option");
+    stale.value = selected;
+    stale.textContent = `${selected} (unavailable)`;
+    stale.disabled = true;
+    sel.append(stale);
+  }
+  sel.value = selected;
+  sel.onchange = sendSelectedServiceTier;
+  const details = [];
+  if (desc?.input_modalities) details.push(`Inputs: ${desc.input_modalities.join(", ") || "none"}`);
+  if (desc?.multi_agent_version) details.push(`Multi-agent: ${desc.multi_agent_version}`);
+  if (desc?.default_service_tier) details.push(`Model default tier: ${desc.default_service_tier}`);
+  $("modelCapabilities").textContent = details.join(" · ");
+  $("modelCapabilities").hidden = !details.length;
+}
+function sendSelectedServiceTier() {
+  const model = selectedModelFromControl();
+  if (!model) return;
+  const next = { ...model, reasoning_effort:state.currentModel?.reasoning_effort || null,
+    service_tier:$("serviceTierSel").value || null };
+  if (isDraftThread()) {
+    state.currentModel = next;
+    pinDraftModel();
+    syncEffortControl();
+    return;
+  }
+  if (!state.threadId) return;
+  const requestId = beginMetadataAction("model", { current_model:next });
+  if (!send({ type:"select_model", request_id:requestId, thread_id:state.threadId, model_ref:next })) {
+    finishMetadataAction(requestId);
+    notice(`Service tier not changed: WebSocket is ${state.wsStatus}.`, "error");
+  }
+}
 function selectedModelFromControl() {
   const opt = $("modelSel").selectedOptions[0];
   if (!opt || !opt.dataset.model) return null;
@@ -10231,7 +10605,7 @@ function sendSelectedModel() {
     notice(`Create a new thread to use models from provider ${model.provider}.`, "warning");
     return;
   }
-  const next = { provider:model.provider, model:model.model, reasoning_effort:null };
+  const next = { provider:model.provider, model:model.model, reasoning_effort:null, service_tier:null };
   if (isDraftThread()) {
     state.currentModel = next;
     pinDraftModel();
@@ -10251,7 +10625,7 @@ function sendSelectedEffort() {
   const model = selectedModelFromControl();
   if (!model) return;
   const effort = $("effortSel").value || null;
-  const next = { provider:model.provider, model:model.model, reasoning_effort:effort };
+  const next = { provider:model.provider, model:model.model, reasoning_effort:effort, service_tier:state.currentModel?.service_tier || null };
   if (isDraftThread()) {
     state.currentModel = next;
     pinDraftModel();
@@ -10347,6 +10721,7 @@ function toggleUsageMenu() {
     $("subagentsMenu").hidden = true;
     $("mcpMenu").hidden = true;
     renderUsageMenu();
+    loadContextWindowEditor();
   }
 }
 function renderUsageMenu() {
@@ -10356,28 +10731,156 @@ function renderUsageMenu() {
   const window = state.contextWindow ? fmt(state.contextWindow) : "unknown";
   const pctLabel = pct === null ? "unknown" : `${pct.toFixed(1)}%`;
   const meterWidth = pct === null ? 0 : pct;
-  menu.innerHTML = `
+  if (!$("usageCurrentValues")) menu.innerHTML = `
     <div class="usage-head">
       <strong>Context Usage</strong>
       <button id="usageClose" type="button">Close</button>
     </div>
     <div class="usage-section">
       <div class="usage-section-title">Current Context</div>
-      <div class="usage-line"><span class="muted">Used</span><span class="mono">${escapeHtml(used)} / ${escapeHtml(window)}</span></div>
-      <div class="usage-meter" aria-hidden="true"><span style="width:${meterWidth}%"></span></div>
-      <div class="usage-line"><span class="muted">Window filled</span><span class="mono">${escapeHtml(pctLabel)}</span></div>
+      <div class="usage-line"><span class="muted">Used</span><span id="usageCurrentValues" class="mono"></span></div>
+      <div class="usage-meter" aria-hidden="true"><span id="usageMeterFill"></span></div>
+      <div class="usage-line"><span class="muted">Window filled</span><span id="usagePercent" class="mono"></span></div>
     </div>
+    <div id="contextWindowSettings" class="usage-section"></div>
     <div class="usage-section">
       <div class="usage-section-title">Actions</div>
       <button id="compactBtn" class="btn" type="button" title="Compact this thread's Codex context">Compact context</button>
     </div>
     <div class="usage-section">
       <div class="usage-section-title">Cumulative Tokens</div>
-      ${renderTokenStats(state.tokenLedger)}
+      <div id="usageTokenStats"></div>
     </div>`;
+  // Usage events must not replace the settings form: preserve focus and unsaved input.
+  $("usageCurrentValues").textContent = `${used} / ${window}`;
+  $("usageMeterFill").style.width = `${meterWidth}%`;
+  $("usagePercent").textContent = pctLabel;
+  $("usageTokenStats").innerHTML = renderTokenStats(state.tokenLedger);
   $("usageClose").onclick = () => { $("usageMenu").hidden = true; };
   $("compactBtn").onclick = compactContext;
   updateComposerControls();
+}
+// This editor belongs to one visible thread, never to a global model preference.
+let contextWindowEditor = null;
+function contextWindowIdentity() {
+  const model = state.currentModel || {};
+  return JSON.stringify([state.activeViewGeneration, state.projectId, state.threadId,
+    model.provider, model.model, !!state.threadReadOnly, managedThreadReadOnly()]);
+}
+function contextWindowScope() {
+  const detail = composedThreadDetail(state.threadId);
+  return JSON.stringify([contextWindowIdentity(), detail && detail.context_window_override]);
+}
+function contextWindowEditorCurrent(editor) {
+  return contextWindowEditor === editor && editor.scope === contextWindowScope() &&
+    !$("usageMenu").hidden;
+}
+async function loadContextWindowEditor(feedback) {
+  const editor = { scope:contextWindowScope(), identity:contextWindowIdentity(), projectId:state.projectId, threadId:state.threadId,
+    config:null, loading:true, saving:false, error:"", feedback:typeof feedback === "string" ? feedback : "" };
+  contextWindowEditor = editor;
+  renderContextWindowEditor();
+  try {
+    const config = await api("GET", `/api/projects/${encodeURIComponent(editor.projectId)}/threads/${encodeURIComponent(editor.threadId)}/context-window`, undefined, { timeoutMs:15000 });
+    if (!contextWindowEditorCurrent(editor)) return;
+    editor.config = config;
+  } catch (e) {
+    if (!contextWindowEditorCurrent(editor)) return;
+    editor.error = `Could not load session context limit: ${apiFailureMessage(e)}`;
+  }
+  if (!contextWindowEditorCurrent(editor)) return;
+  editor.loading = false;
+  renderContextWindowEditor();
+}
+function renderContextWindowEditor() {
+  const host = $("contextWindowSettings");
+  const editor = contextWindowEditor;
+  if (!host || !editor) return;
+  host.innerHTML = `<div class="usage-section-title">Session context limit</div>`;
+  if (editor.loading) {
+    host.insertAdjacentHTML("beforeend", `<div class="muted" role="status">Loading context limits…</div>`);
+    return;
+  }
+  const config = editor.config;
+  if (!config) {
+    host.insertAdjacentHTML("beforeend", `<div class="context-limit-error" role="alert">${escapeHtml(editor.error)}</div><button id="contextWindowRetry" class="btn" type="button">Retry</button>`);
+    $("contextWindowRetry").onclick = loadContextWindowEditor;
+    return;
+  }
+  const readOnly = state.threadReadOnly || managedThreadReadOnly();
+  const knownMaximum = Number.isSafeInteger(config.advertised_maximum) && config.advertised_maximum > 0;
+  const configurable = config.can_configure && knownMaximum && !readOnly;
+  const explanation = readOnly ? "This thread is read-only." : !config.can_configure ?
+    "Session context limits are unavailable for this thread." : !knownMaximum ?
+    "No configurable maximum is available for this model." : "";
+  const custom = config.override_window !== null && config.override_window !== undefined;
+  host.insertAdjacentHTML("beforeend", `
+    <div class="context-limit-controls">
+      <label for="contextWindowMode">Limit</label>
+      <select id="contextWindowMode" ${configurable ? "" : "disabled"}>
+        <option value="default" ${custom ? "" : "selected"}>Default (${Number(config.default_window).toLocaleString()} tokens)</option>
+        <option value="custom" ${custom ? "selected" : ""}>Custom</option>
+      </select>
+      <label for="contextWindowValue">Tokens</label>
+      <input id="contextWindowValue" type="number" inputmode="numeric" step="1" min="${Number(config.default_window)}" max="${Number(config.advertised_maximum || config.default_window)}" value="${Number(config.selected_window)}" ${configurable && custom ? "" : "disabled"}>
+      <button id="contextWindowSave" class="btn" type="button" ${configurable ? "" : "disabled"}>Save limit</button>
+    </div>
+    <div class="muted context-limit-note" ${explanation ? "" : "hidden"}>${escapeHtml(explanation)}</div>
+    <div id="contextWindowPremium" class="context-limit-warning" hidden></div>
+    <div id="contextWindowStatus" class="context-limit-note" role="status"></div>`);
+  const update = () => {
+    $("contextWindowValue").disabled = !configurable || $("contextWindowMode").value !== "custom" || editor.saving;
+    const value = $("contextWindowMode").value === "default" ? config.default_window : Number($("contextWindowValue").value);
+    const warning = $("contextWindowPremium");
+    const above = config.non_premium_window && value > config.non_premium_window;
+    warning.hidden = !above;
+    warning.textContent = above ?
+      `Above ${Number(config.non_premium_window).toLocaleString()} tokens, long-context rates apply to the full request.` : "";
+  };
+  $("contextWindowMode").onchange = update;
+  $("contextWindowValue").oninput = update;
+  $("contextWindowSave").onclick = () => saveContextWindow(editor);
+  $("contextWindowStatus").textContent = editor.feedback;
+  update();
+}
+async function saveContextWindow(editor) {
+  if (!contextWindowEditorCurrent(editor) || editor.saving || !editor.config.can_configure ||
+      state.threadReadOnly || managedThreadReadOnly()) return;
+  const config = editor.config;
+  const custom = $("contextWindowMode").value === "custom";
+  const value = custom ? Number($("contextWindowValue").value) : null;
+  const status = $("contextWindowStatus");
+  if (custom && (!Number.isSafeInteger(value) || value < config.default_window || value > config.advertised_maximum)) {
+    status.setAttribute("role", "alert");
+    status.textContent = `Enter a whole number from ${Number(config.default_window).toLocaleString()} to ${Number(config.advertised_maximum).toLocaleString()}.`;
+    return;
+  }
+  editor.saving = true;
+  $("contextWindowSave").disabled = true;
+  $("contextWindowMode").disabled = true;
+  $("contextWindowValue").disabled = true;
+  status.setAttribute("role", "status");
+  status.textContent = "Saving…";
+  try {
+    const result = await api("POST", `/api/projects/${encodeURIComponent(editor.projectId)}/threads/${encodeURIComponent(editor.threadId)}/context-window`,
+      { model:config.model, context_window:value }, { timeoutMs:15000 });
+    // Metadata can arrive before the HTTP response and refresh this form. Never publish a
+    // delayed response into another thread/model, even when navigation returned to this thread.
+    if (!contextWindowEditorCurrent(editor)) return;
+    editor.config = result;
+    editor.saving = false;
+    editor.feedback = "Saved for the next turn. The current turn is unchanged.";
+    if (editor.refreshAfterSave) { loadContextWindowEditor(editor.feedback); return; }
+    renderContextWindowEditor();
+  } catch (e) {
+    if (!contextWindowEditorCurrent(editor)) return;
+    editor.saving = false;
+    $("contextWindowSave").disabled = false;
+    $("contextWindowMode").disabled = false;
+    $("contextWindowValue").disabled = !custom;
+    status.setAttribute("role", "alert");
+    status.textContent = `Could not save context limit: ${apiFailureMessage(e)}`;
+  }
 }
 $("usageBtn").onclick = (e) => { e.stopPropagation(); toggleUsageMenu(); };
 $("usageMenu").onclick = (e) => e.stopPropagation();
@@ -10513,6 +11016,192 @@ function applyAppearance(a) {
 }
 $("appearanceSel").onchange = () => applyAppearance($("appearanceSel").value);
 applyAppearance(localStorage.getItem("giskard.appearance") || "ide");
+
+/* ---------- native goals and queued prompts ---------- */
+// One panel owns the selected view's projection. Native state stays authoritative; reads and
+// mutations carry a view generation so late responses cannot repaint a different thread.
+const goalsQueue = (() => {
+  const button = document.createElement("button");
+  button.id = "goalsQueueBtn"; button.className = "badge"; button.type = "button";
+  button.textContent = "Goal & queue"; button.hidden = true;
+  button.setAttribute("aria-haspopup", "dialog");
+  $("thrHeader").appendChild(button);
+  const overlay = document.createElement("div");
+  overlay.id = "goalsQueueOverlay"; overlay.className = "overlay";
+  overlay.setAttribute("role", "dialog"); overlay.setAttribute("aria-modal", "true");
+  overlay.setAttribute("aria-labelledby", "goalsQueueTitle");
+  overlay.innerHTML = `<div class="dialog goals-queue-dialog">
+    <div class="goals-queue-head"><h2 id="goalsQueueTitle">Goal & queue</h2><button type="button" id="goalsQueueClose">Close</button></div>
+    <div class="content">
+      <p id="goalsQueueNotice" role="status" aria-live="polite"></p>
+      <p class="muted" id="goalsQueueSettingsNote">Save goal, Add to queue and Start capture the selected model, service tier, mode and permissions for subsequent goals and queued prompts in this thread. Work already running keeps its settings. Pause and save/resume a goal to apply later selector changes.</p>
+      <div class="goals-queue-actions"><button type="button" id="goalsQueueRefresh">Refresh</button><span id="goalsQueueReadOnly" class="muted"></span></div>
+      <section aria-labelledby="goalHeading"><h3 id="goalHeading">Goal</h3>
+        <p id="goalSummary" class="muted">Loading…</p>
+        <form id="goalForm">
+          <label>Objective<textarea id="goalObjective" rows="3" maxlength="4000" required></textarea></label>
+          <div class="goals-queue-fields"><label>Status<select id="goalStatus">
+            <option value="active">Active</option><option value="paused">Paused</option><option value="blocked">Blocked</option>
+            <option value="usage_limited">Usage limited</option><option value="budget_limited">Budget limited</option><option value="complete">Complete</option>
+          </select></label><label>Token budget (optional)<input id="goalBudget" type="number" min="1" step="1" placeholder="No new limit" /></label></div>
+          <div class="goals-queue-actions"><button type="submit" id="goalSave">Save goal</button><button type="button" id="goalClear">Clear goal</button></div>
+        </form>
+      </section>
+      <section aria-labelledby="queueHeading"><h3 id="queueHeading">Queued prompts</h3>
+        <p class="muted">Prompts waiting in this thread. Start runs the next prompt when the thread is idle.</p>
+        <ol id="goalQueueList"></ol><button type="button" id="goalQueueMore" hidden>Load more prompts</button>
+        <form id="queueForm"><label id="queueInputLabel" for="queueText">New queued prompt</label><textarea id="queueText" rows="3" required></textarea>
+          <div class="goals-queue-actions"><button type="submit" id="queueSave">Add to queue</button><button type="button" id="queueCancelEdit" hidden>Cancel edit</button><button type="button" id="queueStart">Start next prompt</button></div>
+        </form>
+      </section>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  let supported = false, opened = false, snapshot = null, busy = false, loading = false;
+  let panelGeneration = 0, readSequence = 0, editingId = null, goalDirty = false, refreshPending = false;
+  let goalFormObjective = "";
+  function path(view) { return `/api/projects/${encodeURIComponent(view.projectId)}/threads/${encodeURIComponent(view.threadId)}/goals-queue`; }
+  function readOnly() {
+    const meta = state.threadId && threadMetaForId(state.threadId);
+    return state.threadReadOnly || managedThreadReadOnly() || threadMetadataPending() || !!(meta && meta.archived);
+  }
+  function writable() { return !readOnly() && state.wsStatus === "open" && !state.updateRequired; }
+  function errorMessage(error) { return error && error.payload && (error.payload.message || error.payload.error && error.payload.error.message) || apiFailureMessage(error); }
+  function status(text, error = false) { $("goalsQueueNotice").textContent = text; $("goalsQueueNotice").classList.toggle("err", error); }
+  function updateControls() {
+    button.hidden = !supported || !state.threadId || isDraftThread();
+    if (!opened) return;
+    const locked = busy || loading || !writable() || !snapshot;
+    overlay.querySelectorAll("form input, form textarea, form select, form button, [data-queue-action]").forEach(el => { el.disabled = locked; });
+    $("goalClear").disabled = locked || !snapshot || !snapshot.goal;
+    $("queueStart").disabled = locked || state.activeTurn || !snapshot || !snapshot.queue.length;
+    overlay.querySelectorAll('[data-queue-action="up"], [data-queue-action="down"]').forEach(el => {
+      el.disabled = locked || !!(snapshot && snapshot.next_cursor) || el.dataset.boundary === "true";
+    });
+    $("goalQueueMore").disabled = busy || loading;
+    $("goalsQueueRefresh").disabled = busy || loading;
+    $("goalsQueueReadOnly").textContent = readOnly() ? "This thread is read-only." : state.wsStatus !== "open" ? "Reconnect to make changes." : "";
+  }
+  function fillGoal() {
+    const goal = snapshot && snapshot.goal;
+    goalFormObjective = goal ? goal.objective : "";
+    $("goalObjective").value = goalFormObjective;
+    $("goalStatus").value = goal ? goal.status : "active";
+    $("goalBudget").value = goal && goal.token_budget != null ? goal.token_budget : "";
+    goalDirty = false;
+  }
+  function render() {
+    const goal = snapshot.goal;
+    $("goalSummary").textContent = goal ? `${goal.objective} · ${goal.status.replaceAll("_", " ")} · ${Number(goal.tokens_used || 0).toLocaleString()} tokens used${goal.token_budget != null ? ` of ${Number(goal.token_budget).toLocaleString()}` : ""} · ${Math.round(goal.time_used_seconds || 0)} seconds` : "No goal set.";
+    if (!goalDirty) fillGoal();
+    const list = $("goalQueueList"); list.replaceChildren();
+    snapshot.queue.forEach((item, index) => {
+      const row = document.createElement("li"); row.dataset.queueId = item.id;
+      const text = document.createElement("p"); text.className = "queue-prompt"; text.textContent = item.text || (item.has_other_input ? "Prompt with attachments or other input" : "Empty prompt"); row.appendChild(text);
+      if (item.has_other_input) { const note = document.createElement("p"); note.className = "muted"; note.textContent = "Contains other input. Text replacement is unavailable to preserve it."; row.appendChild(note); }
+      const actions = document.createElement("div"); actions.className = "goals-queue-actions";
+      for (const [action, label] of [["edit", "Edit"], ["up", "Move up"], ["down", "Move down"], ["delete", "Delete"]]) {
+        if (action === "edit" && item.has_other_input) continue;
+        const control = document.createElement("button"); control.type = "button"; control.textContent = label; control.dataset.queueAction = action;
+        control.dataset.boundary = String(action === "up" && index === 0 || action === "down" && index === snapshot.queue.length - 1);
+        control.onclick = () => {
+          if (action === "edit") { editingId = item.id; $("queueText").value = item.text; $("queueInputLabel").textContent = "Edit queued prompt"; $("queueSave").textContent = "Save prompt"; $("queueCancelEdit").hidden = false; $("queueText").focus(); }
+          else if (action === "delete") mutate({ action:"delete", id:item.id }, () => { if (editingId === item.id) cancelEdit(); });
+          else { const ids = snapshot.queue.map(entry => entry.id), target = action === "up" ? index - 1 : index + 1; [ids[index], ids[target]] = [ids[target], ids[index]]; mutate({ action:"reorder", ids }); }
+        };
+        actions.appendChild(control);
+      }
+      row.appendChild(actions); list.appendChild(row);
+    });
+    if (!snapshot.queue.length) { const empty = document.createElement("p"); empty.className = "muted"; empty.textContent = "No queued prompts."; list.appendChild(empty); }
+    $("goalQueueMore").hidden = !snapshot.next_cursor;
+    $("goalQueueMore").textContent = "Load more prompts (load all to reorder)";
+    updateControls();
+  }
+  async function refresh(more = false) {
+    if (!opened || busy) { refreshPending = opened; return; }
+    const view = captureActiveViewIdentity(), sequence = ++readSequence;
+    const cursor = more && snapshot && snapshot.next_cursor;
+    loading = true; updateControls();
+    try {
+      const result = await api("GET", path(view) + (cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""), undefined, { timeoutMs:30000 });
+      if (!opened || !activeViewIdentityIsCurrent(view) || sequence !== readSequence) return;
+      if (cursor) {
+        const seen = new Set(snapshot.queue.map(item => item.id));
+        result.queue = [...snapshot.queue, ...result.queue.filter(item => !seen.has(item.id))];
+      }
+      snapshot = result; render();
+    } catch (error) {
+      if (opened && activeViewIdentityIsCurrent(view) && sequence === readSequence) status(`Could not refresh goal and queue: ${errorMessage(error)}`, true);
+    } finally {
+      if (opened && activeViewIdentityIsCurrent(view) && sequence === readSequence) { loading = false; updateControls(); }
+    }
+  }
+  async function mutate(command, accepted) {
+    if (busy || loading || !writable() || !snapshot) return;
+    busy = true; status("Saving…"); updateControls();
+    const view = captureActiveViewIdentity(), panel = panelGeneration;
+    try {
+      const result = await api("POST", path(view), command, { timeoutMs:30000 });
+      if (!opened || panel !== panelGeneration || !activeViewIdentityIsCurrent(view)) return;
+      if (accepted) accepted();
+      snapshot = result; status("Saved."); render();
+    } catch (error) {
+      if (opened && panel === panelGeneration && activeViewIdentityIsCurrent(view)) status(`${errorMessage(error)} Check the current goal and queue with Refresh before retrying; the action may have reached the harness.`, true);
+    } finally {
+      if (opened && panel === panelGeneration && activeViewIdentityIsCurrent(view)) { busy = false; updateControls(); if (refreshPending) { refreshPending = false; refresh(); } }
+    }
+  }
+  function cancelEdit() { editingId = null; $("queueText").value = ""; $("queueInputLabel").textContent = "New queued prompt"; $("queueSave").textContent = "Add to queue"; $("queueCancelEdit").hidden = true; }
+  function close() {
+    ++panelGeneration; opened = false; supported = false; snapshot = null; busy = false; loading = false; refreshPending = false; ++readSequence;
+    overlay.classList.remove("open"); button.setAttribute("aria-expanded", "false"); button.hidden = true;
+  }
+  function dismiss() { ++panelGeneration; opened = false; ++readSequence; overlay.classList.remove("open"); button.setAttribute("aria-expanded", "false"); button.focus(); }
+  button.onclick = () => {
+    ++panelGeneration; opened = true; snapshot = null; busy = false; loading = false; goalDirty = false; cancelEdit(); fillGoal();
+    $("goalSummary").textContent = "Loading…"; $("goalQueueList").replaceChildren(); status("");
+    overlay.classList.add("open"); button.setAttribute("aria-expanded", "true"); $("goalsQueueClose").focus(); refresh();
+  };
+  $("goalsQueueClose").onclick = dismiss;
+  overlay.onclick = event => { if (event.target === overlay) dismiss(); };
+  overlay.addEventListener("keydown", event => {
+    if (event.key === "Escape") { event.preventDefault(); dismiss(); }
+    if (event.key === "Tab") {
+      const focusable = [...overlay.querySelectorAll("button, input, textarea, select")].filter(el => !el.disabled && !el.hidden && el.getClientRects().length);
+      const first = focusable[0], last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }
+  });
+  $("goalsQueueRefresh").onclick = () => { status(""); refresh(); };
+  $("goalQueueMore").onclick = () => refresh(true);
+  $("goalForm").oninput = () => { goalDirty = true; };
+  $("goalForm").onsubmit = event => {
+    event.preventDefault();
+    const budget = $("goalBudget").value;
+    const objective = $("goalObjective").value.trim();
+    if (!objective) return;
+    const command = { action:"set_goal", status:$("goalStatus").value };
+    // Supplying even the same objective resets accounting on a terminal native goal. Compare
+    // with the displayed form baseline, since a live refresh may change the native objective
+    // while the user is editing only status or budget.
+    if (!snapshot.goal || objective !== goalFormObjective.trim()) command.objective = objective;
+    if (budget) { const value = Number(budget); if (!Number.isSafeInteger(value) || value < 1) { status("Token budget must be a positive whole number.", true); return; } command.token_budget = value; }
+    mutate(command, () => { goalDirty = false; });
+  };
+  $("goalClear").onclick = () => mutate({ action:"clear_goal" }, () => { goalDirty = false; });
+  $("queueForm").onsubmit = event => {
+    event.preventDefault(); const text = $("queueText").value.trim(); if (!text) return;
+    mutate(editingId ? { action:"update", id:editingId, text } : { action:"add", text, client_message_id:nextMetadataRequestId() }, cancelEdit);
+  };
+  $("queueCancelEdit").onclick = cancelEdit;
+  $("queueStart").onclick = () => mutate({ action:"start" });
+  return { close, updateControls, onMessage(msg) {
+    if (msg.type === "thread_capabilities") { supported = msg.goals_queue === true; updateControls(); }
+    if (opened && (msg.type === "thread_state" || msg.type === "event" && msg.agent_event && msg.agent_event.kind === "goals_queue_changed")) refresh();
+  } };
+})();
 
 /* Try to enter the app directly if already authenticated. */
 (async () => { try { await api("GET","/api/projects"); startApp(); } catch {} })();

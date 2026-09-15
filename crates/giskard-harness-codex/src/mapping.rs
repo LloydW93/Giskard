@@ -186,8 +186,41 @@ impl CodexMapper {
         self.running_commands.iter().next().map(|key| key.thread_id)
     }
 
+    pub(super) fn has_thread_route(&self, handle: &giskard_harness::ThreadHandle) -> bool {
+        self.routes
+            .route_for_native(&handle.harness_thread_id)
+            .is_some_and(|route| route.thread_id == handle.thread)
+    }
+
+    pub(super) fn applied_context_window(
+        &self,
+        handle: &giskard_harness::ThreadHandle,
+    ) -> Option<u32> {
+        self.routes
+            .route_for_native(&handle.harness_thread_id)
+            .filter(|route| route.thread_id == handle.thread)
+            .and_then(|route| route.context_window)
+    }
+
+    pub(super) fn set_context_window(
+        &mut self,
+        handle: &giskard_harness::ThreadHandle,
+        value: Option<u32>,
+    ) -> Result<(), giskard_core::error::HarnessError> {
+        self.routes
+            .set_context_window(&handle.harness_thread_id, handle.thread, value)
+    }
+
     pub fn active_native_turn_for_thread(&self, thread: ThreadId) -> Option<&str> {
         self.active_turns.get(&thread).map(NativeTurnId::as_str)
+    }
+
+    /// Read the existing active identity without minting a turn for a stale steering request.
+    pub fn active_giskard_turn_for_thread(&self, thread: ThreadId) -> Option<TurnId> {
+        let native = self.active_turns.get(&thread)?;
+        self.turn_ids
+            .get(&NativeTurnKey::new(thread, native.clone()))
+            .copied()
     }
 
     pub fn clear_active_turn(&mut self, thread: ThreadId) {
@@ -400,6 +433,22 @@ impl CodexMapper {
         notif: &Notification,
         fallback_thread: ThreadId,
     ) -> MappingResult<Option<AgentEvent>> {
+        let unloaded = match notif {
+            Notification::ThreadClosed(event) => Some(event.thread_id.as_str()),
+            Notification::ThreadArchived(event) => Some(event.thread_id.as_str()),
+            _ => None,
+        };
+        if let Some(native) = unloaded
+            && let Some(route) = self.routes.route_for_native(native)
+        {
+            // Native runtime configuration does not survive unload/archive. Preserve identity.
+            if let Err(error) = self
+                .routes
+                .set_context_window(native, route.thread_id, None)
+            {
+                warn!(%error, native_thread_id = native, "could not invalidate native context configuration");
+            }
+        }
         Ok(match notif {
             Notification::TurnStarted(TurnStartedNotification { thread_id, turn }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread)?;
@@ -738,6 +787,15 @@ impl CodexMapper {
                 })
             }
 
+            Notification::ThreadGoalUpdated(n) => Some(AgentEvent::GoalsQueueChanged {
+                thread: self.resolve_thread(&n.thread_id, fallback_thread)?,
+            }),
+            Notification::ThreadGoalCleared(n) => Some(AgentEvent::GoalsQueueChanged {
+                thread: self.resolve_thread(&n.thread_id, fallback_thread)?,
+            }),
+            Notification::ThreadQueueChanged(n) => Some(AgentEvent::GoalsQueueChanged {
+                thread: self.resolve_thread(&n.thread_id, fallback_thread)?,
+            }),
             Notification::ContextCompacted(n) => {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(thread, &n.turn_id);
@@ -1291,6 +1349,38 @@ impl CodexMapper {
                     )?,
                 }
             }
+            CodexServerRequest::Unknown {
+                method,
+                params: Some(params),
+            } if method == "mcpServer/elicitation/request" => {
+                // Decode solely for approval promotion; retain the original envelope for
+                // ordinary forms so current routing and schema fields survive old bindings.
+                let detected = serde_json::from_value(params.clone())
+                    .ok()
+                    .and_then(|typed| detect_mcp_tool_approval_from_elicitation(&typed));
+                let (thread, turn) = self.server_request_scope(request, fallback_thread)?;
+                match (detected, self.explicit_or_active_turn(thread, turn)) {
+                    (Some(mut detected), Some(turn)) => {
+                        if let Some(server) = params.get("serverName").and_then(Value::as_str) {
+                            detected.server = server.to_owned();
+                        }
+                        self.build_mcp_tool_approval_event(
+                            id.clone(),
+                            req_id,
+                            thread,
+                            turn,
+                            detected,
+                            McpToolApprovalTransport::Elicitation,
+                        )
+                    }
+                    _ => self.map_generic_server_request(
+                        id.clone(),
+                        req_id,
+                        request,
+                        fallback_thread,
+                    )?,
+                }
+            }
             _ => self.map_generic_server_request(id.clone(), req_id, request, fallback_thread)?,
         })
     }
@@ -1534,12 +1624,27 @@ impl CodexMapper {
         let Some(meta) = meta.and_then(Value::as_object) else {
             return Ok((fallback_thread, None));
         };
+        let nested = meta.get("_meta").and_then(Value::as_object);
         let native_thread = string_field(meta, "threadId")
             .or_else(|| string_field(meta, "thread_id"))
+            .or_else(|| {
+                nested.and_then(|meta| {
+                    string_field(meta, "threadId").or_else(|| string_field(meta, "thread_id"))
+                })
+            })
             .unwrap_or_default();
         let thread = self.resolve_thread(native_thread, fallback_thread)?;
         let turn = string_field(meta, "turnId")
             .or_else(|| string_field(meta, "turn_id"))
+            .or_else(|| {
+                (!meta.contains_key("turnId"))
+                    .then(|| {
+                        nested.and_then(|meta| {
+                            string_field(meta, "turnId").or_else(|| string_field(meta, "turn_id"))
+                        })
+                    })
+                    .flatten()
+            })
             .filter(|native| !native.is_empty())
             .map(|native| self.resolve_turn(thread, native));
         Ok((thread, turn))
@@ -1676,16 +1781,19 @@ pub fn map_user_input(input: &giskard_core::user_input::UserInput) -> Vec<codex_
                 });
             }
             input.extend(attachments.iter().filter_map(|attachment| {
-                if attachment.kind != giskard_core::AttachmentKind::Image {
-                    return None;
+                let url = format!(
+                    "data:{};base64,{}",
+                    attachment.mime_type, attachment.data_base64
+                );
+                match attachment.kind {
+                    giskard_core::AttachmentKind::Image => {
+                        Some(codex_codes::UserInput::Image { detail: None, url })
+                    }
+                    giskard_core::AttachmentKind::Audio => {
+                        Some(codex_codes::UserInput::Audio { url })
+                    }
+                    giskard_core::AttachmentKind::File => None,
                 }
-                Some(codex_codes::UserInput::Image {
-                    detail: None,
-                    url: format!(
-                        "data:{};base64,{}",
-                        attachment.mime_type, attachment.data_base64
-                    ),
-                })
             }));
             input
         }
@@ -2723,7 +2831,9 @@ fn map_thread_item_complete(
     completed_at_ms: i64,
 ) -> Item {
     let payload = match item {
-        codex_codes::ThreadItem::UserMessage { content, .. } => {
+        codex_codes::ThreadItem::UserMessage {
+            content, client_id, ..
+        } => {
             let text = content
                 .iter()
                 .filter_map(|c| match c {
@@ -2732,14 +2842,29 @@ fn map_thread_item_complete(
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            ItemPayload::UserMessage { text }
+            ItemPayload::UserMessage {
+                text,
+                client_id: client_id.clone(),
+            }
         }
-        codex_codes::ThreadItem::AgentMessage { text, .. } => {
-            ItemPayload::AgentMessage { text: text.clone() }
-        }
-        codex_codes::ThreadItem::Plan { text, .. } => {
-            ItemPayload::AgentMessage { text: text.clone() }
-        }
+        codex_codes::ThreadItem::AgentMessage {
+            text, questions, ..
+        } => ItemPayload::AgentMessage {
+            questions: questions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|q| giskard_core::item::AsyncQuestion {
+                    title: q.title.clone(),
+                    options: q.options.clone(),
+                })
+                .collect(),
+            text: text.clone(),
+        },
+        codex_codes::ThreadItem::Plan { text, .. } => ItemPayload::AgentMessage {
+            questions: vec![],
+            text: text.clone(),
+        },
         codex_codes::ThreadItem::Reasoning {
             content, summary, ..
         } => {
@@ -3922,6 +4047,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.6-sol".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         mapper.register_active_turn_with_model(fallback, "t1", model.clone());
 
@@ -6504,6 +6630,27 @@ mod tests {
     }
 
     #[test]
+    fn goals_queue_notifications_invalidate_the_exact_thread_without_turn_admission() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/workspace"));
+        let thread = ThreadId::new();
+        mapper.register_thread("goal-thread".into(), thread);
+        for method in ["thread/goal/cleared", "thread/queue/changed"] {
+            let notification = Notification::from_envelope(
+                method,
+                Some(serde_json::json!({"threadId":"goal-thread"})),
+            )
+            .unwrap();
+            let event = mapper
+                .map_notification(&notification, ThreadId::new())
+                .unwrap();
+            assert_eq!(event.thread_id(), thread);
+            assert_eq!(event.turn(), None);
+            assert_eq!(event.kind(), "goals_queue_changed");
+        }
+        assert_eq!(mapper.active_giskard_turn_for_thread(thread), None);
+    }
+
+    #[test]
     fn context_compacted_notification_maps_to_clean_activity() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let notif = Notification::ContextCompacted(
@@ -7064,6 +7211,71 @@ mod tests {
     }
 
     #[test]
+    fn raw_mcp_elicitation_keeps_scope_schema_and_approval_promotion() {
+        for mode in ["form", "openai/form", "openaiForm"] {
+            let mut mapper = CodexMapper::new(PathBuf::from("/workspace"));
+            let thread = ThreadId::new();
+            mapper.register_thread("child-native".into(), thread);
+            let params = json!({
+                "mode":mode, "threadId":"child-native", "turnId":"child-turn",
+                "serverName":"actual-server", "message":"Choose a value",
+                "requestedSchema":{"type":"object", "properties":{"nested":{"type":"object", "properties":{}}}}
+            });
+            let request = CodexServerRequest::Unknown {
+                method: "mcpServer/elicitation/request".into(),
+                params: Some(params.clone()),
+            };
+            match mapper
+                .map_server_request(
+                    &RequestId::String("raw-form".into()),
+                    &request,
+                    ThreadId::new(),
+                )
+                .unwrap()
+            {
+                AgentEvent::ServerRequestReceived {
+                    thread: actual_thread,
+                    turn,
+                    request,
+                } => {
+                    assert_eq!(actual_thread, thread);
+                    assert!(turn.is_some());
+                    assert_eq!(request.params, params);
+                }
+                other => panic!("expected generic request, got {other:?}"),
+            }
+            let mut approval = params;
+            approval["requestedSchema"] = json!({"type":"object", "properties":{}});
+            approval["_meta"] =
+                json!({"codex_approval_kind":"mcp_tool_call", "tool_name":"actual-tool"});
+            let request = CodexServerRequest::Unknown {
+                method: "mcpServer/elicitation/request".into(),
+                params: Some(approval),
+            };
+            match mapper
+                .map_server_request(
+                    &RequestId::String("raw-approval".into()),
+                    &request,
+                    ThreadId::new(),
+                )
+                .unwrap()
+            {
+                AgentEvent::ApprovalRequested {
+                    thread: actual_thread,
+                    request,
+                    ..
+                } => {
+                    assert_eq!(actual_thread, thread);
+                    assert!(
+                        matches!(request.kind, ApprovalKind::McpToolCall { server, tool_name } if server == "actual-server" && tool_name == "actual-tool")
+                    );
+                }
+                other => panic!("expected approval, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn mcp_tool_approval_from_openai_elicitation_form_is_promoted() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let fallback = ThreadId::new();
@@ -7269,5 +7481,64 @@ mod tests {
             }
             other => panic!("expected Result, got {other:?}"),
         }
+    }
+    #[test]
+    fn async_questions_survive_item_mapping_without_a_server_request() {
+        let mut mapper = CodexMapper::new("/workspace".into());
+        let thread = ThreadId::new();
+        let event = mapper
+            .map_notification(
+                &completed_item(json!({
+                    "type": "agentMessage", "id": "question", "text": "",
+                    "questions": [
+                        {"title": "Which approach?", "options": ["Small change", "Redesign"]},
+                        {"title": "Any constraints?"}
+                    ]
+                })),
+                thread,
+            )
+            .unwrap();
+        let AgentEvent::ItemCompleted { item, .. } = event else {
+            panic!("expected completed item")
+        };
+        let ItemPayload::AgentMessage { text, questions } = item.payload else {
+            panic!("expected message")
+        };
+        assert!(text.is_empty());
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].title, "Which approach?");
+        assert_eq!(
+            questions[0].options.as_ref().unwrap(),
+            &["Small change", "Redesign"]
+        );
+        assert_eq!(questions[1].options, None);
+        assert!(mapper.pending_server_requests.is_empty());
+    }
+
+    #[test]
+    fn active_turn_lookup_does_not_mint_or_keep_a_completed_turn() {
+        let mut mapper = CodexMapper::new("/workspace".into());
+        let thread = ThreadId::new();
+        assert_eq!(mapper.active_giskard_turn_for_thread(thread), None);
+        assert!(mapper.turn_ids.is_empty());
+        let turn = mapper.register_active_turn(thread, "native").unwrap();
+        assert_eq!(mapper.active_giskard_turn_for_thread(thread), Some(turn));
+        mapper.clear_active_turn(thread);
+        assert_eq!(mapper.active_giskard_turn_for_thread(thread), None);
+    }
+    #[test]
+    fn user_message_preserves_client_input_identity() {
+        let event = CodexMapper::new("/workspace".into())
+            .map_notification(
+                &completed_item(json!({
+                    "type":"userMessage", "id":"native-input", "clientId":"browser-request",
+                    "content":[{"type":"text", "text":"Same answer"}]
+                })),
+                ThreadId::new(),
+            )
+            .unwrap();
+        assert!(
+            matches!(event, AgentEvent::ItemCompleted { item: Item { payload: ItemPayload::UserMessage { client_id: Some(id), .. }, .. }, .. } if id == "browser-request")
+        );
     }
 }

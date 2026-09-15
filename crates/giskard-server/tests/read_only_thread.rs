@@ -52,6 +52,7 @@ fn orphaned_model() -> ModelRef {
         provider: "cloudflare-litellm".into(),
         model: "@cf/z-ai/glm-4.7".into(),
         reasoning_effort: None,
+        service_tier: None,
     }
 }
 
@@ -94,12 +95,7 @@ async fn open_read_only_thread(
         200,
         "an orphaned thread must degrade to a read-only open, not a hard failure"
     );
-    let open: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(
-        open["turn_steering"], false,
-        "a thread that failed to attach must not advertise active-turn steering"
-    );
-    (open, server, proj_dir)
+    (resp.json().await.unwrap(), server, proj_dir)
 }
 
 #[tokio::test]
@@ -202,7 +198,6 @@ async fn an_unreachable_harness_does_not_blame_the_provider_config() {
     );
     let open: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(open["thread_id"].as_str().unwrap(), tid.to_string());
-    assert_eq!(open["turn_steering"], false);
     assert_eq!(open["warning"]["code"], "thread_read_only");
     let http_message = open["warning"]["message"].as_str().unwrap_or_default();
     assert!(

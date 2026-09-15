@@ -18,6 +18,9 @@
 //! * `GISKARD_REPLAY_PASSWORD` — the app password (default `giskard`);
 //! * `GISKARD_REPLAY_WORKSPACE` — the demo project's workspace dir (created if missing).
 
+#[path = "replay/goals_queue.rs"]
+mod goals_queue;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -91,6 +94,9 @@ const SCRIPTED_APPROVAL_THEN_ERROR_MESSAGE: &str = "Scripted non-fatal harness e
 /// Prompt that raises a `requestUserInput` server request and then keeps the turn in-flight. This
 /// harness deliberately never emits `ServerRequestResolved` when the answer is routed — modelling a
 /// harness whose resolved event is late or absent, which is the window a reload has to survive.
+const SCRIPTED_ASYNC_QUESTION_TRIGGER: &str = "Ask a scripted async question.";
+const SCRIPTED_IDLE_QUESTION_TRIGGER: &str = "Ask a scripted question and finish.";
+const SCRIPTED_ASYNC_QUESTION: &str = "Which branch should I use for the implementation?";
 const SCRIPTED_SERVER_REQUEST_TRIGGER: &str = "Trigger a scripted user input request.";
 const SCRIPTED_SERVER_REQUEST_ID: &str = "scripted-server-request-1";
 const SCRIPTED_SERVER_REQUEST_QUESTION: &str = "Which branch should I use?";
@@ -107,10 +113,6 @@ const SCRIPTED_SERVER_REQUEST_THEN_ERROR_MESSAGE: &str = "Scripted non-fatal har
 const SCRIPTED_REASONING_TRIGGER: &str = "Think out loud before replying.";
 const SCRIPTED_REASONING_SUMMARY: &str = "Weighing the scripted options";
 const SCRIPTED_REASONING_DETAIL: &str = "Then answering with the deterministic scripted reply.";
-/// Starts a turn which emits `TurnStarted` and then waits for `steer_turn`. The accepted steering
-/// text is echoed as a same-turn user-message item before the deterministic reply and completion.
-const SCRIPTED_STEERING_TRIGGER: &str = "Hold this turn open for scripted steering.";
-const SCRIPTED_STEERING_REPLY: &str = "Scripted steering accepted on the active turn.";
 /// A harness that speaks the neutral protocol but has no backend: every turn streams the same
 /// canned agent message, so the browser-visible transcript is fully deterministic.
 struct ScriptedHarness {
@@ -121,7 +123,7 @@ struct ScriptedHarness {
     // Structural reason: This non-test-gated replay adapter cannot use server authorities.
     // Synchronization: The mutex protects linear lookup, insertion, and removal.
     // Invalidation/removal: Thread close removes state; dropping the harness removes all entries.
-    threads: tokio::sync::Mutex<Vec<(ThreadId, Arc<EventLog>)>>,
+    threads: tokio::sync::Mutex<Vec<ScriptedThreadEntry>>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Translate scripted native thread identifiers to Giskard thread identifiers.
     // Source of truth: Bootstrap and import claims establish the bijective bindings.
@@ -136,14 +138,13 @@ struct ScriptedHarness {
     /// would let the later one overwrite the earlier and misattribute its ack. Shared, because a
     /// sub-agent's approval is raised from the detached task that drives the child's turn.
     active_approvals: ActiveApprovals,
-    // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Remember the exact scripted turn waiting for deterministic steering input.
-    // Source of truth: The steering trigger starts the turn; steer, interrupt, and delete clear it.
-    // Structural reason: A provider adapter must validate the expected turn before accepting input.
-    // Synchronization: The mutex makes validation and removal one atomic operation.
-    // Invalidation/removal: Acceptance, interruption, thread deletion, or harness drop removes it.
-    active_steering_turns: tokio::sync::Mutex<HashMap<ThreadId, TurnId>>,
 }
+
+type ScriptedThreadEntry = (
+    ThreadId,
+    Arc<EventLog>,
+    giskard_core::goals_queue::GoalsQueueSnapshot,
+);
 
 type ActiveApprovals = Arc<tokio::sync::Mutex<HashMap<ApprovalId, (ThreadId, TurnId)>>>;
 
@@ -159,14 +160,14 @@ impl ScriptedHarness {
         }
         Ok(Self {
             capabilities: HarnessCapabilities {
-                turn_steering: true,
+                context_window_configuration: true,
                 live_approvals: true,
                 plan_build_modes: true,
                 per_turn_model: true,
                 reasoning_effort: true,
                 structured_diffs: true,
                 resumable_threads: true,
-                model_listing: false,
+                model_listing: true,
                 // The scripted harness knows its one provider, so the picker exercises the same
                 // id-validation path the real Codex harness does.
                 provider_listing: true,
@@ -175,11 +176,11 @@ impl ScriptedHarness {
                 mcp_reload: false,
                 mcp_oauth_login: false,
                 context_compaction: false,
+                turn_steering: true,
             },
             threads: tokio::sync::Mutex::new(Vec::new()),
             native_bindings: tokio::sync::Mutex::new(native_bindings),
             active_approvals: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            active_steering_turns: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -216,8 +217,8 @@ impl ScriptedHarness {
         let threads = self.threads.lock().await;
         threads
             .iter()
-            .find(|(id, _)| *id == thread)
-            .map(|(_, tx)| tx.clone())
+            .find(|(id, _, _)| *id == thread)
+            .map(|(_, tx, _)| tx.clone())
     }
 
     fn subagent_parent(native_thread_id: &str) -> Option<String> {
@@ -240,10 +241,10 @@ impl ScriptedHarness {
         let new_sender = Arc::new(EventLog::new());
         let mut threads = self.threads.lock().await;
         let (sender, is_new) =
-            if let Some((_, existing)) = threads.iter().find(|(id, _)| *id == thread) {
+            if let Some((_, existing, _)) = threads.iter().find(|(id, _, _)| *id == thread) {
                 (existing.clone(), false)
             } else {
-                threads.push((thread, new_sender.clone()));
+                threads.push((thread, new_sender.clone(), Default::default()));
                 (new_sender, true)
             };
         drop(threads);
@@ -397,6 +398,7 @@ impl ScriptedHarness {
                     id: ItemId::new(),
                     harness_item_id: format!("scripted_child_reply_{turn}"),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: SCRIPTED_SUBAGENT_REPLY.into(),
                     },
                     created_at: chrono::Utc::now(),
@@ -445,8 +447,67 @@ impl AgentHarness for ScriptedHarness {
         self.capabilities
     }
 
+    fn goals_queue_supported(&self) -> bool {
+        true
+    }
+
+    async fn goals_queue(
+        &self,
+        thread: &ThreadHandle,
+        command: giskard_core::goals_queue::GoalsQueueCommand,
+        _settings: Option<TurnOverrides>,
+    ) -> Result<giskard_core::goals_queue::GoalsQueueSnapshot, HarnessError> {
+        let mutated = !command.is_read();
+        let (snapshot, start) = {
+            let mut threads = self.threads.lock().await;
+            let (_, log, state) = threads
+                .iter_mut()
+                .find(|(id, _, _)| *id == thread.thread)
+                .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
+            let start = goals_queue::apply(state, command)?;
+            if mutated {
+                let _ = log.append(AgentEvent::GoalsQueueChanged {
+                    thread: thread.thread,
+                });
+            }
+            (state.clone(), start)
+        };
+        if let Some(text) = start {
+            self.start_turn(
+                thread,
+                UserInput::text(text),
+                TurnOverrides {
+                    context_window: None,
+                    model: None,
+                    mode: giskard_core::turn::Mode::Build,
+                    permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
+                },
+            )
+            .await?;
+        }
+        Ok(snapshot)
+    }
+
     async fn list_models(&self) -> Result<Vec<giskard_core::model::ModelDescriptor>, HarnessError> {
-        Ok(vec![])
+        let mut model = giskard_core::model::ModelDescriptor::conservative("replay", "gpt-6-astra");
+        model.context_window = 272_000;
+        model.advertised_context_window = Some(1_000_000);
+        model.service_tiers = Some(vec![
+            giskard_core::model::ModelServiceTier {
+                id: "default".into(),
+                name: "Standard".into(),
+                description: "Standard speed".into(),
+            },
+            giskard_core::model::ModelServiceTier {
+                id: "priority".into(),
+                name: "Priority".into(),
+                description: "Faster processing".into(),
+            },
+        ]);
+        model.default_service_tier = Some("default".into());
+        model.input_modalities = Some(vec!["text".into(), "image".into(), "audio".into()]);
+        model.multi_agent_version = Some("v2".into());
+        Ok(vec![model])
     }
 
     /// The scripted stand-in for Codex's `[model_providers]` table: one provider, no endpoint, so
@@ -577,27 +638,52 @@ impl AgentHarness for ScriptedHarness {
             input_text == Some(SCRIPTED_SERVER_REQUEST_TRIGGER) || raise_server_request_then_error;
         let raise_lazy_diffs = input_text == Some(SCRIPTED_DIFF_TRIGGER);
         let stream_reasoning = input_text == Some(SCRIPTED_REASONING_TRIGGER);
-        let wait_for_steering = input_text == Some(SCRIPTED_STEERING_TRIGGER);
+        let idle_question = input_text == Some(SCRIPTED_IDLE_QUESTION_TRIGGER);
+        let async_question = input_text == Some(SCRIPTED_ASYNC_QUESTION_TRIGGER) || idle_question;
 
-        if wait_for_steering {
-            self.active_steering_turns
-                .lock()
-                .await
-                .insert(thread_id, turn);
-        }
+        let echoed_input = input.as_text().unwrap_or_default().to_string();
 
         // Stream the canned reply the way a real harness would: start, incremental deltas, then a
         // completed item and a turn-completed with token usage. Emitted off-task with yields so the
         // WebSocket layer observes distinct frames (the transcript renders progressively).
         tokio::spawn(async move {
-            if wait_for_steering {
+            if async_question {
                 let _ = sender.append(AgentEvent::TurnStarted {
                     thread: thread_id,
                     turn,
                 });
+                let _ = sender.append(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item: Item {
+                        id: ItemId::new(),
+                        harness_item_id: format!("scripted_async_question_{turn}"),
+                        payload: ItemPayload::AgentMessage {
+                            text: String::new(),
+                            questions: vec![giskard_core::item::AsyncQuestion {
+                                title: SCRIPTED_ASYNC_QUESTION.into(),
+                                options: Some(vec![
+                                    "Create a new branch".into(),
+                                    "Use the current branch".into(),
+                                ]),
+                            }],
+                        },
+                        created_at: chrono::Utc::now(),
+                    },
+                });
+                if idle_question {
+                    let _ = sender.append(AgentEvent::TurnCompleted {
+                        thread: thread_id,
+                        turn,
+                        usage: TokenUsage::new(20, 8),
+                        status: TurnStatus {
+                            kind: TurnStatusKind::Completed,
+                            message: None,
+                        },
+                    });
+                }
                 return;
             }
-
             if raise_lazy_diffs {
                 let item_id = ItemId::new();
                 let file_change = |diff: &str, status: &str| Item {
@@ -813,6 +899,19 @@ impl AgentHarness for ScriptedHarness {
                 thread: thread_id,
                 turn,
             });
+            let _ = sender.append(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("scripted_user_input_{turn}"),
+                    payload: ItemPayload::UserMessage {
+                        text: echoed_input,
+                        client_id: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            });
             tokio::task::yield_now().await;
             if stream_reasoning {
                 // Stream the note the way a real harness does — start, text deltas, completion — so
@@ -883,6 +982,7 @@ impl AgentHarness for ScriptedHarness {
                     id: item_id,
                     harness_item_id: "scripted_1".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: SCRIPTED_REPLY.into(),
                     },
                     created_at: chrono::Utc::now(),
@@ -903,67 +1003,9 @@ impl AgentHarness for ScriptedHarness {
         Ok(turn)
     }
 
-    async fn steer_turn(
-        &self,
-        thread: &ThreadHandle,
-        expected_turn: TurnId,
-        text: String,
-    ) -> Result<(), HarnessError> {
-        let Some(sender) = self.sender_for(thread.thread).await else {
-            return Err(HarnessError::ThreadNotFound(thread.thread));
-        };
-        let mut active_steering_turns = self.active_steering_turns.lock().await;
-        if active_steering_turns.get(&thread.thread) != Some(&expected_turn) {
-            return Err(HarnessError::Protocol(format!(
-                "scripted thread {} is not waiting for steering on turn {expected_turn}",
-                thread.thread
-            )));
-        }
-        active_steering_turns.remove(&thread.thread);
-        drop(active_steering_turns);
-
-        let thread_id = thread.thread;
-        tokio::spawn(async move {
-            let _ = sender.append(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn: expected_turn,
-                item: Item {
-                    id: ItemId::new(),
-                    harness_item_id: format!("scripted_steering_user_{expected_turn}"),
-                    payload: ItemPayload::UserMessage { text },
-                    created_at: chrono::Utc::now(),
-                },
-            });
-            tokio::task::yield_now().await;
-            let _ = sender.append(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn: expected_turn,
-                item: Item {
-                    id: ItemId::new(),
-                    harness_item_id: format!("scripted_steering_reply_{expected_turn}"),
-                    payload: ItemPayload::AgentMessage {
-                        text: SCRIPTED_STEERING_REPLY.into(),
-                    },
-                    created_at: chrono::Utc::now(),
-                },
-            });
-            tokio::task::yield_now().await;
-            let _ = sender.append(AgentEvent::TurnCompleted {
-                thread: thread_id,
-                turn: expected_turn,
-                usage: TokenUsage::new(24, 7),
-                status: TurnStatus {
-                    kind: TurnStatusKind::Completed,
-                    message: None,
-                },
-            });
-        });
-        Ok(())
-    }
-
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
         if let Ok(threads) = self.threads.try_lock()
-            && let Some((_, tx)) = threads.iter().find(|(id, _)| *id == thread.thread)
+            && let Some((_, tx, _)) = threads.iter().find(|(id, _, _)| *id == thread.thread)
         {
             return AgentEventStream::new(tx.reader());
         }
@@ -997,6 +1039,7 @@ impl AgentHarness for ScriptedHarness {
                     id: ItemId::new(),
                     harness_item_id: format!("scripted_approval_ack_{turn}"),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: format!("Approval recorded: {label}"),
                     },
                     created_at: chrono::Utc::now(),
@@ -1014,23 +1057,50 @@ impl AgentHarness for ScriptedHarness {
         Ok(())
     }
 
-    async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.active_steering_turns
-            .lock()
-            .await
-            .remove(&thread.thread);
+    async fn steer_turn(
+        &self,
+        thread: &ThreadHandle,
+        expected_turn: TurnId,
+        input: UserInput,
+        client_message_id: Option<String>,
+    ) -> Result<(), HarnessError> {
+        let Some(sender) = self.sender_for(thread.thread).await else {
+            return Err(HarnessError::ThreadNotFound(thread.thread));
+        };
+        let _ = sender.append(AgentEvent::ItemCompleted {
+            thread: thread.thread,
+            turn: expected_turn,
+            item: Item {
+                id: ItemId::new(),
+                harness_item_id: format!("scripted_steered_input_{}", ItemId::new()),
+                payload: ItemPayload::UserMessage {
+                    text: input.as_text().unwrap_or_default().into(),
+                    client_id: client_message_id,
+                },
+                created_at: chrono::Utc::now(),
+            },
+        });
+        let _ = sender.append(AgentEvent::TurnCompleted {
+            thread: thread.thread,
+            turn: expected_turn,
+            usage: TokenUsage::new(20, 8),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        });
+        Ok(())
+    }
+
+    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
     }
 
     async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.active_steering_turns
-            .lock()
-            .await
-            .remove(&thread.thread);
         self.threads
             .lock()
             .await
-            .retain(|(thread_id, _)| *thread_id != thread.thread);
+            .retain(|(thread_id, _, _)| *thread_id != thread.thread);
         Ok(())
     }
 
@@ -1082,11 +1152,11 @@ password_hash = "{password_hash}"
 kind = "replay"
 
 [providers.replay]
-model_listing = false
+model_listing = true
   [[providers.replay.models]]
-  id = "replay-model"
+  id = "gpt-6-astra"
   display_name = "Replay Model"
-  context_window = 131072
+  context_window = 272000
   supports_reasoning_effort = true
 "#
     );

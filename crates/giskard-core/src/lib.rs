@@ -5,6 +5,7 @@
 
 pub mod approval;
 pub mod diff;
+pub mod dynamic_tool_config;
 pub mod error;
 pub mod event;
 pub mod ids;
@@ -41,3 +42,5 @@ pub use thread::ThreadKind;
 pub use token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
 pub use turn::{Mode, PermissionPreset, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 pub use user_input::{AttachmentKind, UserAttachment, UserInput};
+
+pub mod goals_queue;

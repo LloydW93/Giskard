@@ -127,12 +127,11 @@ Then open **http://127.0.0.1:8787**, log in, and:
    screen, and scrolls beyond that — long prompts stay readable while you write them. Use the
    attachment button, drop files onto the composer, or paste files and screenshots into the
    focused composer
-   to include images, PDFs, or other files with the message. A message accepts up to eight files
+   to include images, WAV/MP3 audio, PDFs, or other files with the message. Audio is sent
+   as native audio input; models reporting no audio support cannot receive it. Other audio
+   formats remain ordinary file uploads, with a visible notice. A message accepts up to eight files
    and 25 MiB total. The first send creates the Codex thread with the selected
-   provider/model and starts the turn. While an ordinary Codex turn is running, type text to reveal
-   **Send** beside **Stop** and append that message to the same turn; an empty composer keeps the
-   single Stop control. Active-turn steering is text-only, so attachments become available again
-   after the turn completes. Existing threads show the **Tasks** menu for running
+   provider/model and starts the turn. Existing threads show the **Tasks** menu for running
    commands/tools, **Sub-agents** monitor, **MCP** status menu, and **Context** usage button;
    scrolling the transcript to the top lazy-loads older history. Completed command rows carry only
    a bounded preview; opening one fetches its retained output and resolves path links by command
@@ -150,11 +149,22 @@ Then open **http://127.0.0.1:8787**, log in, and:
    [Sub-agent threads](docs/subagents.md) for spawning protocols, read-only event ownership,
    prompts, approvals, and deletion behavior.
 
+Model metadata retains the remote maximum separately from configured context defaults. A new
+session starts at the smaller of that maximum and the model's known non-premium input threshold
+(272,000 tokens for Astra). The top-right **Context** card can save a larger raw limit for that
+session, up to the current advertised maximum, or reset it to the default. The preference applies
+at the next safe native launch boundary; running work is never interrupted to change it. Selecting
+a different provider or model clears the preference. [Session context limits](docs/session-context-limits.md)
+documents the complete lifecycle, while [Context capacity and pricing policy](docs/context-window-policy.md)
+documents the source bounds and exact model identifiers with known non-premium thresholds.
+
 The header context value is a context-window indicator, not a billing total. It updates during a
 turn from Codex's latest reported input tokens, which are the best available proxy for "how full is
 the active conversation?" Clicking **Context** opens a card with both the current context footprint
-and cumulative input/output/total tokens. Those cumulative totals can legitimately exceed the
-model's context window over a long thread.
+and cumulative input/output/total tokens, plus the session limit editor when the harness supports
+it. The selected limit is a raw budgeting and compaction input; the effective gauge can be lower
+because Codex reserves headroom. Cumulative totals can legitimately exceed the model's context
+window over a long thread.
 
 > **Common gotcha:** with `secure_cookies = true` over plain HTTP, the browser drops the session
 > cookie — login appears to succeed but nothing loads. Use `false` for local HTTP; set `true` only
@@ -260,6 +270,9 @@ service does not silently run with an empty provider list.
 | `[retention]` | `max_command_output_bytes` | `134217728` (128 MiB) | Maximum durable completed-command output. Must be at least `32768` (32 KiB); larger output retains a UTF-8-safe head and tail. |
 | `[harness]` | `kind` | `codex` | Agent harness (v1: `codex`). |
 | | `idle_shutdown_secs` | `0` (keep alive) | Terminate an idle project's harness after N seconds. |
+| | `dynamic_tools` | `[]` | Explicit client-tool namespaces and process executors; see Client-executed tools below. |
+| | `attestation_provider_command` | `[]` (disabled) | Trusted host program argv for native attestation; [provider contract](docs/native-service-providers.md). |
+| | `external_auth_provider_command` | `[]` (Codex-managed auth) | Trusted host program argv for external ChatGPT login and refresh; [provider contract](docs/native-service-providers.md). |
 | `[providers.<id>]` | `model_listing`, `[[providers.<id>.models]]` | — | **Optional.** Models are found without it: every provider Codex has a `base_url` for is discovered from `GET {base_url}/models` with the key Codex holds for it, and the provider Codex routes to also contributes its `model/list` catalog. A built-in Codex has no endpoint for and does not route to — `ollama` or `lmstudio` when you use neither — has nothing to contribute and is not offered; declare models for it if you want it in the picker. Declare a provider only to turn discovery off (`model_listing = false`), to add models by hand for an endpoint with no `/models` route, to override metadata, or to pin picker order — declared providers come first in the order written, the rest by id. Keyed by routing id, the same way Codex keys `[model_providers.<id>]`; the id must name a provider Codex knows (see below). |
 
 Provider config governs the **picker** and optional `/v1/models` discovery only — Codex itself
@@ -325,6 +338,14 @@ Codex's. Effort values are model-defined strings; familiar models
 commonly offer `minimal`, `low`, `medium`, `high`, or `xhigh`, while other values are passed through
 unchanged. Reloading the picker refreshes provider discovery and harness metadata; non-fatal
 failures are shown as warnings while the usable portion of the model list remains available.
+
+Models advertising service tiers also expose a **Service tier** selector in the model picker.
+The listed identifiers, names, and descriptions come from the harness. **Native default** inherits
+the native thread's configured tier; selecting **Standard** or another listed tier explicitly
+applies that choice to subsequent Giskard turns. Selections persist with the thread and each turn,
+survive reloads, and reset when picking another model. Unsupported or oversized tier identifiers
+are rejected before starting work. The picker also shows reported input modalities, multi-agent
+version, and model default tier; these describe capabilities and do not enable native features.
 
 When a harness reports the effective context window used for a turn, that runtime value replaces
 the initial descriptor value and is retained per `(provider, model)` across reloads and model
@@ -571,3 +592,45 @@ with `cargo deny check`.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Questions during ongoing work
+
+Giskard displays Codex asynchronous questions with suggested choices and a free-text answer. Submit
+explicitly to send an answer; the agent can keep working while you decide. Supported harnesses also
+accept text from the composer during a running turn. A rejected message keeps its draft; uncertain
+delivery is shown rather than automatically retried. See [Astra interactions](docs/astra-interactions.md)
+for the protocol contract and current native capability coverage, and the
+[steering protocol](docs/api-endpoints.md#steering-an-active-turn) for client integration.
+
+Goals and queued messages are available from the thread's goal/queue controls when the harness
+supports them. Goal objectives, status, token budgets and usage stay with the native thread.
+Queued text can be edited, reordered, removed, or started explicitly; agent-owned threads expose
+read-only state. Controls refresh on reconnect and native changes. See the
+[HTTP/WS inventory](docs/api-endpoints.md#goals-and-queue) for the API and delivery semantics.
+### Client-executed tools
+
+Configure `[[harness.dynamic_tools]]` namespaces and `[[harness.dynamic_tools.tools]]` executors
+in `config.toml` to provide native client tools. The commented example in `config.example.toml`
+lists every field. Each executor requires an absolute `command`, fixed `args`, an explicit
+absolute `cwd`, a description and a JSON `input_schema`. `timeout_ms` defaults to 30000.
+Configuration applies to projects using this server; restart to reload it, and start a new
+thread to advertise changed definitions (native resumed threads retain their saved definitions).
+
+Executors receive one native invocation JSON object on stdin and return a typed
+`{"success":true,"contentItems":[{"type":"inputText","text":"Result"}]}` JSON object on stdout.
+Image and audio content are supported too. Calls run automatically only for explicitly configured
+namespace/tool pairs. Unknown tools fail visibly. The server caps concurrency at 16 and each input
+or output stream at 1 MiB; timeouts and thread interruption cancel the process.
+
+Configured tools run as the server OS user with its environment, outside Codex's sandbox and
+approval policy, in their configured executor directory. Only install trusted programs. See the
+[adapter contract](crates/giskard-harness-codex/README.md#client-executed-dynamic-tools) for response
+shapes, cancellation, process cleanup and restart behavior.
+MCP forms, including Codex's `openai/form` extension, support nested fields, typed defaults,
+and optional values. Advanced schemas use a JSON editor; the server validates the complete
+JSON Schema before accepting content. Validation errors preserve the pending form for retry,
+and Decline/Cancel remain available. External schema references are not retrieved.
+
+Goal saves and queue Add/Start capture the selected model, tier, mode and permissions for subsequent
+native work. Selector changes do not alter work already running; save/resume a goal or use Add/Start
+to capture later choices. Settings apply to the thread's subsequent work, not individual queue entries.

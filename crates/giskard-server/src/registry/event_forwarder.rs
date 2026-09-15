@@ -1526,6 +1526,7 @@ impl ThreadEventForwarder {
         hub.publish(thread_id, Outbound::RuntimeEffects(applied))
             .await;
         let reaches_transcript = match &event {
+            AgentEvent::GoalsQueueChanged { .. } => true,
             AgentEvent::Error { error, .. } => {
                 warn!(
                     %project_id,
@@ -2324,6 +2325,7 @@ mod tests {
             TurnIntent::StartTurn {
                 input: context.user_input.clone(),
                 overrides: giskard_core::turn::TurnOverrides {
+                    context_window: None,
                     model: None,
                     mode: Mode::Build,
                     permission_preset: PermissionPreset::AskFirst,
@@ -2366,7 +2368,6 @@ mod tests {
             LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, format!("native-{thread_id}")),
-                turn_steering: false,
                 native_model: None,
             },
             classification,
@@ -2966,6 +2967,7 @@ mod tests {
             id: item_id,
             harness_item_id: "native_first".into(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "first".into(),
             },
             created_at: Utc::now(),
@@ -2978,6 +2980,7 @@ mod tests {
             id: item_id,
             harness_item_id: "native_second".into(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "second".into(),
             },
             created_at: Utc::now(),
@@ -2995,6 +2998,7 @@ mod tests {
             id: item_id,
             harness_item_id: "stale_item".into(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "recovered".into(),
             },
             created_at: Utc::now(),
@@ -3013,6 +3017,7 @@ mod tests {
             id: first_id,
             harness_item_id: "first".into(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "first".into(),
             },
             created_at: Utc::now(),
@@ -3021,12 +3026,14 @@ mod tests {
             id: second_id,
             harness_item_id: "second".into(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "second".into(),
             },
             created_at: Utc::now(),
         };
         let replacement = Item {
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "updated second".into(),
             },
             ..second.clone()
@@ -3050,12 +3057,14 @@ mod tests {
             id: item_id,
             harness_item_id: String::new(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "partial".into(),
             },
             created_at: Utc::now(),
         };
         let completed = Item {
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: "complete".into(),
             },
             ..first.clone()
@@ -3104,6 +3113,7 @@ mod tests {
                 id: original_item,
                 harness_item_id: "cmd_1".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "same identity".into(),
                 },
                 created_at: Utc::now(),
@@ -3118,6 +3128,7 @@ mod tests {
                 id: conflicting_item,
                 harness_item_id: "cmd_1".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "different identity".into(),
                 },
                 created_at: Utc::now(),
@@ -3139,6 +3150,7 @@ mod tests {
             provider: "openai".into(),
             model: "historical-model".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -3161,6 +3173,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -3270,6 +3283,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.6-sol".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -3292,6 +3306,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -3334,6 +3349,7 @@ mod tests {
                 provider: model.provider.clone(),
                 model: "gpt-5.6-pro".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             context_window: Some(400_000),
         }));
@@ -3388,6 +3404,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.6-sol".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -3410,6 +3427,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -3762,6 +3780,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -3784,6 +3803,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -3904,6 +3924,7 @@ mod tests {
             provider: "openai".into(),
             model: "initial".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -3926,6 +3947,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(initial_model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -3951,7 +3973,6 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, "native-orphan".into()),
-                turn_steering: false,
                 native_model: Some(initial_model),
             },
             super::ClassificationPhase::Orphan,
@@ -4049,6 +4070,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4071,6 +4093,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -4247,6 +4270,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4269,6 +4293,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -4324,6 +4349,7 @@ mod tests {
                 id: ItemId::new(),
                 harness_item_id: "agent_partial".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "partial answer".into(),
                 },
                 created_at: Utc::now(),
@@ -4416,6 +4442,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4438,6 +4465,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -4543,6 +4571,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4565,6 +4594,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -4698,6 +4728,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4720,6 +4751,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -4791,6 +4823,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4813,6 +4846,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -4942,6 +4976,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -4964,6 +4999,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -5243,6 +5279,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -5265,6 +5302,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -5385,6 +5423,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -5407,6 +5446,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -5627,6 +5667,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -5649,6 +5690,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -5714,7 +5756,6 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id,
                 handle: native_handle.clone(),
-                turn_steering: false,
                 native_model: Some(model),
             },
             super::ClassificationPhase::Primary,
@@ -5734,6 +5775,7 @@ mod tests {
                 .send(TurnIntent::StartTurn {
                     input: ctx.user_input.clone(),
                     overrides: giskard_core::turn::TurnOverrides {
+                        context_window: None,
                         model: None,
                         mode: Mode::Build,
                         permission_preset: PermissionPreset::AskFirst,
@@ -5783,11 +5825,11 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id,
                 handle: native_handle,
-                turn_steering: false,
                 native_model: Some(ModelRef {
                     provider: "openai".into(),
                     model: "test".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
             },
             classification,
@@ -5857,7 +5899,10 @@ mod tests {
                 item: Item {
                     id: ItemId::new(),
                     harness_item_id: format!("user_{input}"),
-                    payload: ItemPayload::UserMessage { text: input.into() },
+                    payload: ItemPayload::UserMessage {
+                        client_id: None,
+                        text: input.into(),
+                    },
                     created_at: now,
                 },
             },
@@ -5868,6 +5913,7 @@ mod tests {
                     id: ItemId::new(),
                     harness_item_id: format!("agent_{output}"),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: output.into(),
                     },
                     created_at: now,
@@ -5895,6 +5941,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -5917,6 +5964,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -5947,6 +5995,7 @@ mod tests {
                         id: first_item_id,
                         harness_item_id: reused_harness.clone(),
                         payload: ItemPayload::AgentMessage {
+                            questions: vec![],
                             text: "first answer".into(),
                         },
                         created_at: now,
@@ -5999,6 +6048,7 @@ mod tests {
                 id: second_item_id,
                 harness_item_id: reused_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "first version in second turn".into(),
                 },
                 created_at: now,
@@ -6011,6 +6061,7 @@ mod tests {
                 id: second_item_id,
                 harness_item_id: reused_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "second version in second turn".into(),
                 },
                 created_at: now,
@@ -6023,6 +6074,7 @@ mod tests {
                 id: conflicting_item_id,
                 harness_item_id: reused_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "conflicting identity".into(),
                 },
                 created_at: now,
@@ -6053,7 +6105,7 @@ mod tests {
         assert!(
             matches!(
                 &saved[1].items[0].payload,
-                ItemPayload::AgentMessage { text } if text == "second version in second turn"
+                ItemPayload::AgentMessage { text, .. } if text == "second version in second turn"
             ),
             "upsert should keep the latest occurrence within the turn"
         );
@@ -6083,6 +6135,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -6105,6 +6158,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -6133,6 +6187,7 @@ mod tests {
                         id: first_item_id,
                         harness_item_id: reused_harness.clone(),
                         payload: ItemPayload::AgentMessage {
+                            questions: vec![],
                             text: "first answer".into(),
                         },
                         created_at: now,
@@ -6202,6 +6257,7 @@ mod tests {
                 id: second_item_id,
                 harness_item_id: reused_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "second answer".into(),
                 },
                 created_at: now,
@@ -6281,6 +6337,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -6303,6 +6360,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -6375,6 +6433,7 @@ mod tests {
                 id: item_id,
                 harness_item_id: harness.into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "final".into(),
                 },
                 created_at: now,
@@ -6431,6 +6490,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         store
             .create_project(project_id, "proj", "/tmp/test")
@@ -6453,6 +6513,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
+                    context_window_override: None,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
@@ -6493,6 +6554,7 @@ mod tests {
                 id: ItemId::new(),
                 harness_item_id: harness_item_id.to_owned(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: harness_item_id.to_owned(),
                 },
                 created_at: Utc::now(),
@@ -6669,6 +6731,7 @@ mod tests {
                 id: conflicting_item,
                 harness_item_id: "cmd_1".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "different identity".into(),
                 },
                 created_at: Utc::now(),
@@ -6720,6 +6783,7 @@ mod tests {
                 id: ItemId::new(),
                 harness_item_id: "cmd_late".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "late".into(),
                 },
                 created_at: Utc::now(),

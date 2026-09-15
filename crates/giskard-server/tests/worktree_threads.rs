@@ -256,7 +256,10 @@ impl Script for RecordingScript {
                 item: Item {
                     id: ItemId::new(),
                     harness_item_id: format!("say_{}", call.turn),
-                    payload: ItemPayload::AgentMessage { text },
+                    payload: ItemPayload::AgentMessage {
+                        text,
+                        questions: vec![],
+                    },
                     created_at: chrono::Utc::now(),
                 },
             });

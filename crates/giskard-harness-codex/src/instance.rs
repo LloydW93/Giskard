@@ -2,12 +2,17 @@ use super::*;
 use crate::native_routes::UnknownNativeThread;
 use crate::uploads::{cleanup_active_turn_upload, cleanup_all_active_turn_uploads};
 
+#[path = "current_time.rs"]
+mod current_time;
+#[path = "dynamic_tool_runtime.rs"]
+mod dynamic_tool_runtime;
+
 /// One task-owned runtime for one Codex app-server process.
 ///
 /// Exactly one instance is created for each spawned transport and moved into exactly one Tokio
-/// task. Its mapper, active turns, pending steering requests, pending compactions, and pending
-/// context restores never leave that task; helper futures may borrow this state only through
-/// `&mut self`. No independent worker may mutate protocol state.
+/// task. Its mapper, active turns, pending compactions, and pending context restores never leave
+/// that task; helper futures may borrow this state only through `&mut self`. No independent worker
+/// may mutate protocol state.
 ///
 /// This runtime serves every native thread on the process and is unrelated to a primary-thread or
 /// sub-agent hierarchy.
@@ -20,13 +25,19 @@ pub(super) struct CodexInstance<C> {
     workspace_root: PathBuf,
     writable_roots: Vec<PathBuf>,
     mapper: CodexMapper,
+    dynamic_tools: dynamic_tools::Registry,
+    dynamic_calls: dynamic_tool_runtime::Calls,
     active_turns: ActiveTurns,
-    pending_steers: Vec<PendingSteer>,
     pending_compactions: HashMap<ThreadId, PendingCompaction>,
     pending_context_restores: HashMap<NativeThreadId, PendingContextRestore>,
 }
 
 impl<C> CodexInstance<C> {
+    pub(super) fn with_dynamic_tools(mut self, registry: dynamic_tools::Registry) -> Self {
+        self.dynamic_tools = registry;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         client: C,
@@ -48,8 +59,9 @@ impl<C> CodexInstance<C> {
             workspace_root,
             writable_roots,
             mapper,
+            dynamic_tools: dynamic_tools::Registry::default(),
+            dynamic_calls: dynamic_tool_runtime::Calls::default(),
             active_turns: HashMap::new(),
-            pending_steers: Vec::new(),
             pending_compactions: HashMap::new(),
             pending_context_restores: HashMap::new(),
         };
@@ -114,13 +126,17 @@ where
             tokio::select! {
                 biased;
                 _ = wait_for_shutdown_request(&mut self.receivers.shutdown) => {
-                    self.fail_pending_steers("Codex harness shut down before turn steering completed");
+                    self.dynamic_calls.abort_all("harness shutdown");
+                    self.dynamic_calls.tasks.shutdown().await;
                     cleanup_all_active_turn_uploads(&mut self.client, &mut self.active_turns).await;
                     shutdown_codex_transport(self.client, &self.workspace_root).await;
                     self.worker_queue.close();
                     self.discoveries.close();
                     self.receivers.done.send_replace(true);
                     return;
+                }
+                completion = self.dynamic_calls.tasks.join_next(), if !self.dynamic_calls.tasks.is_empty() => {
+                    self.finish_dynamic_call(completion).await;
                 }
                 msg = self.client.next_message() => {
                     match msg {
@@ -209,10 +225,6 @@ where
                         }
                     }
                 }
-                completed = poll_pending_steer(&mut self.pending_steers), if !self.pending_steers.is_empty() => {
-                    let (index, result) = completed;
-                    self.finish_pending_steer(index, result);
-                }
                 queued = self.receivers.commands.recv() => {
                     let queued = match queued {
                         Some(queued) => queued,
@@ -233,16 +245,16 @@ where
                     };
                     self.worker_queue.mark_started(queued.token);
                     let token = queued.token;
-                    if self.handle_control_command(queued.command, token).await {
-                        self.worker_queue.mark_finished(token);
-                    }
+                    self.handle_control_command(queued.command).await;
+                    self.worker_queue.mark_finished(token);
                 }
                 _ = first_event_warn_tick.tick(), if !self.active_turns.is_empty() => {
                     warn_slow_first_events(&mut self.active_turns);
                 }
             }
         }
-        self.fail_pending_steers("Codex worker stopped before turn steering completed");
+        self.dynamic_calls.abort_all("Codex stream ended");
+        self.dynamic_calls.tasks.shutdown().await;
         self.worker_queue.close();
         self.discoveries.close();
         self.receivers.done.send_replace(true);
@@ -286,6 +298,13 @@ where
                 overrides,
                 response,
             } => {
+                if let Err(error) =
+                    context_policy::ensure(&mut self.client, &mut self.mapper, &thread, &overrides)
+                        .await
+                {
+                    let _ = response.send(Err(error));
+                    return;
+                }
                 match handle_start_turn(
                     &mut self.client,
                     &mut self.mapper,
@@ -333,6 +352,7 @@ where
                 resume_id,
                 &cwd,
                 &opts.initial_model,
+                opts.context_window,
             )
             .await
             {
@@ -350,13 +370,29 @@ where
                         opts.project,
                     )
                     .with_thread_id(thread_id);
-                    start_thread(&mut self.client, context, &cwd, &opts.initial_model).await?
+                    start_thread(
+                        &mut self.client,
+                        context,
+                        &cwd,
+                        &opts.initial_model,
+                        self.dynamic_tools.specs(),
+                        opts.context_window,
+                    )
+                    .await?
                 }
             }
         } else {
             let context = CodexOperationContext::for_project("thread_start", opts.project)
                 .with_thread_id(thread_id);
-            start_thread(&mut self.client, context, &cwd, &opts.initial_model).await?
+            start_thread(
+                &mut self.client,
+                context,
+                &cwd,
+                &opts.initial_model,
+                self.dynamic_tools.specs(),
+                opts.context_window,
+            )
+            .await?
         };
 
         // B4: bind the (possibly re-established) native id to the durable ThreadId. A failed
@@ -370,6 +406,20 @@ where
         } else {
             self.claim_thread_route(opened.harness_thread_id.clone(), thread_id)?;
         }
+
+        let context_handle = ThreadHandle::opened(
+            thread_id,
+            opened.harness_thread_id.clone(),
+            opts.workspace_root.clone(),
+        );
+        self.mapper.set_context_window(
+            &context_handle,
+            if opts.resume.is_none() || resume_warning.is_some() {
+                opts.context_window
+            } else {
+                None
+            },
+        )?;
 
         let _ = broadcast_event(&self.senders, thread_id, || AgentEvent::ThreadOpened {
             thread: thread_id,
@@ -506,6 +556,14 @@ where
                             })
                             .flatten()
                     });
+                    if matches!(&event, AgentEvent::TurnCompleted { .. }) {
+                        self.cancel_dynamic_calls(
+                            thread,
+                            event.turn(),
+                            "originating turn completed",
+                        )
+                        .await;
+                    }
                     let _ = broadcast_event(&self.senders, thread, || event).await;
                     if let Some(turn) = completed_active_turn {
                         cleanup_active_turn_upload(
@@ -525,6 +583,8 @@ where
                     } else if let Some((turn, message)) = fatal_completion
                         && emit_fatal_turn_completion(&self.senders, thread, turn, message).await
                     {
+                        self.cancel_dynamic_calls(thread, turn, "fatal turn error")
+                            .await;
                         cleanup_active_turn_upload(
                             &mut self.client,
                             &mut self.active_turns,
@@ -557,6 +617,22 @@ where
                 MessageOutcome::Handled
             }
             codex_codes::ServerMessage::Request { id, request } => {
+                // Service requests are answered by the instance, without registering a browser
+                // action or inventing a thread/turn solely to read the clock.
+                match current_time::respond(&mut self.client, &id, &request).await {
+                    Ok(true) => return MessageOutcome::Handled,
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(action = "respond_current_time", method = request.method(),
+                            request_id = ?id,
+                            harness_thread_id = ?server_request_native_scope(&request).0,
+                            error = %error, "failed to send Codex current-time response");
+                        return MessageOutcome::Handled;
+                    }
+                }
+                if self.dynamic_call_is_duplicate(&id, &request).await {
+                    return MessageOutcome::Handled;
+                }
                 let Some(event) = self
                     .map_or_discover(
                         |mapper| mapper.try_map_server_request(&id, &request, fallback_thread),
@@ -571,6 +647,9 @@ where
                 if let Some(active) = self.active_turns.get_mut(&thread) {
                     active.mark_server_message();
                 }
+                if self.begin_dynamic_call(&request, &event).await {
+                    return MessageOutcome::Handled;
+                }
                 let _ = broadcast_event(&self.senders, thread, || event).await;
                 MessageOutcome::Handled
             }
@@ -582,68 +661,7 @@ impl<C> CodexInstance<C>
 where
     C: CodexTransport,
 {
-    fn finish_pending_steer(&mut self, index: usize, result: Result<(), HarnessError>) {
-        let pending = self.pending_steers.swap_remove(index);
-        match &result {
-            Ok(()) => debug!(
-                thread_id = %pending.thread.thread,
-                harness_thread_id = %pending.thread.harness_thread_id,
-                turn_id = %pending.expected_turn,
-                native_turn_id = %pending.native_turn_id,
-                elapsed_ms = pending.started_at.elapsed().as_millis(),
-                "Codex accepted turn steering input"
-            ),
-            Err(HarnessError::Timeout(_)) => warn!(
-                action = "steer_turn",
-                method = codex_codes::protocol::methods::TURN_STEER,
-                thread_id = %pending.thread.thread,
-                harness_thread_id = %pending.thread.harness_thread_id,
-                turn_id = %pending.expected_turn,
-                native_turn_id = %pending.native_turn_id,
-                elapsed_ms = pending.started_at.elapsed().as_millis(),
-                timeout_ms = CODEX_JSON_RPC_TIMEOUT.as_millis(),
-                "Codex turn steering request timed out; worker continued processing controls"
-            ),
-            Err(error) => warn!(
-                action = "steer_turn",
-                method = codex_codes::protocol::methods::TURN_STEER,
-                thread_id = %pending.thread.thread,
-                harness_thread_id = %pending.thread.harness_thread_id,
-                turn_id = %pending.expected_turn,
-                native_turn_id = %pending.native_turn_id,
-                error = %error,
-                elapsed_ms = pending.started_at.elapsed().as_millis(),
-                "Codex turn steering request failed"
-            ),
-        }
-        let _ = pending.response.send(result);
-        self.worker_queue.mark_finished(pending.token);
-    }
-
-    fn fail_pending_steers(&mut self, message: &str) {
-        for pending in self.pending_steers.drain(..) {
-            warn!(
-                action = "steer_turn",
-                thread_id = %pending.thread.thread,
-                harness_thread_id = %pending.thread.harness_thread_id,
-                turn_id = %pending.expected_turn,
-                native_turn_id = %pending.native_turn_id,
-                error = message,
-                elapsed_ms = pending.started_at.elapsed().as_millis(),
-                "abandoning pending Codex turn steering request"
-            );
-            let _ = pending
-                .response
-                .send(Err(HarnessError::Transport(message.to_owned())));
-            self.worker_queue.mark_finished(pending.token);
-        }
-    }
-
-    async fn handle_control_command(
-        &mut self,
-        control: ControlCommand,
-        token: WorkerQueueToken,
-    ) -> bool {
+    async fn handle_control_command(&mut self, control: ControlCommand) {
         match control {
             ControlCommand::ClaimNativeThread {
                 thread,
@@ -685,6 +703,12 @@ where
                 response_payload,
                 response,
             } => {
+                if self.dynamic_calls.owns(&id) {
+                    let _ = response.send(Err(HarnessError::Protocol(
+                        "client executor owns this dynamic tool response".into(),
+                    )));
+                    return;
+                }
                 let result = handle_respond_server_request(
                     &mut self.client,
                     &mut self.mapper,
@@ -693,6 +717,98 @@ where
                     response_payload,
                 )
                 .await;
+                let _ = response.send(result);
+            }
+            ControlCommand::GoalsQueue {
+                thread,
+                command,
+                settings,
+                response,
+            } => {
+                let guard = if !command.is_read() && !self.mapper.has_thread_route(&thread) {
+                    Err(HarnessError::Protocol(
+                        "Thread binding changed; reopen before changing its goal or queue".into(),
+                    ))
+                } else if matches!(
+                    command,
+                    giskard_core::goals_queue::GoalsQueueCommand::Start { .. }
+                ) && self
+                    .mapper
+                    .active_giskard_turn_for_thread(thread.thread)
+                    .is_some()
+                {
+                    Err(HarnessError::ThreadBusy {
+                        thread: thread.thread,
+                    })
+                } else {
+                    Ok(())
+                };
+                // Stopping autonomous work must remain possible while its pending context
+                // preference cannot yet be applied. Keep ordinary launch settings handling;
+                // only defer the context reload for explicitly inactive goal statuses.
+                let stops_goal = matches!(
+                    &command,
+                    giskard_core::goals_queue::GoalsQueueCommand::SetGoal { status: Some(status), .. }
+                        if *status != giskard_core::goals_queue::GoalStatus::Active
+                );
+                let guard = match guard {
+                    Ok(()) if command.requires_settings() && !stops_goal => match settings.as_ref()
+                    {
+                        Some(settings) => {
+                            context_policy::ensure(
+                                &mut self.client,
+                                &mut self.mapper,
+                                &thread,
+                                settings,
+                            )
+                            .await
+                        }
+                        None => Ok(()),
+                    },
+                    other => other,
+                };
+                let result = if let Err(error) = guard {
+                    Err(error)
+                } else {
+                    timeout_codex_control(
+                        "goals_queue",
+                        Some(&thread),
+                        None,
+                        None,
+                        super::goals_queue::execute(&mut self.client, &thread, command, settings),
+                    )
+                    .await
+                };
+                if let Err(error) = &result {
+                    warn!(thread_id = %thread.thread, %error, "Codex goals/queue control failed");
+                }
+                let _ = response.send(result);
+            }
+            ControlCommand::SteerTurn {
+                thread,
+                expected_turn,
+                input,
+                client_message_id,
+                response,
+            } => {
+                let result = timeout_codex_control(
+                    "steer_turn",
+                    Some(&thread),
+                    None,
+                    None,
+                    handle_steer_turn(
+                        &mut self.client,
+                        &self.mapper,
+                        &thread,
+                        expected_turn,
+                        input,
+                        client_message_id,
+                    ),
+                )
+                .await;
+                if let Err(error) = &result {
+                    warn!(thread_id = %thread.thread, turn_id = %expected_turn, %error, "Codex steering failed");
+                }
                 let _ = response.send(result);
             }
             ControlCommand::Interrupt { thread, response } => {
@@ -709,77 +825,18 @@ where
                 )
                 .await;
                 if result.is_ok() {
+                    self.cancel_dynamic_calls(thread.thread, None, "thread interrupted")
+                        .await;
                     reject_pending_requests_for_interrupted_thread(
                         &mut self.client,
                         &mut self.mapper,
                         &self.senders,
                         thread.thread,
+                        &self.dynamic_calls.undelivered_ids(),
                     )
                     .await;
                 }
                 let _ = response.send(result);
-            }
-            ControlCommand::SteerTurn {
-                thread,
-                expected_turn,
-                text,
-                response,
-            } => {
-                let active = match self.active_turns.get(&thread.thread) {
-                    Some(active) => active,
-                    None => {
-                        let _ = response.send(Err(HarnessError::Protocol(format!(
-                            "cannot steer turn {expected_turn}: thread {} has no active turn",
-                            thread.thread
-                        ))));
-                        return true;
-                    }
-                };
-                if active.acknowledged_turn != expected_turn {
-                    let _ = response.send(Err(HarnessError::Protocol(format!(
-                        "cannot steer stale turn {expected_turn}: active turn for thread {} is {}",
-                        thread.thread, active.acknowledged_turn
-                    ))));
-                    return true;
-                }
-                let Some(native_turn_id) = self
-                    .mapper
-                    .active_native_turn_for_thread(thread.thread)
-                    .map(str::to_owned)
-                else {
-                    let _ = response.send(Err(HarnessError::Protocol(format!(
-                            "cannot steer turn {expected_turn}: Codex has no active native turn for thread {}",
-                            thread.thread
-                        ))));
-                    return true;
-                };
-                let request =
-                    match start_steer_request(&mut self.client, &thread, &native_turn_id, &text) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            warn!(
-                                action = "steer_turn",
-                                thread_id = %thread.thread,
-                                harness_thread_id = %thread.harness_thread_id,
-                                turn_id = %expected_turn,
-                                native_turn_id,
-                                error = %error,
-                                "could not start Codex turn steering request"
-                            );
-                            let _ = response.send(Err(error));
-                            return true;
-                        }
-                    };
-                self.pending_steers.push(PendingSteer {
-                    token,
-                    response,
-                    thread,
-                    expected_turn,
-                    native_turn_id,
-                    started_at: Instant::now(),
-                    request,
-                });
-                return false;
             }
             ControlCommand::TerminateCommand {
                 thread,
@@ -806,7 +863,7 @@ where
                     let _ = response.send(Err(HarnessError::Unsupported(
                         "context compaction is not available during an active turn".into(),
                     )));
-                    return true;
+                    return;
                 }
                 let started = Instant::now();
                 info!(
@@ -861,6 +918,9 @@ where
                 } else {
                     handle_set_thread_archived(&mut self.client, &thread, archived).await
                 };
+                if result.is_ok() && self.mapper.has_thread_route(&thread) {
+                    let _ = self.mapper.set_context_window(&thread, None);
+                }
                 let _ = response.send(result);
             }
             ControlCommand::DeleteThread { thread, response } => {
@@ -872,6 +932,8 @@ where
                     handle_delete_thread(&mut self.client, &thread).await
                 };
                 if result.is_ok() {
+                    self.cancel_dynamic_calls(thread.thread, None, "thread deleted")
+                        .await;
                     if let Some(log) = lock_senders(&self.senders).remove(&thread.thread) {
                         log.close();
                     }
@@ -936,6 +998,5 @@ where
                 let _ = response.send(result);
             }
         }
-        true
     }
 }

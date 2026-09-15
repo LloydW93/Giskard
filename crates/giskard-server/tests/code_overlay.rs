@@ -80,8 +80,10 @@ fn thread_file(pid: ProjectId, tid: ThreadId) -> giskard_persist::store::ThreadF
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         }),
         context_window: 1,
+        context_window_override: None,
         model_context_windows: std::collections::HashMap::new(),
         permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
         model_efforts: std::collections::HashMap::new(),
@@ -121,6 +123,7 @@ fn command_turn(output: &str, status: Option<&str>) -> (Turn, ItemId) {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             mode: giskard_core::turn::TurnMode::Known(Mode::Build),
             status: TurnStatus {
@@ -648,6 +651,7 @@ async fn command_output_links_rejects_unreadable_items_and_uses_thread_workspace
         id: wrong_kind,
         harness_item_id: "message".into(),
         payload: ItemPayload::AgentMessage {
+            questions: vec![],
             text: "isolated.rs:1".into(),
         },
         created_at: Utc::now(),

@@ -15,6 +15,7 @@ fn test_model() -> ModelRef {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     }
 }
 
@@ -39,6 +40,7 @@ fn test_thread(
         mode: giskard_core::turn::TurnMode::Known(mode),
         current_model: giskard_core::turn::TurnModel::Known(test_model()),
         context_window: 262_144,
+        context_window_override: None,
         model_context_windows: Default::default(),
         permission_preset: PermissionPreset::AskFirst,
         model_efforts: HashMap::new(),

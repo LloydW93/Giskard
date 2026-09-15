@@ -413,7 +413,6 @@ mod tests {
             LoadedThreadBinding {
                 project_id: ProjectId::new(),
                 handle: ThreadHandle::detached(thread_id, native_id.into()),
-                turn_steering: false,
                 native_model: None,
             },
             ClassificationPhase::Primary,

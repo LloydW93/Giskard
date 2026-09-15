@@ -29,6 +29,7 @@ pub fn fake_native_model() -> ModelRef {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     }
 }
 
@@ -56,6 +57,7 @@ pub async fn persist_primary_thread(
                 mode: TurnMode::Known(Mode::Build),
                 current_model: TurnModel::Known(model),
                 context_window: 0,
+                context_window_override: None,
                 model_context_windows: HashMap::new(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: HashMap::new(),
@@ -100,6 +102,7 @@ pub fn completed_turn_fixture() -> ReplayFixture {
                 id: item,
                 harness_item_id: "it_1".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "done".into(),
                 },
                 created_at: now,
@@ -126,6 +129,7 @@ pub fn completed_turn(text: &str, model: ModelRef) -> Turn {
             id: ItemId::new(),
             harness_item_id: String::new(),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: text.to_string(),
             },
             created_at: now,
@@ -163,6 +167,7 @@ pub fn orphaned_thread(
         mode: TurnMode::Known(Mode::Build),
         current_model: TurnModel::Known(model),
         context_window: 131_072,
+        context_window_override: None,
         model_context_windows: Default::default(),
         permission_preset: PermissionPreset::AskFirst,
         model_efforts: HashMap::new(),

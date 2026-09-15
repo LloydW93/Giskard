@@ -7,10 +7,15 @@
 //! See the crate README for Codex-native identifier scopes, item and process
 //! lifecycles, background-command ownership, and termination routing.
 
+mod context_policy;
+mod dynamic_tools;
+mod goals_queue;
 mod instance;
 mod log_fields;
 mod mapping;
 mod native_ids;
+mod native_services;
+pub use native_services::NativeServiceProviders;
 mod native_routes;
 mod queue;
 mod rpc;
@@ -26,9 +31,7 @@ use transport::StdioTransport;
 use uploads::{cleanup_codex_upload_dir, prepare_user_input_for_codex_uploads};
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -174,21 +177,6 @@ struct QueuedControlCommand {
     command: ControlCommand,
 }
 
-type CodexRequestFuture =
-    Pin<Box<dyn Future<Output = Result<Value, HarnessError>> + Send + 'static>>;
-
-type PendingSteerFuture = Pin<Box<dyn Future<Output = Result<(), HarnessError>> + Send + 'static>>;
-
-struct PendingSteer {
-    token: WorkerQueueToken,
-    response: oneshot::Sender<Result<(), HarnessError>>,
-    thread: ThreadHandle,
-    expected_turn: TurnId,
-    native_turn_id: String,
-    started_at: Instant,
-    request: PendingSteerFuture,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThreadBackgroundTerminalsTerminateParams {
@@ -216,6 +204,20 @@ enum HarnessCommand {
 }
 
 enum ControlCommand {
+    GoalsQueue {
+        thread: ThreadHandle,
+        command: giskard_core::goals_queue::GoalsQueueCommand,
+        settings: Option<TurnOverrides>,
+        response:
+            oneshot::Sender<Result<giskard_core::goals_queue::GoalsQueueSnapshot, HarnessError>>,
+    },
+    SteerTurn {
+        thread: ThreadHandle,
+        expected_turn: TurnId,
+        input: UserInput,
+        client_message_id: Option<String>,
+        response: oneshot::Sender<Result<(), HarnessError>>,
+    },
     ClaimNativeThread {
         thread: ThreadId,
         harness_thread_id: String,
@@ -234,12 +236,6 @@ enum ControlCommand {
     },
     Interrupt {
         thread: ThreadHandle,
-        response: oneshot::Sender<Result<(), HarnessError>>,
-    },
-    SteerTurn {
-        thread: ThreadHandle,
-        expected_turn: TurnId,
-        text: String,
         response: oneshot::Sender<Result<(), HarnessError>>,
     },
     TerminateCommand {
@@ -410,16 +406,11 @@ impl<'a> CodexOperationContext<'a> {
 
 #[async_trait]
 trait CodexTransport: Send {
-    fn start_request_json(&mut self, method: &str, params: serde_json::Value)
-    -> CodexRequestFuture;
-
     async fn request_json(
         &mut self,
         method: &str,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, HarnessError> {
-        self.start_request_json(method, params).await
-    }
+    ) -> Result<serde_json::Value, HarnessError>;
 
     async fn next_message(
         &mut self,
@@ -477,16 +468,58 @@ impl CodexHarness {
         workspace_root: PathBuf,
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<Self>, HarnessError> {
+        Self::start_with_service_providers(
+            workspace_root,
+            bootstrap,
+            NativeServiceProviders::default(),
+        )
+        .await
+    }
+
+    pub async fn start_with_service_providers(
+        workspace_root: PathBuf,
+        bootstrap: HarnessBootstrap,
+        providers: NativeServiceProviders,
+    ) -> Result<Arc<Self>, HarnessError> {
+        Self::start_with_configuration(workspace_root, bootstrap, Vec::new(), providers).await
+    }
+
+    pub async fn start_with_dynamic_tools(
+        workspace_root: PathBuf,
+        bootstrap: HarnessBootstrap,
+        tools: Vec<giskard_core::dynamic_tool_config::DynamicToolNamespaceConfig>,
+    ) -> Result<Arc<Self>, HarnessError> {
+        Self::start_with_configuration(
+            workspace_root,
+            bootstrap,
+            tools,
+            NativeServiceProviders::default(),
+        )
+        .await
+    }
+
+    /// Validate all configured host integrations before starting the native process.
+    pub async fn start_with_configuration(
+        workspace_root: PathBuf,
+        bootstrap: HarnessBootstrap,
+        tools: Vec<giskard_core::dynamic_tool_config::DynamicToolNamespaceConfig>,
+        providers: NativeServiceProviders,
+    ) -> Result<Arc<Self>, HarnessError> {
+        providers.validate()?;
+        let registry =
+            dynamic_tools::Registry::from_config(tools).map_err(HarnessError::Protocol)?;
         let workspace_root = normalize_workspace_root(workspace_root)?;
         let (mut client, client_version) =
-            start_codex_client(codex_codes::AppServerBuilder::new()).await?;
+            start_codex_client_with_providers(codex_codes::AppServerBuilder::new(), providers)
+                .await?;
         let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
-        Self::spawn_harness(
+        Self::spawn_harness_configured(
             client,
             workspace_root,
             writable_roots,
             client_version,
             bootstrap,
+            registry,
         )
     }
 
@@ -517,6 +550,27 @@ impl CodexHarness {
     where
         C: CodexTransport + 'static,
     {
+        Self::spawn_harness_configured(
+            client,
+            workspace_root,
+            writable_roots,
+            client_version,
+            bootstrap,
+            dynamic_tools::Registry::default(),
+        )
+    }
+
+    fn spawn_harness_configured<C>(
+        client: C,
+        workspace_root: PathBuf,
+        writable_roots: Vec<PathBuf>,
+        client_version: Option<String>,
+        bootstrap: HarnessBootstrap,
+        dynamic_tools: dynamic_tools::Registry,
+    ) -> Result<Arc<Self>, HarnessError>
+    where
+        C: CodexTransport + 'static,
+    {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(64);
         let senders: SenderMap = Arc::new(EventLogs::default());
@@ -539,7 +593,8 @@ impl CodexHarness {
             workspace_root.clone(),
             writable_roots,
             bootstrap,
-        )?;
+        )?
+        .with_dynamic_tools(dynamic_tools);
         let harness = Arc::new(Self {
             workspace_root,
             client_version,
@@ -551,6 +606,8 @@ impl CodexHarness {
             shutdown_tx,
             worker_done,
             capabilities: HarnessCapabilities {
+                context_window_configuration: true,
+                turn_steering: true,
                 live_approvals: true,
                 plan_build_modes: true,
                 per_turn_model: true,
@@ -564,7 +621,6 @@ impl CodexHarness {
                 mcp_reload: true,
                 mcp_oauth_login: true,
                 context_compaction: true,
-                turn_steering: true,
             },
         });
 
@@ -602,7 +658,6 @@ impl CodexHarness {
         let thread_id = match &command {
             ControlCommand::ClaimNativeThread { thread, .. } => Some(*thread),
             ControlCommand::Interrupt { thread, .. }
-            | ControlCommand::SteerTurn { thread, .. }
             | ControlCommand::TerminateCommand { thread, .. }
             | ControlCommand::CompactThread { thread, .. }
             | ControlCommand::SetThreadName { thread, .. }
@@ -640,12 +695,21 @@ fn normalize_workspace_root(workspace_root: PathBuf) -> Result<PathBuf, HarnessE
 async fn start_codex_client(
     builder: codex_codes::AppServerBuilder,
 ) -> Result<(StdioTransport, Option<String>), HarnessError> {
+    start_codex_client_with_providers(builder, NativeServiceProviders::default()).await
+}
+
+async fn start_codex_client_with_providers(
+    builder: codex_codes::AppServerBuilder,
+    providers: NativeServiceProviders,
+) -> Result<(StdioTransport, Option<String>), HarnessError> {
     let mut client = StdioTransport::spawn(builder).await?;
+    client.set_native_services(providers.clone());
+    let initialize = build_initialize_params(&providers);
     let response: codex_codes::InitializeResponse = codex_request(
         &mut client,
         CodexOperationContext::new("initialize"),
         codex_codes::protocol::methods::INITIALIZE,
-        &build_initialize_params(),
+        &initialize,
     )
     .await
     .map_err(|e| HarnessError::Spawn(e.to_string()))?;
@@ -653,6 +717,7 @@ async fn start_codex_client(
         .send_notification(codex_codes::protocol::methods::INITIALIZED)
         .await
         .map_err(|e| HarnessError::Spawn(e.to_string()))?;
+    providers.login(&mut client).await?;
     let version = codex_version_from_user_agent(&response.user_agent);
     match version.as_deref() {
         Some(version) => warn_if_codex_is_newer_than_tested(version),
@@ -738,7 +803,7 @@ fn codex_version_from_user_agent(user_agent: &str) -> Option<String> {
     Some(format!("{major}.{minor}.{patch}"))
 }
 
-fn build_initialize_params() -> codex_codes::InitializeParams {
+fn build_initialize_params(providers: &NativeServiceProviders) -> codex_codes::InitializeParams {
     codex_codes::InitializeParams {
         client_info: codex_codes::ClientInfo {
             name: "giskard".into(),
@@ -747,10 +812,14 @@ fn build_initialize_params() -> codex_codes::InitializeParams {
         },
         capabilities: Some(codex_codes::InitializeCapabilities {
             experimental_api: Some(true),
-            extensions: None,
+            extensions: Some(
+                [("openai/form".to_owned(), serde_json::json!({}))]
+                    .into_iter()
+                    .collect(),
+            ),
             mcp_server_openai_form_elicitation: None,
             opt_out_notification_methods: None,
-            request_attestation: None,
+            request_attestation: (!providers.attestation_command.is_empty()).then_some(true),
         }),
     }
 }
@@ -1077,12 +1146,24 @@ impl AgentHarness for CodexHarness {
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
-    async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+    fn goals_queue_supported(&self) -> bool {
+        true
+    }
+
+    async fn goals_queue(
+        &self,
+        thread: &ThreadHandle,
+        command: giskard_core::goals_queue::GoalsQueueCommand,
+        settings: Option<TurnOverrides>,
+    ) -> Result<giskard_core::goals_queue::GoalsQueueSnapshot, HarnessError> {
+        command.validate().map_err(HarnessError::Protocol)?;
         let (tx, rx) = oneshot::channel();
         self.enqueue_control(
-            "interrupt",
-            ControlCommand::Interrupt {
+            "goals_queue",
+            ControlCommand::GoalsQueue {
                 thread: thread.clone(),
+                command,
+                settings,
                 response: tx,
             },
         )
@@ -1095,7 +1176,8 @@ impl AgentHarness for CodexHarness {
         &self,
         thread: &ThreadHandle,
         expected_turn: TurnId,
-        text: String,
+        input: UserInput,
+        client_message_id: Option<String>,
     ) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
         self.enqueue_control(
@@ -1103,7 +1185,22 @@ impl AgentHarness for CodexHarness {
             ControlCommand::SteerTurn {
                 thread: thread.clone(),
                 expected_turn,
-                text,
+                input,
+                client_message_id,
+                response: tx,
+            },
+        )
+        .await?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
+    async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue_control(
+            "interrupt",
+            ControlCommand::Interrupt {
+                thread: thread.clone(),
                 response: tx,
             },
         )
@@ -1578,6 +1675,7 @@ fn effective_model(
         model: model.to_string(),
         reasoning_effort: reported_effort
             .or_else(|| requested.and_then(|r| r.reasoning_effort.clone())),
+        service_tier: requested.and_then(|r| r.service_tier.clone()),
     })
 }
 
@@ -1587,6 +1685,7 @@ async fn resume_thread(
     resume_id: &str,
     cwd: &str,
     model: &giskard_core::model::ModelRef,
+    context_window: Option<u32>,
 ) -> Result<OpenedNativeThread, HarnessError> {
     let params = codex_codes::ThreadResumeParams {
         thread_id: resume_id.to_owned(),
@@ -1596,6 +1695,11 @@ async fn resume_thread(
         exclude_turns: Some(true),
         ..Default::default()
     };
+    let mut params =
+        serde_json::to_value(params).map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    if let Some(window) = context_window {
+        params["config"] = context_policy::config(window)?;
+    }
     let resp: codex_codes::ThreadResumeResponse = codex_request(
         client,
         context,
@@ -1636,6 +1740,8 @@ async fn start_thread(
     context: CodexOperationContext<'_>,
     cwd: &str,
     initial_model: &giskard_core::model::ModelRef,
+    dynamic_tools: &[Value],
+    context_window: Option<u32>,
 ) -> Result<OpenedNativeThread, HarnessError> {
     let params = codex_codes::ThreadStartParams {
         cwd: Some(cwd.to_owned()),
@@ -1643,6 +1749,14 @@ async fn start_thread(
         model_provider: Some(initial_model.provider.clone()),
         ..Default::default()
     };
+    let mut params =
+        serde_json::to_value(params).map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    if let Some(window) = context_window {
+        params["config"] = context_policy::config(window)?;
+    }
+    if !dynamic_tools.is_empty() {
+        params["dynamicTools"] = Value::Array(dynamic_tools.to_vec());
+    }
     let resp: codex_codes::ThreadStartResponse = codex_request(
         client,
         context,
@@ -1764,6 +1878,11 @@ fn build_turn_start_params(
 
     if let Some(model) = overrides.model.as_ref() {
         map.insert("model".into(), serde_json::json!(model.model));
+        // Per-turn selection avoids changing the native thread tier. Returning to Native
+        // default therefore inherits the native configuration, even after a priority turn.
+        if let Some(tier) = model.service_tier.as_ref() {
+            map.insert("serviceTierForTurn".into(), serde_json::json!(tier));
+        }
         if let Some(effort) = effort.as_ref() {
             map.insert("effort".into(), serde_json::json!(effort));
         }
@@ -2118,6 +2237,7 @@ async fn reject_pending_requests_for_interrupted_thread(
     mapper: &mut CodexMapper,
     senders: &SenderMap,
     thread: ThreadId,
+    owned_dynamic_ids: &[ServerRequestId],
 ) {
     let approval_ids = mapper.pending_approval_ids_for_thread(thread);
     let server_request_ids = mapper.pending_server_request_ids_for_thread(thread);
@@ -2161,6 +2281,9 @@ async fn reject_pending_requests_for_interrupted_thread(
     }
 
     for server_request_id in server_request_ids {
+        if owned_dynamic_ids.contains(&server_request_id) {
+            continue;
+        }
         let response = ServerRequestResponse::Error {
             code: -32000,
             message: "Turn interrupted before this server request was answered.".into(),
@@ -2179,6 +2302,53 @@ async fn reject_pending_requests_for_interrupted_thread(
     }
 }
 
+async fn handle_steer_turn(
+    client: &mut dyn CodexTransport,
+    mapper: &CodexMapper,
+    thread: &ThreadHandle,
+    expected_turn: TurnId,
+    input: UserInput,
+    client_message_id: Option<String>,
+) -> Result<(), HarnessError> {
+    if mapper.active_giskard_turn_for_thread(thread.thread) != Some(expected_turn) {
+        return Err(HarnessError::Protocol(
+            "the expected turn is no longer active; steering was not sent".into(),
+        ));
+    }
+    if !input.attachments().is_empty() {
+        return Err(HarnessError::Unsupported(
+            "turn steering currently accepts text only".into(),
+        ));
+    }
+    let text = input.as_text().unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(HarnessError::Protocol(
+            "steering input must not be empty".into(),
+        ));
+    }
+    let native_turn = mapper
+        .active_native_turn_for_thread(thread.thread)
+        .ok_or_else(|| HarnessError::Protocol("no active turn to steer".into()))?;
+    let response: serde_json::Value = codex_request(
+        client,
+        CodexOperationContext::for_thread("steer_turn", thread).with_native_turn_id(native_turn),
+        "turn/steer",
+        &serde_json::json!({
+            "threadId": thread.harness_thread_id,
+            "expectedTurnId": native_turn,
+            "clientUserMessageId": client_message_id,
+            "input": [{"type": "text", "text": text, "text_elements": []}],
+        }),
+    )
+    .await?;
+    if response.get("turnId").and_then(serde_json::Value::as_str) != Some(native_turn) {
+        return Err(HarnessError::Protocol(
+            "turn/steer acknowledged an unexpected turn".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn handle_interrupt(
     client: &mut dyn CodexTransport,
     mapper: &CodexMapper,
@@ -2193,55 +2363,6 @@ async fn handle_interrupt(
         &thread.harness_thread_id,
         native_turn_id,
     )
-    .await
-}
-
-fn start_steer_request(
-    client: &mut dyn CodexTransport,
-    thread: &ThreadHandle,
-    native_turn_id: &str,
-    text: &str,
-) -> Result<PendingSteerFuture, HarnessError> {
-    let params = codex_codes::TurnSteerParams {
-        thread_id: thread.harness_thread_id.clone(),
-        expected_turn_id: native_turn_id.to_owned(),
-        input: vec![codex_codes::UserInput::Text {
-            text: text.to_owned(),
-            text_elements: None,
-        }],
-        ..Default::default()
-    };
-    let params =
-        serde_json::to_value(params).map_err(|error| HarnessError::Protocol(error.to_string()))?;
-    let request = client.start_request_json(codex_codes::protocol::methods::TURN_STEER, params);
-    let expected_native_turn_id = native_turn_id.to_owned();
-    Ok(Box::pin(async move {
-        let response = tokio::time::timeout(CODEX_JSON_RPC_TIMEOUT, request)
-            .await
-            .map_err(|_| {
-                HarnessError::Timeout("Codex JSON-RPC request turn/steer timed out".into())
-            })??;
-        let response: codex_codes::TurnSteerResponse = serde_json::from_value(response)
-            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
-        if response.turn_id != expected_native_turn_id {
-            return Err(HarnessError::Protocol(format!(
-                "turn/steer response named native turn {:?}, expected {:?}",
-                response.turn_id, expected_native_turn_id
-            )));
-        }
-        Ok(())
-    }))
-}
-
-async fn poll_pending_steer(pending: &mut [PendingSteer]) -> (usize, Result<(), HarnessError>) {
-    std::future::poll_fn(|context| {
-        for (index, pending) in pending.iter_mut().enumerate() {
-            if let std::task::Poll::Ready(result) = pending.request.as_mut().poll(context) {
-                return std::task::Poll::Ready((index, result));
-            }
-        }
-        std::task::Poll::Pending
-    })
     .await
 }
 
@@ -2486,6 +2607,46 @@ async fn default_model_provider(
     Ok(non_empty(config.model_provider).unwrap_or_else(|| CODEX_DEFAULT_PROVIDER.to_string()))
 }
 
+// Keep catalog strings open-ended: newer native modalities and agent versions must not
+// invalidate the whole model list when the generated SDK's enums lag behind.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeModelPage {
+    data: Vec<NativeCatalogModel>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeCatalogModel {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    is_default: bool,
+    default_reasoning_effort: codex_codes::ReasoningEffort,
+    #[serde(default)]
+    supported_reasoning_efforts: Vec<codex_codes::ReasoningEffortOption>,
+    #[serde(default)]
+    service_tiers: Option<Vec<giskard_core::model::ModelServiceTier>>,
+    #[serde(default)]
+    default_service_tier: Option<String>,
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    multi_agent_version: Option<String>,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    max_context_window: Option<u64>,
+}
+
 /// List the models Codex advertises over the app-server `model/list` RPC, mapped to Giskard
 /// [`ModelDescriptor`]s so the picker can show Codex's friendly `display_name` instead of raw
 /// model ids.
@@ -2496,9 +2657,9 @@ async fn default_model_provider(
 /// built-in providers carry no `base_url` to discover against, with nothing in the picker at all.
 ///
 /// So the catalog is attributed to the provider Codex itself routes to, read from the same
-/// `config/read` that supplies the provider table. Codex omits the context window from this RPC,
-/// so descriptors still use the conservative default; these entries size no gauge until the
-/// harness reports a real window at turn time.
+/// `config/read` that supplies the provider table. Current Codex versions include the normal
+/// session window and the largest configurable window. Older versions may omit both, leaving the
+/// conservative default until another catalog source or runtime usage supplies a capacity.
 async fn handle_list_models(
     client: &mut dyn CodexTransport,
     cwd: String,
@@ -2514,7 +2675,7 @@ async fn handle_list_models(
             include_hidden: None,
             limit: None,
         };
-        let page: codex_codes::ModelListResponse = codex_request(
+        let page: NativeModelPage = codex_request(
             client,
             CodexOperationContext::new("list_models"),
             codex_codes::protocol::methods::MODEL_LIST,
@@ -2539,8 +2700,8 @@ async fn handle_list_models(
 
 /// Map a Codex `model/list` entry to a Giskard [`ModelDescriptor`] under `provider`. See
 /// [`handle_list_models`] for where that provider comes from — the entry itself names none — and
-/// why the context window is conservative.
-fn map_model(model: codex_codes::Model, provider: &str) -> ModelDescriptor {
+/// how its context capacity is mapped.
+fn map_model(model: NativeCatalogModel, provider: &str) -> ModelDescriptor {
     // `model` is the wire slug used in a ModelRef; `id` is the preset id. Prefer the slug, but fall
     // back to the id if an older/edge payload leaves it empty.
     let id = if model.model.is_empty() {
@@ -2565,14 +2726,28 @@ fn map_model(model: codex_codes::Model, provider: &str) -> ModelDescriptor {
     if reasoning_efforts.is_empty() && default_reasoning_effort != "none" {
         reasoning_efforts.push(default_reasoning_effort);
     }
+    let context_window = model
+        .context_window
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0);
+    let advertised_context_window = model
+        .max_context_window
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .or(context_window);
     ModelDescriptor {
         provider: provider.to_string(),
         model: id,
-        context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+        context_window: context_window.unwrap_or(ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW),
+        advertised_context_window,
         supports_reasoning_effort: !reasoning_efforts.is_empty(),
         reasoning_efforts,
         display_name,
         is_default: model.is_default,
+        service_tiers: model.service_tiers,
+        default_service_tier: model.default_service_tier,
+        input_modalities: model.input_modalities,
+        multi_agent_version: model.multi_agent_version,
     }
 }
 
@@ -2768,15 +2943,58 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: effort,
+            service_tier: None,
         }
     }
 
     fn turn_overrides(mode: Mode, effort: Option<Effort>) -> TurnOverrides {
         TurnOverrides {
+            context_window: None,
             model: Some(test_model(effort)),
             mode,
             permission_preset: PermissionPreset::AskFirst,
         }
+    }
+
+    #[test]
+    fn catalog_preserves_open_native_capabilities() {
+        let model: NativeCatalogModel = serde_json::from_value(json!({
+            "id": "astra", "model": "gpt-6-astra", "displayName": "Astra",
+            "defaultReasoningEffort": "ultra",
+            "serviceTiers": [{"id":"future-fast","name":"Future Fast","description":"Extra capacity"}],
+            "defaultServiceTier": "future-fast", "inputModalities": ["text", "audio", "future-modality"],
+            "multiAgentVersion": "v99"
+        })).unwrap();
+        let mapped = map_model(model, "openai");
+        assert_eq!(mapped.service_tiers.as_ref().unwrap()[0].id, "future-fast");
+        assert_eq!(mapped.default_service_tier.as_deref(), Some("future-fast"));
+        assert_eq!(
+            mapped.input_modalities.as_ref().unwrap(),
+            &["text", "audio", "future-modality"]
+        );
+        assert_eq!(mapped.multi_agent_version.as_deref(), Some("v99"));
+        let wire = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(wire["service_tiers"][0]["name"], "Future Fast");
+        assert_eq!(wire["input_modalities"][2], "future-modality");
+    }
+
+    #[test]
+    fn service_tier_is_a_per_turn_override_and_native_default_omits_it() {
+        let mut overrides = turn_overrides(Mode::Build, None);
+        overrides.model.as_mut().unwrap().service_tier = Some("future-fast".into());
+        let params =
+            build_turn_start_params(&test_thread(), &UserInput::text("hi"), &overrides, &[])
+                .unwrap();
+        assert_eq!(params["serviceTierForTurn"], "future-fast");
+        assert!(
+            params.get("serviceTier").is_none(),
+            "do not alter native thread defaults"
+        );
+        overrides.model.as_mut().unwrap().service_tier = None;
+        let params =
+            build_turn_start_params(&test_thread(), &UserInput::text("hi"), &overrides, &[])
+                .unwrap();
+        assert!(params.get("serviceTierForTurn").is_none());
     }
 
     #[test]
@@ -2838,6 +3056,9 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct FakeCodexState {
+        goal_status: Option<String>,
+        goals_queue_failure: Option<String>,
+        settings_update_failure: Option<String>,
         thread_counter: usize,
         turn_counter: usize,
         hang_methods: HashSet<String>,
@@ -2845,7 +3066,6 @@ mod tests {
         command_exec_terminate_error: Option<String>,
         thread_delete_error: Option<String>,
         thread_resume_missing_rollout_failures: usize,
-        steer_response_turn_id: Option<String>,
         model_list_error: Option<String>,
         config_read_error: Option<String>,
         /// `model_provider` in the `config/read` payload; `None` omits the key, as a config that
@@ -2919,10 +3139,6 @@ mod tests {
 
         async fn resume_method(&self, method: &'static str) {
             self.state.lock().await.hang_methods.remove(method);
-        }
-
-        async fn steer_response_turn_id(&self, turn_id: Option<&str>) {
-            self.state.lock().await.steer_response_turn_id = turn_id.map(str::to_owned);
         }
 
         async fn background_terminal_terminate_result(&self, result: bool) {
@@ -3008,16 +3224,6 @@ mod tests {
 
     #[async_trait]
     impl CodexTransport for FakeCodexTransport {
-        fn start_request_json(&mut self, method: &str, params: Value) -> CodexRequestFuture {
-            let (_events_tx, events_rx) = mpsc::channel(1);
-            let mut transport = FakeCodexTransport {
-                state: self.state.clone(),
-                events_rx,
-            };
-            let method = method.to_owned();
-            Box::pin(async move { transport.request_json(&method, params).await })
-        }
-
         async fn request_json(
             &mut self,
             method: &str,
@@ -3034,6 +3240,41 @@ mod tests {
                 std::future::pending().await
             } else {
                 match method {
+                    "thread/settings/update" => {
+                        if let Some(message) = &state.settings_update_failure {
+                            Err(HarnessError::Protocol(message.clone()))
+                        } else {
+                            Ok(json!({}))
+                        }
+                    }
+                    "thread/goal/get" => {
+                        if let Some(message) = &state.goals_queue_failure {
+                            Err(HarnessError::Protocol(message.clone()))
+                        } else if let Some(status) = &state.goal_status {
+                            Ok(
+                                json!({"goal":{"threadId":params["threadId"],"objective":"test goal","status":status,"tokenBudget":null,
+                                "tokensUsed":0,"timeUsedSeconds":0,"createdAt":0,"updatedAt":0}}),
+                            )
+                        } else {
+                            Ok(json!({"goal":null}))
+                        }
+                    }
+                    "thread/queue/list" => Ok(json!({"data":[],"nextCursor":null})),
+                    "thread/goal/set" => {
+                        if state.goal_status.is_some()
+                            && let Some(status) = params["status"].as_str()
+                        {
+                            state.goal_status = Some(status.to_owned());
+                        }
+                        Ok(json!({}))
+                    }
+                    "thread/goal/clear"
+                    | "thread/queue/add"
+                    | "thread/queue/update"
+                    | "thread/queue/delete"
+                    | "thread/queue/reorder"
+                    | "thread/queue/start" => Ok(json!({})),
+                    "turn/steer" => Ok(json!({"turnId": params["expectedTurnId"]})),
                     codex_codes::protocol::methods::THREAD_START => {
                         state.thread_counter += 1;
                         let native_thread_id = format!("native-thread-{}", state.thread_counter);
@@ -3084,12 +3325,6 @@ mod tests {
                             }
                         }))
                     }
-                    codex_codes::protocol::methods::TURN_STEER => Ok(json!({
-                        "turnId": state
-                            .steer_response_turn_id
-                            .clone()
-                            .unwrap_or_else(|| params["expectedTurnId"].as_str().unwrap_or_default().to_owned())
-                    })),
                     codex_codes::protocol::methods::THREAD_COMPACT_START
                     | codex_codes::protocol::methods::THREAD_ARCHIVE
                     | codex_codes::protocol::methods::THREAD_UNARCHIVE
@@ -3192,7 +3427,9 @@ mod tests {
                                     { "reasoningEffort": "high", "description": "" }
                                 ],
                                 "defaultReasoningEffort": "medium",
-                                "isDefault": true
+                                "isDefault": true,
+                                "contextWindow": 272000,
+                                "maxContextWindow": 872000
                             },
                             {
                                 "id": "gpt-5.5-mini",
@@ -3202,7 +3439,8 @@ mod tests {
                                 "hidden": false,
                                 "supportedReasoningEfforts": [],
                                 "defaultReasoningEffort": "medium",
-                                "isDefault": false
+                                "isDefault": false,
+                                "contextWindow": 128000
                             },
                             {
                                 "id": "internal-secret",
@@ -3312,6 +3550,7 @@ mod tests {
     fn open_opts(thread: ThreadId, resume: Option<&str>) -> OpenThreadOptions {
         let (updates, _) = giskard_harness::thread_update_channel();
         OpenThreadOptions {
+            context_window: None,
             project: ProjectId::new(),
             thread,
             workspace_root: PathBuf::from("/tmp"),
@@ -3383,6 +3622,48 @@ mod tests {
         assert_eq!(
             requests[0].params["input"][1]["url"],
             "data:image/png;base64,aW1hZ2U="
+        );
+    }
+
+    #[tokio::test]
+    async fn start_turn_maps_audio_attachment_without_host_file_upload() {
+        let (mut transport, controller) = fake_codex();
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = test_thread();
+        let input = UserInput::text_with_attachments(
+            "Inspect this",
+            vec![UserAttachment {
+                name: "recording.wav".into(),
+                mime_type: "audio/wav".into(),
+                size: 5,
+                kind: AttachmentKind::Audio,
+                data_base64: "aW1hZ2U=".into(),
+            }],
+        );
+
+        handle_start_turn(
+            &mut transport,
+            &mut mapper,
+            &thread,
+            &input,
+            &build_turn_overrides(),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let requests = controller.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].method,
+            codex_codes::protocol::methods::TURN_START
+        );
+        assert_eq!(requests[0].params["input"][0]["type"], "text");
+        assert_eq!(requests[0].params["input"][0]["text"], "Inspect this");
+        assert_eq!(requests[0].params["input"][1]["type"], "audio");
+        assert_eq!(
+            requests[0].params["input"][1]["url"],
+            "data:audio/wav;base64,aW1hZ2U="
         );
     }
 
@@ -3594,6 +3875,404 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn selected_context_is_configured_at_creation_and_reused_for_turn_and_goal() {
+        use giskard_core::goals_queue::GoalsQueueCommand;
+        let (harness, controller) = spawn_fake_harness();
+        let mut opts = open_opts(ThreadId::new(), None);
+        opts.context_window = Some(272_000);
+        let thread = harness.open_thread(opts).await.unwrap();
+        let mut settings = build_turn_overrides();
+        settings.context_window = Some(272_000);
+        harness
+            .goals_queue(
+                &thread,
+                GoalsQueueCommand::Add {
+                    text: "queued".into(),
+                    client_message_id: "context-test".into(),
+                },
+                Some(settings.clone()),
+            )
+            .await
+            .unwrap();
+        harness
+            .start_turn(&thread, UserInput::text("test"), settings)
+            .await
+            .unwrap();
+        let calls = controller.requests().await;
+        assert_eq!(
+            calls[0].params["config"],
+            context_policy::config(272_000).unwrap()
+        );
+        assert!(calls.iter().any(|request| request.method == "turn/start"));
+        assert!(
+            calls
+                .iter()
+                .any(|request| request.method == "thread/queue/add")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|request| request.method == "thread/unsubscribe")
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_goal_statuses_bypass_pending_context_reload_but_resume_does_not() {
+        use giskard_core::goals_queue::{GoalStatus, GoalsQueueCommand};
+        for status in [
+            GoalStatus::Paused,
+            GoalStatus::Blocked,
+            GoalStatus::UsageLimited,
+            GoalStatus::BudgetLimited,
+            GoalStatus::Complete,
+        ] {
+            let (harness, controller) = spawn_fake_harness();
+            let thread = harness
+                .open_thread(open_opts(ThreadId::new(), None))
+                .await
+                .unwrap();
+            controller.state.lock().await.goal_status = Some("active".into());
+            let mut settings = build_turn_overrides();
+            settings.context_window = Some(272_000);
+            harness
+                .goals_queue(
+                    &thread,
+                    GoalsQueueCommand::SetGoal {
+                        objective: None,
+                        status: Some(status),
+                        token_budget: None,
+                    },
+                    Some(settings.clone()),
+                )
+                .await
+                .unwrap();
+            let calls = controller.requests().await;
+            let settings_index = calls
+                .iter()
+                .position(|request| request.method == "thread/settings/update")
+                .unwrap();
+            let goal_index = calls
+                .iter()
+                .position(|request| request.method == "thread/goal/set")
+                .unwrap();
+            assert!(
+                settings_index < goal_index,
+                "ordinary settings handling remains intact"
+            );
+            assert!(
+                !calls.iter().any(|request| request.method == "thread/read"
+                    || request.method == "thread/unsubscribe")
+            );
+            for status in [Some(GoalStatus::Active), None] {
+                assert!(
+                    harness
+                        .goals_queue(
+                            &thread,
+                            GoalsQueueCommand::SetGoal {
+                                objective: None,
+                                status,
+                                token_budget: None,
+                            },
+                            Some(settings.clone())
+                        )
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(
+                controller
+                    .requests()
+                    .await
+                    .iter()
+                    .filter(|request| request.method == "thread/goal/set")
+                    .count(),
+                1,
+                "reactivation must not bypass native context verification"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_context_failure_prevents_goal_and_turn_launch() {
+        use giskard_core::goals_queue::GoalsQueueCommand;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let mut settings = build_turn_overrides();
+        settings.context_window = Some(272_000);
+        // This fake does not provide native idle snapshots. Both admission paths must fail
+        // configuration rather than continue with an unverified window.
+        assert!(
+            harness
+                .goals_queue(
+                    &thread,
+                    GoalsQueueCommand::Add {
+                        text: "queued".into(),
+                        client_message_id: "context-failure".into()
+                    },
+                    Some(settings.clone())
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            harness
+                .start_turn(&thread, UserInput::text("test"), settings)
+                .await
+                .is_err()
+        );
+        let calls = controller.requests().await;
+        assert!(
+            !calls
+                .iter()
+                .any(|request| request.method == "thread/queue/add"
+                    || request.method == "turn/start"
+                    || request.method == "thread/settings/update")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_passes_context_config_without_attesting_warm_application() {
+        let (harness, controller) = spawn_fake_harness();
+        let mut opts = open_opts(ThreadId::new(), Some("native-resume"));
+        opts.context_window = Some(272_000);
+        let thread = harness.open_thread(opts).await.unwrap();
+        let calls = controller.requests().await;
+        let resume = calls
+            .iter()
+            .find(|request| request.method == "thread/resume")
+            .unwrap();
+        assert_eq!(
+            resume.params["config"],
+            context_policy::config(272_000).unwrap()
+        );
+        let mut settings = build_turn_overrides();
+        settings.context_window = Some(272_000);
+        assert!(
+            harness
+                .start_turn(&thread, UserInput::text("test"), settings)
+                .await
+                .is_err()
+        );
+        assert!(
+            !controller
+                .requests()
+                .await
+                .iter()
+                .any(|request| request.method == "turn/start")
+        );
+    }
+
+    #[tokio::test]
+    async fn goals_queue_commands_use_native_identity_and_do_not_start_a_second_turn() {
+        use giskard_core::goals_queue::*;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        harness
+            .goals_queue(
+                &thread,
+                GoalsQueueCommand::Add {
+                    text: "queued request".into(),
+                    client_message_id: "receipt-1".into(),
+                },
+                Some(build_turn_overrides()),
+            )
+            .await
+            .unwrap();
+        let requests = controller.requests().await;
+        let add = requests
+            .iter()
+            .find(|r| r.method == "thread/queue/add")
+            .unwrap();
+        assert_eq!(add.params["threadId"], thread.harness_thread_id);
+        assert_eq!(add.params["input"][0]["text"], "queued request");
+        assert_eq!(add.params["clientUserMessageId"], "receipt-1");
+        let settings_index = requests
+            .iter()
+            .position(|r| r.method == "thread/settings/update")
+            .unwrap();
+        let add_index = requests
+            .iter()
+            .position(|r| r.method == "thread/queue/add")
+            .unwrap();
+        assert_eq!(
+            add_index,
+            settings_index + 1,
+            "settings and launch must be adjacent owner operations"
+        );
+        let settings = &requests[settings_index].params;
+        assert_eq!(settings["threadId"], thread.harness_thread_id);
+        assert_eq!(
+            settings["cwd"],
+            thread.workspace_root.to_string_lossy().as_ref()
+        );
+        assert_eq!(settings["permissions"], ":read-only");
+        assert_eq!(settings["approvalPolicy"], "on-request");
+        assert_eq!(settings["collaborationMode"]["mode"], "default");
+        assert!(settings.get("serviceTier").unwrap().is_null());
+        assert!(controller.started_turns().await.is_empty());
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn goals_queue_rejects_stale_routes_and_active_queue_start() {
+        use giskard_core::goals_queue::*;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let mut stale = thread.clone();
+        stale.harness_thread_id = "replaced-native".into();
+        assert!(
+            harness
+                .goals_queue(&stale, GoalsQueueCommand::ClearGoal, None)
+                .await
+                .is_err()
+        );
+        harness
+            .start_turn(&thread, UserInput::text("work"), build_turn_overrides())
+            .await
+            .unwrap();
+        assert!(matches!(
+            harness
+                .goals_queue(
+                    &thread,
+                    GoalsQueueCommand::Start { id: None },
+                    Some(build_turn_overrides())
+                )
+                .await,
+            Err(HarnessError::ThreadBusy { .. })
+        ));
+        assert!(
+            !controller
+                .requests()
+                .await
+                .iter()
+                .any(|r| r.method == "thread/queue/start" || r.method == "thread/goal/clear")
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn goals_queue_settings_failure_prevents_work_and_missing_settings_are_rejected() {
+        use giskard_core::goals_queue::*;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        assert!(
+            harness
+                .goals_queue(&thread, GoalsQueueCommand::Start { id: None }, None)
+                .await
+                .is_err()
+        );
+        controller.state.lock().await.settings_update_failure = Some("rejected permissions".into());
+        for command in [
+            GoalsQueueCommand::Start { id: None },
+            GoalsQueueCommand::Add {
+                text: "work".into(),
+                client_message_id: "settings-test".into(),
+            },
+            GoalsQueueCommand::SetGoal {
+                objective: Some("finish".into()),
+                status: None,
+                token_budget: None,
+            },
+        ] {
+            let error = harness
+                .goals_queue(&thread, command, Some(build_turn_overrides()))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("rejected permissions"));
+        }
+        let requests = controller.requests().await;
+        assert!(!requests.iter().any(|r| matches!(
+            r.method.as_str(),
+            "thread/queue/start" | "thread/queue/add" | "thread/goal/set"
+        )));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn goals_queue_captures_tier_effort_mode_and_then_clears_tier() {
+        use giskard_core::goals_queue::*;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let mut settings = turn_overrides(Mode::Plan, Some(Effort("ultra".into())));
+        settings.permission_preset = PermissionPreset::AskFirst;
+        settings.model.as_mut().unwrap().service_tier = Some("priority".into());
+        harness
+            .goals_queue(
+                &thread,
+                GoalsQueueCommand::SetGoal {
+                    objective: Some("finish".into()),
+                    status: Some(GoalStatus::Paused),
+                    token_budget: None,
+                },
+                Some(settings),
+            )
+            .await
+            .unwrap();
+        harness
+            .goals_queue(
+                &thread,
+                GoalsQueueCommand::Start { id: None },
+                Some(build_turn_overrides()),
+            )
+            .await
+            .unwrap();
+        let requests = controller.requests().await;
+        let updates: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method == "thread/settings/update")
+            .collect();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].params["serviceTier"], "priority");
+        assert_eq!(updates[0].params["effort"], "ultra");
+        assert_eq!(updates[0].params["collaborationMode"]["mode"], "plan");
+        assert_eq!(updates[0].params["approvalPolicy"], "on-request");
+        assert!(updates[1].params.get("serviceTier").unwrap().is_null());
+        assert!(controller.started_turns().await.is_empty());
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn goals_queue_refresh_failure_reports_accepted_mutation() {
+        use giskard_core::goals_queue::*;
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        controller.state.lock().await.goals_queue_failure = Some("offline".into());
+        let error = harness
+            .goals_queue(&thread, GoalsQueueCommand::ClearGoal, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Change accepted"));
+        assert_eq!(
+            controller
+                .requests()
+                .await
+                .iter()
+                .filter(|r| r.method == "thread/goal/clear")
+                .count(),
+            1
+        );
+        harness.shutdown().await.unwrap();
+    }
+
     #[test]
     fn foreign_turn_completion_does_not_end_live_stream() {
         let stream_thread = ThreadId::new();
@@ -3699,265 +4378,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_worker_steers_the_exact_active_turn_on_the_control_lane() {
-        let (harness, controller) = spawn_fake_harness();
-        assert!(harness.capabilities().turn_steering);
-        let thread = harness
-            .open_thread(open_opts(ThreadId::new(), None))
-            .await
-            .unwrap();
-        let turn = harness
-            .start_turn(
-                &thread,
-                UserInput::text("initial input"),
-                build_turn_overrides(),
-            )
-            .await
-            .unwrap();
-        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
-
-        timeout(
-            Duration::from_secs(1),
-            harness.steer_turn(&thread, turn, "additional direction".into()),
-        )
-        .await
-        .expect("steering must be serviced while the turn is active")
-        .unwrap();
-
-        let requests = controller.requests().await;
-        let steer = requests
-            .iter()
-            .find(|request| request.method == codex_codes::protocol::methods::TURN_STEER)
-            .expect("turn/steer request should be recorded");
-        assert_eq!(steer.params["threadId"], thread.harness_thread_id);
-        assert_eq!(steer.params["expectedTurnId"], native_turn);
-        assert_eq!(
-            steer.params["input"],
-            json!([{ "type": "text", "text": "additional direction" }])
-        );
-
-        harness
-            .steer_turn(&thread, turn, "one more detail".into())
-            .await
-            .expect("accepted steering must not clear the active turn");
-    }
-
-    #[tokio::test]
-    async fn codex_worker_rejects_missing_and_stale_local_turns_without_an_rpc() {
+    async fn steering_targets_the_expected_native_turn_and_rejects_stale_input() {
         let (harness, controller) = spawn_fake_harness();
         let thread = harness
             .open_thread(open_opts(ThreadId::new(), None))
             .await
             .unwrap();
-        let no_active = harness
-            .steer_turn(&thread, TurnId::new(), "too soon".into())
-            .await
-            .expect_err("a thread without an active turn cannot be steered");
-        assert!(
-            matches!(no_active, HarnessError::Protocol(message) if message.contains("no active turn"))
-        );
-
         let turn = harness
-            .start_turn(&thread, UserInput::text("initial"), build_turn_overrides())
+            .start_turn(&thread, UserInput::text("work"), build_turn_overrides())
             .await
             .unwrap();
-        let stale = TurnId::new();
-        assert_ne!(turn, stale);
-        let stale_error = harness
-            .steer_turn(&thread, stale, "wrong turn".into())
-            .await
-            .expect_err("a stale local turn id must be rejected");
         assert!(
-            matches!(stale_error, HarnessError::Protocol(message) if message.contains("stale turn"))
+            harness
+                .steer_turn(&thread, TurnId::new(), UserInput::text("stale"), None)
+                .await
+                .is_err()
         );
-        assert_eq!(
-            controller
+        assert!(
+            harness
+                .steer_turn(&thread, turn, UserInput::text(" "), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            !controller
                 .requests()
                 .await
                 .iter()
-                .filter(|request| request.method == codex_codes::protocol::methods::TURN_STEER)
-                .count(),
-            0
+                .any(|request| request.method == "turn/steer")
         );
-    }
-
-    #[tokio::test]
-    async fn codex_worker_rejects_a_mismatched_steer_response_without_clearing_active_turn() {
-        let (harness, controller) = spawn_fake_harness();
-        let thread = harness
-            .open_thread(open_opts(ThreadId::new(), None))
-            .await
-            .unwrap();
-        let turn = harness
-            .start_turn(&thread, UserInput::text("initial"), build_turn_overrides())
-            .await
-            .unwrap();
-        controller
-            .steer_response_turn_id(Some("foreign-native-turn"))
-            .await;
-
-        let error = harness
-            .steer_turn(&thread, turn, "direction".into())
-            .await
-            .expect_err("Codex must echo the exact native active turn id");
-        assert!(
-            matches!(error, HarnessError::Protocol(message) if message.contains("foreign-native-turn"))
-        );
-
-        controller.steer_response_turn_id(None).await;
         harness
-            .steer_turn(&thread, turn, "retry".into())
-            .await
-            .expect("a response mismatch must not clear active turn state");
-    }
-
-    #[tokio::test]
-    async fn codex_worker_recovers_after_hung_steer_request() {
-        let (harness, controller) = spawn_fake_harness();
-        let thread = harness
-            .open_thread(open_opts(ThreadId::new(), None))
+            .steer_turn(
+                &thread,
+                turn,
+                UserInput::text("focus on tests"),
+                Some("steer-receipt-1".into()),
+            )
             .await
             .unwrap();
-        let turn = harness
-            .start_turn(&thread, UserInput::text("initial"), build_turn_overrides())
-            .await
-            .unwrap();
-        controller
-            .hang_method(codex_codes::protocol::methods::TURN_STEER)
-            .await;
-
-        let error = timeout(
-            Duration::from_secs(1),
-            harness.steer_turn(&thread, turn, "will time out".into()),
-        )
-        .await
-        .expect("worker-side timeout must answer the steering caller")
-        .expect_err("hung turn/steer should return a timeout");
-        assert!(matches!(error, HarnessError::Timeout(_)));
-
-        controller
-            .resume_method(codex_codes::protocol::methods::TURN_STEER)
-            .await;
-        harness
-            .steer_turn(&thread, turn, "retry".into())
-            .await
-            .expect("a steering timeout must not clear active turn state");
-    }
-
-    #[tokio::test]
-    async fn codex_worker_interrupts_before_a_hung_steer_times_out() {
-        let (harness, controller) = spawn_fake_harness();
-        let thread = harness
-            .open_thread(open_opts(ThreadId::new(), None))
-            .await
-            .unwrap();
-        let turn = harness
-            .start_turn(&thread, UserInput::text("initial"), build_turn_overrides())
-            .await
-            .unwrap();
-        controller
-            .hang_method(codex_codes::protocol::methods::TURN_STEER)
-            .await;
-
-        let steer_harness = harness.clone();
-        let steer_thread = thread.clone();
-        let steer = tokio::spawn(async move {
-            steer_harness
-                .steer_turn(&steer_thread, turn, "pending direction".into())
-                .await
-        });
-        timeout(Duration::from_secs(1), async {
-            loop {
-                if controller
-                    .requests()
-                    .await
-                    .iter()
-                    .any(|request| request.method == codex_codes::protocol::methods::TURN_STEER)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the pending turn/steer request must be issued");
-
-        harness
-            .interrupt(&thread)
-            .await
-            .expect("interrupt must bypass a pending steering response");
-        assert!(
-            !steer.is_finished(),
-            "interrupt must finish before the hung steering request times out"
-        );
         let requests = controller.requests().await;
-        let methods: Vec<_> = requests
+        let steer = requests
             .iter()
-            .map(|request| request.method.as_str())
-            .collect();
-        let steer_position = methods
-            .iter()
-            .position(|method| *method == codex_codes::protocol::methods::TURN_STEER)
-            .expect("turn/steer request position");
-        let interrupt_position = methods
-            .iter()
-            .position(|method| *method == codex_codes::protocol::methods::TURN_INTERRUPT)
-            .expect("turn/interrupt request position");
-        assert!(steer_position < interrupt_position);
-
-        let steering_error = steer
-            .await
-            .expect("steering task should join")
-            .expect_err("the still-hung steering request should time out");
-        assert!(matches!(steering_error, HarnessError::Timeout(_)));
+            .find(|request| request.method == "turn/steer")
+            .unwrap();
+        assert_eq!(steer.params["threadId"], thread.harness_thread_id);
+        assert_eq!(
+            steer.params["expectedTurnId"],
+            controller.started_turns().await[0].native_turn_id
+        );
+        assert_eq!(steer.params["input"][0]["text"], "focus on tests");
+        assert_eq!(steer.params["clientUserMessageId"], "steer-receipt-1");
+        assert_eq!(controller.started_turns().await.len(), 1);
+        harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn codex_worker_shutdown_fails_pending_steering_without_waiting_for_its_timeout() {
+    async fn steering_timeout_does_not_stop_worker() {
         let (harness, controller) = spawn_fake_harness();
         let thread = harness
             .open_thread(open_opts(ThreadId::new(), None))
             .await
             .unwrap();
         let turn = harness
-            .start_turn(&thread, UserInput::text("initial"), build_turn_overrides())
+            .start_turn(&thread, UserInput::text("work"), build_turn_overrides())
             .await
             .unwrap();
         controller
-            .hang_method(codex_codes::protocol::methods::TURN_STEER)
-            .await;
-
-        let steer_harness = harness.clone();
-        let steer_thread = thread.clone();
-        let steer = tokio::spawn(async move {
-            steer_harness
-                .steer_turn(&steer_thread, turn, "pending direction".into())
-                .await
-        });
-        timeout(Duration::from_secs(1), async {
-            loop {
-                if controller
-                    .requests()
-                    .await
-                    .iter()
-                    .any(|request| request.method == codex_codes::protocol::methods::TURN_STEER)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the pending turn/steer request must be issued");
-
-        harness.shutdown().await.expect("shutdown should complete");
-        let steering_error = steer
+            .state
+            .lock()
             .await
-            .expect("steering task should join")
-            .expect_err("shutdown must fail pending steering");
-        assert!(
-            matches!(steering_error, HarnessError::Transport(message) if message.contains("shut down"))
-        );
+            .hang_methods
+            .insert("turn/steer".into());
+        assert!(matches!(
+            harness
+                .steer_turn(&thread, turn, UserInput::text("tests"), None)
+                .await,
+            Err(HarnessError::Timeout(_))
+        ));
+        harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -4134,6 +4636,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: Some(Effort::new("high")),
+                service_tier: None,
             })
         );
     }
@@ -4482,6 +4985,7 @@ mod tests {
         let thread = ThreadId::new();
         harness
             .open_thread(OpenThreadOptions {
+                context_window: None,
                 project: ProjectId::new(),
                 thread,
                 workspace_root: PathBuf::from("/tmp"),
@@ -4753,11 +5257,8 @@ mod tests {
         // Codex routes to — `openai` here, the built-in default, since this config sets no
         // `model_provider`. Without that a stock setup has nothing to put in the picker.
         assert_eq!(flagship.provider, "openai");
-        // The context window is still absent from this RPC.
-        assert_eq!(
-            flagship.context_window,
-            ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW
-        );
+        assert_eq!(flagship.context_window, 272_000);
+        assert_eq!(flagship.advertised_context_window, Some(872_000));
 
         let mini = &models[1];
         assert_eq!(mini.model, "gpt-5.5-mini");
@@ -4767,6 +5268,8 @@ mod tests {
             "a non-none default is the sole effort when alternatives are empty"
         );
         assert_eq!(mini.reasoning_efforts, vec!["medium"]);
+        assert_eq!(mini.context_window, 128_000);
+        assert_eq!(mini.advertised_context_window, Some(128_000));
 
         assert!(
             controller
@@ -5907,12 +6410,33 @@ mod tests {
     }
 
     #[test]
+    fn attestation_is_negotiated_only_with_an_explicit_host_provider() {
+        let defaults =
+            serde_json::to_value(build_initialize_params(&NativeServiceProviders::default()))
+                .unwrap();
+        assert_ne!(defaults["capabilities"]["requestAttestation"], true);
+        let configured = NativeServiceProviders {
+            attestation_command: vec!["/trusted/provider".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(build_initialize_params(&configured)).unwrap()["capabilities"]["requestAttestation"],
+            true
+        );
+    }
+
+    #[test]
     fn initialize_params_enable_experimental_app_server_api() {
-        let params = serde_json::to_value(build_initialize_params()).unwrap();
+        let params =
+            serde_json::to_value(build_initialize_params(&NativeServiceProviders::default()))
+                .unwrap();
 
         assert_eq!(params["clientInfo"]["name"], "giskard");
         assert_eq!(params["capabilities"]["experimentalApi"], true);
-        assert!(params["capabilities"].get("extensions").is_none());
+        assert_eq!(
+            params["capabilities"]["extensions"],
+            serde_json::json!({"openai/form": {}})
+        );
     }
 
     #[test]
@@ -6318,7 +6842,7 @@ mod tests {
             assert!(
                 matches!(&message, AgentEvent::ItemCompleted { thread, item, .. }
                 if *thread == child.thread
-                    && matches!(&item.payload, ItemPayload::AgentMessage { text } if text == "hello"))
+                    && matches!(&item.payload, ItemPayload::AgentMessage { text, .. } if text == "hello"))
             );
             let completed = expect_event(&mut child_stream, "child TurnCompleted").await;
             assert!(

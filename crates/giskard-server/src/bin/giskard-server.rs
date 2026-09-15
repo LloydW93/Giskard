@@ -13,7 +13,10 @@ mod common;
 
 const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-struct CodexFactory;
+struct CodexFactory {
+    providers: giskard_harness_codex::NativeServiceProviders,
+    dynamic_tools: Vec<giskard_core::dynamic_tool_config::DynamicToolNamespaceConfig>,
+}
 
 #[async_trait]
 impl HarnessFactory for CodexFactory {
@@ -32,8 +35,13 @@ impl HarnessFactory for CodexFactory {
         let workspace_root =
             std::path::PathBuf::from(config.workspace_root.as_deref().unwrap_or(&config.dir));
         Ok(
-            giskard_harness_codex::CodexHarness::start_with_bootstrap(workspace_root, bootstrap)
-                .await?,
+            giskard_harness_codex::CodexHarness::start_with_configuration(
+                workspace_root,
+                bootstrap,
+                self.dynamic_tools.clone(),
+                self.providers.clone(),
+            )
+            .await?,
         )
     }
 }
@@ -299,7 +307,19 @@ async fn run(
     let viz = startup.config.viz.clone();
     let retention = startup.config.retention.clone();
 
-    let factory = Arc::new(CodexFactory);
+    let providers = giskard_harness_codex::NativeServiceProviders {
+        attestation_command: startup.config.harness.attestation_provider_command.clone(),
+        external_auth_command: startup
+            .config
+            .harness
+            .external_auth_provider_command
+            .clone(),
+    };
+    providers.validate().map_err(|error| error.to_string())?;
+    let factory = Arc::new(CodexFactory {
+        providers,
+        dynamic_tools: startup.config.harness.dynamic_tools.clone(),
+    });
 
     let state = AppState::new_with_config(
         startup.store,

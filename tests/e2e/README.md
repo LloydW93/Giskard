@@ -111,7 +111,13 @@ cargo build -p giskard-server --bin giskard-server-replay
 GISKARD_E2E_PREBUILT_BIN=target/debug/giskard-server-replay tests/e2e/screenshots.sh
 ```
 
-This writes `docs/screenshots/ide-desktop.png` and `docs/screenshots/ide-mobile.png` — the default
+This writes `docs/screenshots/ide-desktop.png` and `docs/screenshots/ide-mobile.png`, plus
+`async-questions-desktop.png` and `async-questions-mobile.png` showing a question during a running
+turn. Native capability captures also show goal management (`native-goal-*`), queued prompts
+(`native-queue-*`), a rich MCP form (`native-mcp-form-*`), and model service tiers
+(`native-model-*`) at both viewport sizes. The rich-form capture uses the same typed request
+fixture as the form browser tests; goal and queue captures use the real replay API.
+The IDE captures show the default
 IDE theme at desktop (1440×900 @2×) and mobile (390×844 @3×) viewports, each with a project open and
 a thread showing a message and the scripted reply. The generator lives in `screenshots/` and uses
 `screenshots.config.ts` (separate from the test suite so `run.sh` never regenerates images and this
@@ -149,7 +155,5 @@ Playwright, change **both**:
 - `@playwright/test` in `tests/e2e/package.json`, and
 - the `mcr.microsoft.com/playwright:vX.Y.Z-noble` tag in `tests/e2e/Dockerfile`.
 
-The scripted replies and special prompts asserted by the browser specs are defined in the replay
-binary and mirrored in `tests/helpers.ts`; keep the two in step. The turn-steering fixture starts a
-turn with `SCRIPTED_STEERING_TRIGGER`, holds it active until text is steered into that exact turn,
-then emits a same-turn user message, `SCRIPTED_STEERING_REPLY`, and one completion.
+The scripted reply asserted by `tests/thread.spec.ts` is defined once in the replay binary
+(`SCRIPTED_REPLY`) and mirrored in `tests/helpers.ts`; keep the two in step.

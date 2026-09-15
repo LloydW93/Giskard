@@ -279,6 +279,7 @@ mod tests {
     fn thread_state(thread_id: ThreadId, revision: u64) -> ThreadState {
         ThreadState {
             metadata: ThreadMetadata {
+                context_window_override: None,
                 thread_id,
                 revision,
                 title: format!("revision {revision}"),
@@ -287,6 +288,7 @@ mod tests {
                     provider: "test".into(),
                     model: "test".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 context_window: 128_000,
                 permission_preset: PermissionPreset::AskFirst,

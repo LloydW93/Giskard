@@ -14,6 +14,7 @@ pub struct UserAttachment {
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentKind {
     Image,
+    Audio,
     File,
 }
 
@@ -140,6 +141,27 @@ mod tests {
         let back: UserInput = serde_json::from_str(&json).unwrap();
         assert_eq!(back.as_text(), input.as_text());
         assert_eq!(back.attachments().len(), 1);
+        assert_eq!(back.attachments()[0].data_base64, "");
+    }
+
+    #[test]
+    fn audio_user_input_persists_descriptor_without_bytes() {
+        let input = UserInput::text_with_attachments(
+            "Refactor the auth module",
+            vec![UserAttachment {
+                name: "recording.wav".into(),
+                mime_type: "audio/wav".into(),
+                size: 12,
+                kind: AttachmentKind::Audio,
+                data_base64: "aW1hZ2U=".into(),
+            }],
+        );
+        let json = serde_json::to_string(&input).unwrap();
+        assert!(!json.contains("aW1hZ2U="));
+        let back: UserInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_text(), input.as_text());
+        assert_eq!(back.attachments().len(), 1);
+        assert_eq!(back.attachments()[0].kind, AttachmentKind::Audio);
         assert_eq!(back.attachments()[0].data_base64, "");
     }
 

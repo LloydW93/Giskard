@@ -64,4 +64,14 @@ test("IDE theme", async ({ page }, testInfo) => {
     path: file,
     contentType: "image/png",
   });
+
+  await input.fill("Ask a scripted async question.");
+  await page.locator("#sendBtn").click();
+  const question = page.locator(".agent-questions");
+  await expect(question.getByRole("button", { name:"Send answer" })).toBeEnabled();
+  await question.scrollIntoViewIfNeeded();
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  const questionFile = path.join(OUT_DIR, `async-questions-${testInfo.project.name}.png`);
+  await page.screenshot({ path:questionFile, animations:"disabled" });
+  await testInfo.attach(`async-questions-${testInfo.project.name}`, { path:questionFile, contentType:"image/png" });
 });

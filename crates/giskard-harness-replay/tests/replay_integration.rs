@@ -46,6 +46,7 @@ fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
                 id: it_1,
                 harness_item_id: "it_1".into(),
                 payload: ItemPayload::UserMessage {
+                    client_id: None,
                     text: "Fix the auth module".into(),
                 },
                 created_at: now,
@@ -77,6 +78,7 @@ fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
                 id: it_2,
                 harness_item_id: "it_2".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "I'll start by reading auth.rs".into(),
                 },
                 created_at: now,
@@ -110,6 +112,7 @@ async fn open_thread_one_turn_assert_state() {
     // Open thread
     let handle = harness
         .open_thread(OpenThreadOptions {
+            context_window: None,
             project: giskard_core::ProjectId::new(),
             thread: expected_thread,
             workspace_root: "/tmp/test".into(),
@@ -119,6 +122,7 @@ async fn open_thread_one_turn_assert_state() {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
+                service_tier: None,
             },
         })
         .await
@@ -136,10 +140,12 @@ async fn open_thread_one_turn_assert_state() {
             &handle,
             UserInput::text("Fix the auth module"),
             giskard_core::turn::TurnOverrides {
+                context_window: None,
                 model: Some(ModelRef {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 mode: Mode::Build,
                 permission_preset: PermissionPreset::AutoApprove,
@@ -188,7 +194,7 @@ async fn open_thread_one_turn_assert_state() {
     // Event 3: ItemCompleted (UserMessage)
     if let AgentEvent::ItemCompleted { item, .. } = &events[3] {
         match &item.payload {
-            ItemPayload::UserMessage { text } => assert_eq!(text, "Fix the auth module"),
+            ItemPayload::UserMessage { text, .. } => assert_eq!(text, "Fix the auth module"),
             _ => panic!("expected UserMessage"),
         }
     } else {
@@ -212,7 +218,7 @@ async fn open_thread_one_turn_assert_state() {
     // Event 6: ItemCompleted (AgentMessage)
     if let AgentEvent::ItemCompleted { item, .. } = &events[6] {
         match &item.payload {
-            ItemPayload::AgentMessage { text } => {
+            ItemPayload::AgentMessage { text, .. } => {
                 assert_eq!(text, "I'll start by reading auth.rs")
             }
             _ => panic!("expected AgentMessage"),
@@ -246,6 +252,7 @@ async fn replay_persisted_state_roundtrip() {
 
     let handle = harness
         .open_thread(OpenThreadOptions {
+            context_window: None,
             project: giskard_core::ProjectId::new(),
             thread: thread_id,
             workspace_root: "/tmp/test".into(),
@@ -255,6 +262,7 @@ async fn replay_persisted_state_roundtrip() {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
+                service_tier: None,
             },
         })
         .await
@@ -266,6 +274,7 @@ async fn replay_persisted_state_roundtrip() {
             &handle,
             UserInput::text("test"),
             giskard_core::turn::TurnOverrides {
+                context_window: None,
                 model: None,
                 mode: Mode::Plan,
                 permission_preset: PermissionPreset::AskFirst,
@@ -313,8 +322,10 @@ async fn replay_persisted_state_roundtrip() {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         }),
         context_window: 262_144,
+        context_window_override: None,
         model_context_windows: Default::default(),
         permission_preset: PermissionPreset::AskFirst,
         model_efforts: std::collections::HashMap::new(),

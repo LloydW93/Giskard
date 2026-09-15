@@ -203,7 +203,6 @@ impl RegistryTaskTracker {
 pub struct LoadedThreadBinding {
     project_id: ProjectId,
     handle: ThreadHandle,
-    turn_steering: bool,
     /// The model the harness reports this native thread is on. `None` when neither the caller nor
     /// the harness named one — callers already treat an unknown native model the same as an
     /// unbound thread.
@@ -219,52 +218,8 @@ impl LoadedThreadBinding {
         &self.handle
     }
 
-    pub(crate) fn turn_steering(&self) -> bool {
-        self.turn_steering
-    }
-
     pub fn native_model(&self) -> Option<&ModelRef> {
         self.native_model.as_ref()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum SteerTurnError {
-    NotSteerable {
-        thread_id: ThreadId,
-        expected_turn: TurnId,
-        active_turn: Option<TurnId>,
-    },
-    Harness(HarnessError),
-}
-
-impl fmt::Display for SteerTurnError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotSteerable {
-                thread_id,
-                expected_turn,
-                active_turn: Some(active_turn),
-            } => write!(
-                formatter,
-                "turn {expected_turn} is not steerable for thread {thread_id}; the acknowledged active user turn is {active_turn}"
-            ),
-            Self::NotSteerable {
-                thread_id,
-                expected_turn,
-                active_turn: None,
-            } => write!(
-                formatter,
-                "turn {expected_turn} is not steerable for thread {thread_id}; there is no acknowledged active user turn"
-            ),
-            Self::Harness(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl From<HarnessError> for SteerTurnError {
-    fn from(error: HarnessError) -> Self {
-        Self::Harness(error)
     }
 }
 
@@ -821,29 +776,6 @@ impl HarnessRegistry {
         Ok(HarnessBootstrap { known_threads })
     }
 
-    /// Attach a persisted provider-owned child without resuming or nudging native work.
-    pub async fn attach_subagent_thread(
-        &self,
-        config: &ProjectConfig,
-        thread: &ThreadFile,
-    ) -> Result<LoadedThreadBinding, HarnessError> {
-        if thread.kind != ThreadKind::Subagent {
-            return Err(HarnessError::Protocol(format!(
-                "thread {} is not a sub-agent",
-                thread.id
-            )));
-        }
-        let harness = self.get_or_create_harness(config.id, config).await?;
-        ensure_subagent_thread_open(
-            config,
-            thread,
-            &self.shared,
-            &harness,
-            ClassificationPhase::from(thread.kind),
-        )
-        .await
-    }
-
     pub async fn open_thread(
         &self,
         config: &ProjectConfig,
@@ -851,7 +783,45 @@ impl HarnessRegistry {
         thread: ThreadId,
         resume: Option<String>,
         initial_model: ModelRef,
-    ) -> Result<LoadedThreadBinding, HarnessError> {
+    ) -> Result<ThreadHandle, HarnessError> {
+        self.open_primary_thread(config, workspace_root, thread, resume, initial_model)
+            .await
+    }
+
+    /// Attach a persisted provider-owned child without resuming or nudging native work.
+    pub async fn attach_subagent_thread(
+        &self,
+        config: &ProjectConfig,
+        thread: &ThreadFile,
+    ) -> Result<ThreadHandle, HarnessError> {
+        if thread.kind != ThreadKind::Subagent {
+            return Err(HarnessError::Protocol(format!(
+                "thread {} is not a sub-agent",
+                thread.id
+            )));
+        }
+        self.get_or_create_harness(config.id, config).await?;
+        ensure_subagent_thread_open(
+            config,
+            thread,
+            &self.shared,
+            ClassificationPhase::from(thread.kind),
+        )
+        .await?;
+        self.loaded_thread_binding(thread.id)
+            .await
+            .map(|binding| binding.handle)
+            .ok_or(HarnessError::ThreadNotFound(thread.id))
+    }
+
+    async fn open_primary_thread(
+        &self,
+        config: &ProjectConfig,
+        workspace_root: &str,
+        thread: ThreadId,
+        resume: Option<String>,
+        initial_model: ModelRef,
+    ) -> Result<ThreadHandle, HarnessError> {
         debug!(
             project_id = %config.id,
             thread_id = %thread,
@@ -863,15 +833,14 @@ impl HarnessRegistry {
         // losing open may invalidate the stream already owned by the winner.
         let _owner_guard = lock_thread_owner(&self.shared.threads, thread).await;
         if let Some(existing) = self.shared.coordinator(thread).await {
-            existing
+            return existing
                 .reusable_handle(
                     config.id,
                     thread,
                     resume.as_deref(),
                     ClassificationPhase::Primary,
                 )
-                .await?;
-            return Ok(existing.binding().await);
+                .await;
         }
         let harness = self.get_or_create_harness(config.id, config).await?;
         let (updates, update_stream) = thread_update_channel();
@@ -882,8 +851,49 @@ impl HarnessRegistry {
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
         let restore_permit = self.shared.services.runtime.restoration_permit(&authority);
 
+        let app_config = self
+            .shared
+            .services
+            .store
+            .load_config()
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        let catalog = self.project_model_catalog(config).await.unwrap_or_default();
+        let descriptor =
+            crate::models::resolve_catalog_descriptor(&catalog, &app_config, &initial_model);
+        let existing = self
+            .shared
+            .services
+            .store
+            .load_thread(config.id, thread)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        let requested = existing
+            .as_ref()
+            .filter(|tf| {
+                tf.current_model.as_known().is_some_and(|m| {
+                    m.provider == initial_model.provider && m.model == initial_model.model
+                })
+            })
+            .and_then(|tf| tf.context_window_override);
+        let limit = existing
+            .as_ref()
+            .and_then(|tf| {
+                crate::models::configured_session_context_window(
+                    &initial_model,
+                    &descriptor,
+                    &tf.model_context_windows,
+                    requested,
+                )
+            })
+            .or_else(|| {
+                descriptor
+                    .advertised_context_window
+                    .map(|_| crate::models::selected_session_context_window(&descriptor, requested))
+            });
         let handle = harness
             .open_thread(OpenThreadOptions {
+                context_window: limit,
                 project: config.id,
                 thread,
                 workspace_root: workspace_root.into(),
@@ -909,13 +919,12 @@ impl HarnessRegistry {
         let binding = LoadedThreadBinding {
             project_id: config.id,
             handle: handle.clone(),
-            turn_steering: harness.capabilities().turn_steering,
             native_model: Some(native_model),
         };
         let owner_installed = install_event_owner(
             &self.shared,
             &harness,
-            binding.clone(),
+            binding,
             ClassificationPhase::Primary,
         )
         .await?;
@@ -938,7 +947,7 @@ impl HarnessRegistry {
             "harness thread opened"
         );
 
-        Ok(binding)
+        Ok(handle)
     }
 
     pub async fn start_turn(
@@ -1065,7 +1074,30 @@ impl HarnessRegistry {
             &resolved.authority,
             RuntimeRequestId::Server(request_id.clone()),
         )?;
+        let transition_payload = transition.request_state.payload.clone();
         self.publish_request_transition(thread_id, transition).await;
+
+        if let giskard_proto::RequestPayload::Server { request } = &transition_payload {
+            let request = request.clone();
+            let response_to_validate = response.clone();
+            let validation = tokio::task::spawn_blocking(move || {
+                crate::mcp_forms::validate_response(&request, &response_to_validate)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(HarnessError::Protocol(format!(
+                    "MCP form validation task failed: {error}"
+                )))
+            });
+            if let Err(error) = validation {
+                warn!(%project_id, %thread_id, request_id = %request_id.0,
+                    action = "server_request_response", %error, "server request response validation rejected");
+                if let Some(transition) = claim.rollback() {
+                    self.publish_request_transition(thread_id, transition).await;
+                }
+                return Err(error);
+            }
+        }
 
         if let Err(error) = harness
             .respond_server_request(request_id.clone(), response.clone())
@@ -1151,76 +1183,92 @@ impl HarnessRegistry {
             .await;
     }
 
-    /// Append text to an exact acknowledged user turn without reserving another turn lease.
-    pub(crate) async fn steer_turn(
+    pub async fn goals_queue_supported(&self, thread_id: ThreadId) -> bool {
+        let Some(binding) = self.loaded_thread_binding(thread_id).await else {
+            return false;
+        };
+        self.shared
+            .active_harness(binding.project_id)
+            .await
+            .is_some_and(|h| h.goals_queue_supported())
+    }
+
+    pub async fn turn_steering_supported(&self, thread_id: ThreadId) -> bool {
+        let Some(binding) = self.loaded_thread_binding(thread_id).await else {
+            return false;
+        };
+        self.shared
+            .active_harness(binding.project_id)
+            .await
+            .is_some_and(|harness| harness.capabilities().turn_steering)
+    }
+
+    /// Controls an existing turn; it never acquires a turn lease or admits a new turn.
+    pub async fn steer_turn(
         &self,
         thread_id: ThreadId,
         expected_turn: TurnId,
-        text: String,
-    ) -> Result<(), SteerTurnError> {
-        let resolved = self
-            .shared
-            .resolve_loaded_thread(thread_id)
+        question_item: Option<ItemId>,
+        input: UserInput,
+        client_message_id: Option<String>,
+    ) -> Result<(), HarnessError> {
+        let binding = self
+            .loaded_thread_binding(thread_id)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let project_id = resolved.binding.project_id;
-        self.ensure_thread_writable(project_id, thread_id).await?;
-
-        let runtime =
-            ResolvedThreadRuntime::new(self.shared.services.runtime.clone(), resolved.authority);
-        let active_turn = runtime.steerable_turn_id();
-        if active_turn != Some(expected_turn) {
-            return Err(SteerTurnError::NotSteerable {
-                thread_id,
-                expected_turn,
-                active_turn,
-            });
+        let project_id = binding.project_id;
+        let _lifecycle = self.lock_project_lifecycle(project_id).await;
+        let binding = self
+            .loaded_thread_binding(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let runtime = self
+            .thread_runtime(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let snapshot = runtime.live_snapshot();
+        if snapshot.as_ref().map(|snapshot| snapshot.turn_id) != Some(expected_turn) {
+            return Err(HarnessError::Protocol(
+                "the expected turn is no longer active; steering was not sent".into(),
+            ));
         }
-
+        if let Some(question_item) = question_item {
+            let matches_question = snapshot.as_ref().is_some_and(|snapshot| snapshot.accumulated.iter().any(|event| {
+                matches!(event, giskard_proto::WireAgentEvent::ItemCompleted { thread, turn, item }
+                    if *thread == thread_id && *turn == expected_turn && item.id == question_item
+                    && matches!(&item.payload, giskard_proto::WireItemPayload::AgentMessage { questions, .. } if !questions.is_empty()))
+            }));
+            if !matches_question {
+                return Err(HarnessError::Protocol(
+                    "the async question does not belong to this active turn".into(),
+                ));
+            }
+        } else {
+            self.ensure_thread_writable(project_id, thread_id).await?;
+        }
         let harness = self
             .shared
             .active_harness(project_id)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         if !harness.capabilities().turn_steering {
-            return Err(SteerTurnError::Harness(HarnessError::Unsupported(
-                "active-turn steering is not supported by this harness".into(),
-            )));
+            return Err(HarnessError::Unsupported(
+                "turn steering is not supported".into(),
+            ));
         }
-
-        let handle = resolved.binding.handle;
-        let started = Instant::now();
-        info!(
-            %project_id,
-            %thread_id,
-            turn_id = %expected_turn,
-            harness_thread_id = %handle.harness_thread_id,
-            action = "steer_turn",
-            "sending steering input to harness"
-        );
-        let result = harness.steer_turn(&handle, expected_turn, text).await;
+        info!(%project_id, %thread_id, turn_id = %expected_turn, action = "steer_turn", "sending steering input to harness");
+        let result = harness
+            .steer_turn(&binding.handle, expected_turn, input, client_message_id)
+            .await;
         match &result {
-            Ok(()) => info!(
-                %project_id,
-                %thread_id,
-                turn_id = %expected_turn,
-                harness_thread_id = %handle.harness_thread_id,
-                elapsed_ms = started.elapsed().as_millis(),
-                action = "steer_turn",
-                "harness accepted steering input"
-            ),
-            Err(error) => warn!(
-                %project_id,
-                %thread_id,
-                turn_id = %expected_turn,
-                harness_thread_id = %handle.harness_thread_id,
-                elapsed_ms = started.elapsed().as_millis(),
-                action = "steer_turn",
-                %error,
-                "harness rejected steering input"
-            ),
+            Ok(()) => {
+                info!(%project_id, %thread_id, turn_id = %expected_turn, "harness accepted steering input")
+            }
+            Err(error) => {
+                warn!(%project_id, %thread_id, turn_id = %expected_turn, %error, "harness rejected steering input")
+            }
         }
-        result.map_err(SteerTurnError::Harness)
+        result
     }
 
     pub async fn interrupt(&self, thread_id: ThreadId) -> Result<(), HarnessError> {
@@ -1896,9 +1944,12 @@ async fn ensure_subagent_thread_open(
     project_config: &ProjectConfig,
     thread_file: &ThreadFile,
     shared: &Arc<RegistryShared>,
-    harness: &Arc<dyn AgentHarness>,
     classification: ClassificationPhase,
-) -> Result<LoadedThreadBinding, HarnessError> {
+) -> Result<Option<String>, HarnessError> {
+    let harness = shared
+        .active_harness(project_config.id)
+        .await
+        .ok_or(HarnessError::ThreadNotFound(thread_file.id))?;
     // A sub-agent is provider-owned and read-only. Reattach its durable identity to this harness
     // lifetime without issuing thread/resume or otherwise nudging native work.
     let workspace_root =
@@ -1906,7 +1957,7 @@ async fn ensure_subagent_thread_open(
             .await
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
     if let Some(coordinator) = shared.coordinator(thread_file.id).await {
-        coordinator
+        let handle = coordinator
             .reusable_handle(
                 project_config.id,
                 thread_file.id,
@@ -1914,7 +1965,7 @@ async fn ensure_subagent_thread_open(
                 classification,
             )
             .await?;
-        return Ok(coordinator.binding().await);
+        return Ok(handle.agent_name);
     }
     let handle = harness
         .claim_native_thread(
@@ -1933,14 +1984,19 @@ async fn ensure_subagent_thread_open(
         .resumed_model
         .clone()
         .or_else(|| thread_file.current_model.as_known().cloned());
-    let binding = LoadedThreadBinding {
-        project_id: project_config.id,
-        handle,
-        turn_steering: harness.capabilities().turn_steering,
-        native_model,
-    };
-    install_event_owner(shared, harness, binding.clone(), classification).await?;
-    Ok(binding)
+    let agent_name = handle.agent_name.clone();
+    install_event_owner(
+        shared,
+        &harness,
+        LoadedThreadBinding {
+            project_id: project_config.id,
+            handle,
+            native_model,
+        },
+        classification,
+    )
+    .await?;
+    Ok(agent_name)
 }
 
 async fn install_event_owner(
@@ -2503,8 +2559,10 @@ mod tests {
                 provider: "openai".into(),
                 model: "test".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             context_window: 128_000,
+            context_window_override: None,
             model_context_windows: Default::default(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: Default::default(),
@@ -2601,7 +2659,6 @@ mod tests {
                 super::LoadedThreadBinding {
                     project_id: project,
                     handle: ThreadHandle::opened(thread, native.into(), PathBuf::from("/tmp/test")),
-                    turn_steering: false,
                     native_model: None,
                 },
                 super::ClassificationPhase::Primary,
@@ -2671,6 +2728,115 @@ mod tests {
             provider: "openai".into(),
             model: "test".into(),
             reasoning_effort: None,
+            service_tier: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_validates_question_ownership_for_primary_and_child_threads() {
+        for kind in [
+            giskard_core::ThreadKind::Primary,
+            giskard_core::ThreadKind::Subagent,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+            let (project, config) = create_test_project(&store, "steering-ownership").await;
+            let thread = ThreadId::new();
+            store
+                .save_thread(
+                    project,
+                    &test_thread_file(project, thread, "native-steer", kind),
+                )
+                .await
+                .unwrap();
+            let (registry, _factory, _sink) = discovery_registry(store).await;
+            registry
+                .get_or_create_harness(project, &config)
+                .await
+                .unwrap();
+            registry
+                .shared
+                .event_driver(project)
+                .await
+                .unwrap()
+                .attach(
+                    super::LoadedThreadBinding {
+                        project_id: project,
+                        handle: ThreadHandle::opened(
+                            thread,
+                            "native-steer".into(),
+                            PathBuf::from("/tmp/test"),
+                        ),
+                        native_model: None,
+                    },
+                    kind.into(),
+                )
+                .await
+                .unwrap();
+            let runtime = registry.thread_runtime(thread).await.unwrap();
+            let turn = TurnId::new();
+            let item_id = ItemId::new();
+            runtime.replace_live_turn_for_test(turn, None);
+            runtime.apply_event_for_test(
+                &AgentEvent::ItemCompleted {
+                    thread,
+                    turn,
+                    item: Item {
+                        id: item_id,
+                        harness_item_id: "native-question".into(),
+                        payload: ItemPayload::AgentMessage {
+                            text: "Choose".into(),
+                            questions: vec![giskard_core::item::AsyncQuestion {
+                                title: "Which?".into(),
+                                options: None,
+                            }],
+                        },
+                        created_at: Utc::now(),
+                    },
+                },
+                true,
+            );
+            assert!(matches!(
+                registry
+                    .steer_turn(
+                        thread,
+                        turn,
+                        Some(ItemId::new()),
+                        UserInput::text("spoof"),
+                        None
+                    )
+                    .await,
+                Err(HarnessError::Protocol(_))
+            ));
+            assert!(matches!(
+                registry
+                    .steer_turn(
+                        thread,
+                        TurnId::new(),
+                        Some(item_id),
+                        UserInput::text("stale"),
+                        None
+                    )
+                    .await,
+                Err(HarnessError::Protocol(_))
+            ));
+            // The test harness advertises no steering: valid requests reach that boundary only.
+            assert!(matches!(
+                registry
+                    .steer_turn(thread, turn, Some(item_id), UserInput::text("answer"), None)
+                    .await,
+                Err(HarnessError::Unsupported(_))
+            ));
+            let generic = registry
+                .steer_turn(thread, turn, None, UserInput::text("generic"), None)
+                .await;
+            if kind == giskard_core::ThreadKind::Subagent {
+                assert!(matches!(generic, Err(HarnessError::ThreadReadOnly { .. })));
+            } else {
+                assert!(matches!(generic, Err(HarnessError::Unsupported(_))));
+            }
+            assert_eq!(runtime.live_snapshot().unwrap().turn_id, turn);
+            registry.shutdown().await.unwrap();
         }
     }
 
@@ -2952,6 +3118,7 @@ mod tests {
                     id: ItemId::new(),
                     harness_item_id: "native-agent-message".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: "hello".into(),
                     },
                     created_at: Utc::now(),
@@ -3167,6 +3334,7 @@ mod tests {
                     let (updates, _) = giskard_harness::thread_update_channel();
                     let _ = h
                         .open_thread(giskard_harness::OpenThreadOptions {
+                            context_window: None,
                             project: project_id,
                             thread: ThreadId::new(),
                             workspace_root: "/tmp/test".into(),
@@ -3175,6 +3343,7 @@ mod tests {
                                 provider: "openai".into(),
                                 model: "gpt-test".into(),
                                 reasoning_effort: None,
+                                service_tier: None,
                             },
                             updates,
                         })
@@ -3229,6 +3398,7 @@ mod tests {
                     provider: "openai".into(),
                     model: "gpt-test".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 },
             )
             .await;
@@ -3365,8 +3535,10 @@ mod tests {
                             provider: "openai".into(),
                             model: "test".into(),
                             reasoning_effort: None,
+                            service_tier: None,
                         }),
                         context_window: 128_000,
+                        context_window_override: None,
                         model_context_windows: Default::default(),
                         permission_preset: PermissionPreset::AskFirst,
                         model_efforts: Default::default(),
@@ -3704,7 +3876,6 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id: ProjectId::new(),
                 handle: ThreadHandle::detached(ThreadId::new(), "native-test".into()),
-                turn_steering: false,
                 native_model: None,
             },
             classification,
@@ -3736,6 +3907,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "test".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             mode: TurnMode::Known(Mode::Build),
             kind: TurnContextKind::User,
@@ -3931,12 +4103,12 @@ mod tests {
             provider: "provider-a".into(),
             model: "model-a".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let coordinator_a = Arc::new(super::ThreadCoordinator::new(
             super::LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, "native-a".into()),
-                turn_steering: true,
                 native_model: Some(model_a.clone()),
             },
             super::ClassificationPhase::Primary,
@@ -3953,12 +4125,12 @@ mod tests {
             provider: "provider-b".into(),
             model: "model-b".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let coordinator_b = Arc::new(super::ThreadCoordinator::new(
             super::LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, "native-b".into()),
-                turn_steering: false,
                 native_model: Some(model_b.clone()),
             },
             super::ClassificationPhase::Primary,
@@ -3972,11 +4144,9 @@ mod tests {
         );
 
         assert_eq!(snapshot_a.handle().harness_thread_id, "native-a");
-        assert!(snapshot_a.turn_steering());
         assert_eq!(snapshot_a.native_model(), Some(&model_a));
         let snapshot_b = registry.loaded_thread_binding(thread_id).await.unwrap();
         assert_eq!(snapshot_b.handle().harness_thread_id, "native-b");
-        assert!(!snapshot_b.turn_steering());
         assert_eq!(snapshot_b.native_model(), Some(&model_b));
     }
 
@@ -4003,7 +4173,6 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, "native-unknown".into()),
-                turn_steering: false,
                 native_model: None,
             },
             super::ClassificationPhase::Primary,
@@ -4021,12 +4190,12 @@ mod tests {
             provider: "provider".into(),
             model: "model".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         let known = Arc::new(super::ThreadCoordinator::new(
             super::LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, "native-known".into()),
-                turn_steering: false,
                 native_model: Some(model.clone()),
             },
             super::ClassificationPhase::Primary,

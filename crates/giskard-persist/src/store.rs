@@ -98,6 +98,9 @@ pub struct ThreadFile {
     /// is replaced when the harness reports an authoritative runtime value.
     #[serde(default)]
     pub context_window: u32,
+    /// Explicit raw limit for this session's selected provider/model; None uses pricing policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_override: Option<u32>,
     /// Harness-reported effective windows nested by provider and model. These survive reloads and
     /// model switches without making Giskard maintain model-specific built-in metadata.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -203,13 +206,15 @@ impl ThreadMutation {
 }
 
 impl ThreadFile {
-    /// Record a harness-reported window for an exact model and update the visible capacity only
-    /// when that provider/model is selected. Reasoning effort is not part of capacity identity.
+    /// Retain the largest capacity observed for an exact model and update the current gauge.
+    /// Later reports may reflect a smaller session override, so they must not replace that capacity.
     pub fn record_model_context_window(&mut self, model: &ModelRef, context_window: u32) {
         self.model_context_windows
             .entry(model.provider.clone())
             .or_default()
-            .insert(model.model.clone(), context_window);
+            .entry(model.model.clone())
+            .and_modify(|window| *window = (*window).max(context_window))
+            .or_insert(context_window);
         if self.current_model.as_known().is_some_and(|current| {
             current.provider == model.provider && current.model == model.model
         }) {
@@ -1142,6 +1147,17 @@ impl PersistStore {
         };
         let mut after = before.clone();
         f(&mut after);
+        let before_model = before
+            .current_model
+            .as_known()
+            .map(|m| (&m.provider, &m.model));
+        let after_model = after
+            .current_model
+            .as_known()
+            .map(|m| (&m.provider, &m.model));
+        if before_model != after_model {
+            after.context_window_override = None;
+        }
 
         // The store, not mutation closures, owns both ordering fields.
         after.revision = before.revision;
@@ -2319,6 +2335,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         }
     }
 
@@ -2389,6 +2406,7 @@ mod tests {
             mode: TurnMode::Known(Mode::Build),
             current_model: TurnModel::Known(test_model()),
             context_window: 128_000,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
@@ -2619,10 +2637,26 @@ mod tests {
             provider: "proxy".into(),
             model: "other".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         thread.record_model_context_window(&other, 64_000);
         assert_eq!(thread.context_window, 128_000);
         assert_eq!(thread.model_context_windows["proxy"]["other"], 64_000);
+    }
+
+    #[test]
+    fn a_reduced_session_report_does_not_erase_the_natural_model_capacity() {
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let mut thread = test_thread(project_id, thread_id);
+        let model = thread.current_model.as_known().unwrap().clone();
+        thread.record_model_context_window(&model, 828_400);
+        thread.record_model_context_window(&model, 258_400);
+        assert_eq!(thread.context_window, 258_400);
+        assert_eq!(
+            thread.model_context_windows[&model.provider][&model.model],
+            828_400
+        );
     }
 
     #[tokio::test]
@@ -2728,6 +2762,7 @@ mod tests {
             mode: TurnMode::Known(Mode::Build),
             current_model: TurnModel::Known(test_model()),
             context_window: 262_144,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
@@ -2824,6 +2859,7 @@ mod tests {
             mode: TurnMode::Known(Mode::Build),
             current_model: TurnModel::Known(test_model()),
             context_window: 262_144,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
@@ -2879,6 +2915,7 @@ mod tests {
             mode: TurnMode::Known(Mode::Build),
             current_model: TurnModel::Known(test_model()),
             context_window: 262_144,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
@@ -2928,6 +2965,7 @@ mod tests {
                 mode: TurnMode::Known(Mode::Plan),
                 current_model: TurnModel::Known(test_model()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: HashMap::new(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: HashMap::new(),
@@ -3245,6 +3283,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(test_model()),
                     context_window: 0,
+                    context_window_override: None,
                     model_context_windows: HashMap::new(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),
@@ -3579,6 +3618,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(test_model()),
                     context_window: 0,
+                    context_window_override: None,
                     model_context_windows: HashMap::new(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),
@@ -3628,6 +3668,7 @@ mod tests {
                     mode: TurnMode::Known(Mode::Build),
                     current_model: TurnModel::Known(test_model()),
                     context_window: 0,
+                    context_window_override: None,
                     model_context_windows: HashMap::new(),
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),
@@ -3687,7 +3728,10 @@ mod layout_tests {
         Item {
             id: giskard_core::ids::ItemId(ulid::Ulid::new()),
             harness_item_id: format!("native-{text}"),
-            payload: ItemPayload::AgentMessage { text: text.into() },
+            payload: ItemPayload::AgentMessage {
+                questions: vec![],
+                text: text.into(),
+            },
             created_at: Utc::now(),
         }
     }
@@ -3844,6 +3888,7 @@ mod layout_tests {
         let items = [item("first"), item("cargo build"), item("third")];
         let mut settled = items[1].clone();
         settled.payload = ItemPayload::AgentMessage {
+            questions: vec![],
             text: "cargo build (finished)".into(),
         };
 
@@ -4647,6 +4692,7 @@ mod layout_tests {
         let items = [item("first"), item("second"), item("third")];
         let mut settled = items[2].clone();
         settled.payload = ItemPayload::AgentMessage {
+            questions: vec![],
             text: "third (settled)".into(),
         };
 

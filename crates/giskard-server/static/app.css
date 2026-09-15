@@ -303,6 +303,13 @@
   .usage-meter span { display:block; height:100%; min-width:2px; max-width:100%; background:var(--accent); }
   .usage-line { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; }
 
+  .context-limit-controls { display:grid; grid-template-columns:auto minmax(0, 1fr); gap:8px; align-items:center; font-size:12px; }
+  .context-limit-controls input, .context-limit-controls select { min-width:0; width:100%; }
+  .context-limit-controls button { grid-column:2; justify-self:start; }
+  .context-limit-note, .context-limit-warning, .context-limit-error { margin-top:8px; font-size:12px; line-height:1.5; }
+  .context-limit-warning { color:var(--muted); }
+  .context-limit-error, #contextWindowStatus[role="alert"] { color:var(--danger, #ff8c8c); }
+
   #transcript {
     flex:1; min-width:0; overflow-y:auto; overflow-x:hidden; padding:16px;
     scrollbar-width:thin; scrollbar-color:var(--scroll-thumb) var(--scroll-track);
@@ -456,6 +463,10 @@
   .server-request-field select,
   .server-request-field textarea { width:100%; }
   .server-request-field textarea { min-height:84px; resize:vertical; font-family:var(--mono); }
+  .server-request-field input.server-request-mcp-include { width:auto; margin-right:4px; }
+  .server-request-mcp-field > .server-request-field { margin-top:10px; padding-left:10px; border-left:2px solid var(--border); }
+  .server-request-json-content { width:100%; min-height:100px; resize:vertical; font-family:var(--mono); }
+  .server-request-form-error:not(:empty) { margin-top:8px; color:#ff9b9b; white-space:pre-wrap; overflow-wrap:anywhere; }
   pre.out {
     max-width:100%; margin:0; overflow-x:hidden; font-family:var(--mono); font-size:12.5px;
     white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;
@@ -652,15 +663,18 @@
     background:var(--scroll-thumb); border:2px solid var(--scroll-track); border-radius:999px;
   }
   .composer textarea::-webkit-scrollbar-thumb:hover { background:var(--scroll-thumb-hover); }
-  /* Send (up-pointing paper-plane arrow) and Stop (red filled square) are flex siblings. They share
-     the trailing action position while idle or unsupported, and sit side-by-side when non-empty
-     steering input is available. Both remain bottom-aligned when the textarea grows. */
+  /* Send (up-pointing paper-plane arrow) and Stop (red filled square) are flex siblings. Steering
+     harnesses show both while running; other harnesses share a single slot. Both match the
+     composer's at-rest height, mirroring the ＋ attach button on the left for a symmetric composer;
+     when the textarea grows they keep that height and stay aligned to its bottom edge. */
   .composer #sendBtn,
   .composer #stopBtn {
     width:40px; min-width:40px; height:40px; margin:0; padding:0;
     display:flex; align-items:center; justify-content:center; border-radius:6px; line-height:1;
   }
-  /* The icon rules override the [hidden] attribute's default display:none, so re-assert it. */
+  /* The [hidden] attribute's default display:none is overridden by the display:flex above, so
+     re-assert display:none for hidden buttons — otherwise the send arrow stays visible alongside
+     the stop square during a running turn. */
   .composer #sendBtn[hidden],
   .composer #stopBtn[hidden] { display:none; }
   /* Both icon buttons render a Unicode glyph at the same size, matching the ＋ attach button. */
@@ -1101,3 +1115,30 @@
   @media (max-width:480px) {
     .git-line .git-sync, .git-line .git-sep { display:none; }
   }
+
+/* Async question cards stay in the transcript while the agent continues working. */
+.agent-questions { display:flex; flex-direction:column; gap:12px; margin-top:12px; }
+.agent-questions fieldset { min-width:0; margin:0; padding:12px; border:1px solid var(--border); border-radius:8px; }
+.agent-questions legend { font-weight:600; padding:0 4px; overflow-wrap:anywhere; }
+.question-option { display:flex; align-items:baseline; gap:8px; margin:8px 0; overflow-wrap:anywhere; }
+.question-option input { flex:none; }
+.question-free-text { display:flex; flex-direction:column; gap:6px; margin-top:12px; }
+.question-free-text textarea { width:100%; box-sizing:border-box; resize:vertical; font:inherit; }
+.agent-questions .question-delivery { margin:0; }
+.agent-questions button[type=submit] { align-self:flex-start; }
+
+/* Goal and queue controls share a bounded, keyboard-accessible dialog on desktop and mobile. */
+.goals-queue-dialog { width:min(680px, calc(100vw - 24px)); max-height:calc(var(--app-height, 100dvh) - 32px); }
+.goals-queue-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 20px; }
+.goals-queue-head h2 { margin:0; padding:0; }
+.goals-queue-dialog .content { overflow:auto; }
+.goals-queue-dialog section + section { margin-top:24px; }
+.goals-queue-dialog label { display:flex; flex-direction:column; gap:6px; margin:12px 0; }
+.goals-queue-dialog textarea { width:100%; resize:vertical; min-height:72px; box-sizing:border-box; }
+.goals-queue-fields { display:flex; flex-wrap:wrap; gap:12px; }
+.goals-queue-fields label { flex:1; min-width:150px; }
+.goals-queue-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+#goalQueueList { padding-left:24px; }
+#goalQueueList li { margin:16px 0; }
+.queue-prompt, #goalSummary { white-space:pre-wrap; overflow-wrap:anywhere; }
+#goalsQueueNotice:empty { display:none; }

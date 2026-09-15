@@ -47,11 +47,6 @@ pub enum Call {
         input: UserInput,
         overrides: TurnOverrides,
     },
-    SteerTurn {
-        thread: ThreadId,
-        expected_turn: TurnId,
-        text: String,
-    },
     RespondApproval {
         request: ApprovalId,
         decision: ApprovalDecision,
@@ -288,14 +283,6 @@ pub struct TurnCall {
     pub log: Arc<EventLog>,
 }
 
-pub struct SteerCall {
-    pub thread: ThreadId,
-    pub harness_thread_id: String,
-    pub expected_turn: TurnId,
-    pub text: String,
-    pub log: Arc<EventLog>,
-}
-
 #[async_trait]
 pub trait Script: Send + Sync + 'static {
     fn capabilities(&self) -> HarnessCapabilities {
@@ -321,9 +308,6 @@ pub trait Script: Send + Sync + 'static {
         Ok(core.claimed(thread, harness_thread_id, workspace_root))
     }
     async fn start_turn(&self, _core: &FakeCore, _call: &TurnCall) -> Result<(), HarnessError> {
-        Ok(())
-    }
-    async fn steer_turn(&self, _core: &FakeCore, _call: &SteerCall) -> Result<(), HarnessError> {
         Ok(())
     }
     async fn respond_approval(
@@ -468,26 +452,6 @@ impl<S: Script> AgentHarness for FakeHarness<S> {
             .await
             .map(|()| turn)
     }
-    async fn steer_turn(
-        &self,
-        thread: &ThreadHandle,
-        expected_turn: TurnId,
-        text: String,
-    ) -> Result<(), HarnessError> {
-        self.core.record(Call::SteerTurn {
-            thread: thread.thread,
-            expected_turn,
-            text: text.clone(),
-        });
-        let call = SteerCall {
-            thread: thread.thread,
-            harness_thread_id: thread.harness_thread_id.clone(),
-            expected_turn,
-            text,
-            log: self.core.log(thread.thread),
-        };
-        self.script.steer_turn(&self.core, &call).await
-    }
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
         self.core
             .try_log(thread.thread)
@@ -630,6 +594,7 @@ impl Gate {
 pub mod caps {
     use giskard_harness::HarnessCapabilities;
     pub const TURNS: HarnessCapabilities = HarnessCapabilities {
+        context_window_configuration: false,
         turn_steering: false,
         live_approvals: true,
         plan_build_modes: true,
@@ -646,15 +611,13 @@ pub mod caps {
         context_compaction: false,
     };
     pub const ACTIVITY: HarnessCapabilities = HarnessCapabilities {
+        turn_steering: false,
         structured_diffs: false,
         token_usage: false,
         ..TURNS
     };
-    pub const STEERING: HarnessCapabilities = HarnessCapabilities {
-        turn_steering: true,
-        ..TURNS
-    };
     pub const RESUMABLE: HarnessCapabilities = HarnessCapabilities {
+        context_window_configuration: false,
         turn_steering: false,
         resumable_threads: true,
         live_approvals: false,
@@ -671,6 +634,7 @@ pub mod caps {
         context_compaction: false,
     };
     pub const RESUMABLE_COMPACTION: HarnessCapabilities = HarnessCapabilities {
+        context_window_configuration: false,
         turn_steering: false,
         resumable_threads: true,
         context_compaction: true,
@@ -687,6 +651,7 @@ pub mod caps {
         mcp_oauth_login: false,
     };
     pub const REPLAY: HarnessCapabilities = HarnessCapabilities {
+        context_window_configuration: false,
         turn_steering: false,
         live_approvals: true,
         plan_build_modes: true,
@@ -733,11 +698,13 @@ mod tests {
             provider: "test".into(),
             model: "model".into(),
             reasoning_effort: None,
+            service_tier: None,
         }
     }
 
     fn overrides() -> TurnOverrides {
         TurnOverrides {
+            context_window: None,
             model: Some(model()),
             mode: Mode::Build,
             permission_preset: PermissionPreset::AskFirst,
@@ -750,19 +717,6 @@ mod tests {
     impl Script for Fails {
         async fn start_turn(&self, _core: &FakeCore, _call: &TurnCall) -> Result<(), HarnessError> {
             Err(HarnessError::Protocol("script failed".into()))
-        }
-    }
-
-    struct FailsSteering;
-
-    #[async_trait]
-    impl Script for FailsSteering {
-        async fn steer_turn(
-            &self,
-            _core: &FakeCore,
-            _call: &SteerCall,
-        ) -> Result<(), HarnessError> {
-            Err(HarnessError::Protocol("steering failed".into()))
         }
     }
 
@@ -784,37 +738,6 @@ mod tests {
                 .count(|call| matches!(call, Call::StartTurn { .. })),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn exact_steering_call_is_recorded_before_the_script_runs() {
-        let harness = FakeHarness::new(FailsSteering);
-        let thread = ThreadHandle::opened(ThreadId::new(), "native".into(), PathBuf::from("/tmp"));
-        let expected_turn = TurnId::new();
-        let error = harness
-            .steer_turn(&thread, expected_turn, "redirect now".into())
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            HarnessError::Protocol("steering failed".into()).to_string()
-        );
-        let call = harness
-            .core
-            .calls()
-            .into_iter()
-            .next()
-            .expect("steering call must be recorded");
-        assert!(matches!(
-            call,
-            Call::SteerTurn {
-                thread: recorded_thread,
-                expected_turn: recorded_turn,
-                text,
-            } if recorded_thread == thread.thread
-                && recorded_turn == expected_turn
-                && text == "redirect now"
-        ));
     }
 
     #[tokio::test]
@@ -915,6 +838,7 @@ mod tests {
         let (updates, _) = thread_update_channel();
         harness
             .open_thread(OpenThreadOptions {
+                context_window: None,
                 project: giskard_core::ids::ProjectId::new(),
                 thread,
                 workspace_root: PathBuf::from("/tmp"),
@@ -938,6 +862,7 @@ mod tests {
         let first = ThreadId::new();
         let second = ThreadId::new();
         let opts = |thread| OpenThreadOptions {
+            context_window: None,
             project: giskard_core::ids::ProjectId::new(),
             thread,
             workspace_root: PathBuf::from("/tmp"),

@@ -281,6 +281,7 @@ async fn emit_external_turn(
         id: ItemId::new(),
         harness_item_id: format!("external_{turn}"),
         payload: ItemPayload::AgentMessage {
+            questions: vec![],
             text: text.to_string(),
         },
         created_at: chrono::Utc::now(),
@@ -344,6 +345,7 @@ async fn emit_external_turn_without_completion(
         id: ItemId::new(),
         harness_item_id: format!("external_{turn}"),
         payload: ItemPayload::AgentMessage {
+            questions: vec![],
             text: text.to_string(),
         },
         created_at: chrono::Utc::now(),
@@ -477,6 +479,7 @@ fn started_inputs(core: &FakeCore) -> Vec<String> {
 impl Script for UnsupportedCompactionScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
+            context_window_configuration: false,
             turn_steering: false,
             live_approvals: false,
             plan_build_modes: false,
@@ -552,6 +555,7 @@ impl Script for SlowCompactionScript {
                 id: ItemId::new(),
                 harness_item_id: format!("reply_{turn}"),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "other thread reply".into(),
                 },
                 created_at: chrono::Utc::now(),
@@ -1085,6 +1089,7 @@ impl Script for SlowStartScript {
             id: ItemId::new(),
             harness_item_id: format!("reply_{sequence}_{}", call.turn),
             payload: ItemPayload::AgentMessage {
+                questions: vec![],
                 text: format!("reply to {text}"),
             },
             created_at: chrono::Utc::now(),
@@ -1193,6 +1198,7 @@ impl Script for CountingScript {
 impl Script for NoMcpScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
+            context_window_configuration: false,
             turn_steering: false,
             live_approvals: false,
             plan_build_modes: false,
@@ -1301,6 +1307,7 @@ fn make_fixture() -> ReplayFixture {
                 id: it_1,
                 harness_item_id: "it_1".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "Hello from replay!".into(),
                 },
                 created_at: now,
@@ -1343,6 +1350,7 @@ fn reused_item_id_across_turns_fixture(
                 id: item_id,
                 harness_item_id: shared_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "old answer".into(),
                 },
                 created_at: now,
@@ -1368,6 +1376,7 @@ fn reused_item_id_across_turns_fixture(
                 id: item_id,
                 harness_item_id: shared_harness.clone(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "new answer".into(),
                 },
                 created_at: now,
@@ -1412,6 +1421,7 @@ fn duplicate_history_fixture(
                 id: old_user,
                 harness_item_id: "old_user".into(),
                 payload: ItemPayload::UserMessage {
+                    client_id: None,
                     text: "old input".into(),
                 },
                 created_at: now,
@@ -1424,6 +1434,7 @@ fn duplicate_history_fixture(
                 id: old_agent,
                 harness_item_id: "old_agent".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "old answer".into(),
                 },
                 created_at: now,
@@ -1449,6 +1460,7 @@ fn duplicate_history_fixture(
                 id: new_user,
                 harness_item_id: "new_user".into(),
                 payload: ItemPayload::UserMessage {
+                    client_id: None,
                     text: "new input".into(),
                 },
                 created_at: now,
@@ -1461,6 +1473,7 @@ fn duplicate_history_fixture(
                 id: new_agent,
                 harness_item_id: "new_agent".into(),
                 payload: ItemPayload::AgentMessage {
+                    questions: vec![],
                     text: "new answer".into(),
                 },
                 created_at: now,
@@ -1527,7 +1540,10 @@ fn notice_fixture(thread: ThreadId, turn: TurnId) -> ReplayFixture {
             item: Item {
                 id: item,
                 harness_item_id: "a1".into(),
-                payload: ItemPayload::AgentMessage { text: "hi".into() },
+                payload: ItemPayload::AgentMessage {
+                    questions: vec![],
+                    text: "hi".into(),
+                },
                 created_at: chrono::Utc::now(),
             },
         },
@@ -1885,7 +1901,7 @@ async fn wait_for_agent_message_item(
                     && let WireAgentEvent::ItemCompleted { turn, item, .. } = *agent_event
                     && matches!(
                         item.payload,
-                        giskard_proto::WireItemPayload::AgentMessage { ref text }
+                        giskard_proto::WireItemPayload::AgentMessage { ref text, .. }
                             if text == expected_text
                     )
                 {
@@ -2025,7 +2041,9 @@ async fn wait_for_thread_activity(
                     }
                     ServerMessage::Event { thread_id, .. }
                     | ServerMessage::HistoryDelta { thread_id, .. }
-                    | ServerMessage::RunningTasks { thread_id, .. } => {
+                    | ServerMessage::RunningTasks { thread_id, .. }
+                    | ServerMessage::ThreadCapabilities { thread_id, .. }
+                    | ServerMessage::SteerInputAccepted { thread_id, .. } => {
                         assert_eq!(
                             thread_id, active_thread,
                             "thread-scoped message should belong to subscribed thread"
@@ -2216,6 +2234,7 @@ async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
                 thread_id,
                 UserInput::text("cancelled caller"),
                 TurnOverrides {
+                    context_window: None,
                     model: Some(model.clone()),
                     mode: thread.mode.as_known().unwrap(),
                     permission_preset: thread.permission_preset,
@@ -2246,6 +2265,7 @@ async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
             thread_id,
             UserInput::text("next turn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(thread.current_model.as_known().unwrap().clone()),
                 mode: thread.mode.as_known().unwrap(),
                 permission_preset: thread.permission_preset,
@@ -2305,6 +2325,7 @@ async fn cancelling_compaction_caller_does_not_abandon_admitted_operation() {
             thread_id,
             UserInput::text("after compaction"),
             TurnOverrides {
+                context_window: None,
                 model: Some(thread.current_model.as_known().unwrap().clone()),
                 mode: thread.mode.as_known().unwrap(),
                 permission_preset: thread.permission_preset,
@@ -2346,6 +2367,7 @@ async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_atta
             thread_id,
             UserInput::text("a turn nobody is subscribed to"),
             TurnOverrides {
+                context_window: None,
                 model: Some(thread_file.current_model.as_known().unwrap().clone()),
                 mode: thread_file.mode.as_known().unwrap(),
                 permission_preset: thread_file.permission_preset,
@@ -2935,7 +2957,9 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                         );
                     }
                     ServerMessage::HistoryDelta { thread_id, .. }
-                    | ServerMessage::RunningTasks { thread_id, .. } => {
+                    | ServerMessage::RunningTasks { thread_id, .. }
+                    | ServerMessage::ThreadCapabilities { thread_id, .. }
+                    | ServerMessage::SteerInputAccepted { thread_id, .. } => {
                         assert_eq!(
                             thread_id, active_thread,
                             "snapshots should belong to the subscribed thread"
@@ -3485,6 +3509,7 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -3529,7 +3554,7 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
             assert!(turn.items.iter().any(|item| {
                 matches!(
                     &item.payload,
-                    ItemPayload::AgentMessage { text } if text == "subagent live output"
+                    ItemPayload::AgentMessage { text, .. } if text == "subagent live output"
                 )
             }));
             break;
@@ -3625,6 +3650,7 @@ async fn route_and_forwarder_import_same_native_child_once() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -3745,6 +3771,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -3821,6 +3848,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
                     provider: "other-provider".into(),
                     model: "other-model".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 },
             },
             "select_model",
@@ -3838,14 +3866,6 @@ async fn passive_subagent_command_start_streams_before_completion() {
                 thread_id: child_id,
             },
             "compact_context",
-        ),
-        (
-            ClientMessage::SteerInput {
-                thread_id: child_id,
-                turn_id: TurnId::new(),
-                text: "must not steer a read-only child".into(),
-            },
-            "steer_input",
         ),
     ];
     for (message, action) in mutations {
@@ -4011,6 +4031,7 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4052,7 +4073,7 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
             assert!(turn.items.iter().any(|item| {
                 matches!(
                     &item.payload,
-                    ItemPayload::AgentMessage { text } if text == "collab child output"
+                    ItemPayload::AgentMessage { text, .. } if text == "collab child output"
                 )
             }));
             break;
@@ -4097,6 +4118,7 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
             parent_id,
             UserInput::text("collab spawn input fallback"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4198,6 +4220,7 @@ async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
             parent_id,
             UserInput::text("subagent delayed metadata"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4245,7 +4268,7 @@ async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
             assert!(turn.items.iter().any(|item| {
                 matches!(
                     &item.payload,
-                    ItemPayload::AgentMessage { text } if text == "delayed metadata child output"
+                    ItemPayload::AgentMessage { text, .. } if text == "delayed metadata child output"
                 )
             }));
             break;
@@ -4290,6 +4313,7 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4376,7 +4400,7 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
             assert!(turn.items.iter().any(|item| {
                 matches!(
                     &item.payload,
-                    ItemPayload::AgentMessage { text } if text == "server-resolved child output"
+                    ItemPayload::AgentMessage { text, .. } if text == "server-resolved child output"
                 )
             }));
             break;
@@ -4421,6 +4445,7 @@ async fn subagent_link_open_rejects_unknown_and_non_link_items() {
             parent_id,
             UserInput::text("plain activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4489,6 +4514,7 @@ async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
             parent_id,
             UserInput::text("subagent terminal fallback"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4574,6 +4600,7 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4640,6 +4667,7 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
             parent_id,
             UserInput::text("subagent interrupted"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4738,6 +4766,7 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -4938,6 +4967,7 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
             child.id,
             UserInput::text("reverse parent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(fake_native_model()),
                 mode: Mode::Build,
                 permission_preset: child.permission_preset,
@@ -4990,6 +5020,7 @@ async fn route_rejects_native_child_with_a_different_parent() {
             parent_id,
             UserInput::text("foreign subagent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -5059,6 +5090,7 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -5091,6 +5123,7 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
             &child_handle,
             UserInput::text("nested collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(fake_native_model()),
                 mode: Mode::Build,
                 permission_preset: child.permission_preset,
@@ -5199,6 +5232,7 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_file.current_model.as_known().unwrap().clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
@@ -5239,6 +5273,7 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
             &child_handle,
             UserInput::text("approval"),
             TurnOverrides {
+                context_window: None,
                 model: Some(fake_native_model()),
                 mode: Mode::Build,
                 permission_preset: child_file.permission_preset,
@@ -5951,6 +5986,7 @@ async fn websocket_serializes_harness_error_events() {
                 }
                 other => panic!("expected error event, got {other:?}"),
             },
+            ServerMessage::ThreadCapabilities { thread_id, .. } => assert_eq!(thread_id, tid),
             ServerMessage::HistoryDelta { .. }
             | ServerMessage::LiveTurnSnapshot(_)
             | ServerMessage::RunningTasks { .. } => continue,
@@ -5974,6 +6010,7 @@ async fn subscribe_reopens_persisted_thread() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
 
     let resp = client
@@ -6012,6 +6049,7 @@ async fn subscribe_reopens_persisted_thread() {
                 mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: HashMap::from([(
                     "openai".into(),
                     HashMap::from([("gpt-5.5".into(), 258_400)]),
@@ -6087,6 +6125,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
 
     let resp = client
@@ -6125,6 +6164,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
                 mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
@@ -6223,6 +6263,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
 
     let resp = client
@@ -6260,6 +6301,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
@@ -6286,6 +6328,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                         id: ItemId::new(),
                         harness_item_id: "old_user".into(),
                         payload: ItemPayload::UserMessage {
+                            client_id: None,
                             text: "old input".into(),
                         },
                         created_at: now,
@@ -6294,6 +6337,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                         id: ItemId::new(),
                         harness_item_id: "old_agent".into(),
                         payload: ItemPayload::AgentMessage {
+                            questions: vec![],
                             text: "old answer".into(),
                         },
                         created_at: now,
@@ -6359,8 +6403,8 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 if let ServerMessage::Event { agent_event, .. } = server_msg {
                     match *agent_event {
                         WireAgentEvent::ItemCompleted { item, .. } => match item.payload {
-                            giskard_proto::WireItemPayload::AgentMessage { text }
-                            | giskard_proto::WireItemPayload::UserMessage { text } => {
+                            giskard_proto::WireItemPayload::AgentMessage { text, .. }
+                            | giskard_proto::WireItemPayload::UserMessage { text, .. } => {
                                 if text.starts_with("old ") {
                                     seen_old = true;
                                 }
@@ -6424,6 +6468,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
 
     let resp = client
@@ -6461,6 +6506,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                 mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
@@ -6488,6 +6534,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                     id: shared_item_id,
                     harness_item_id: "shared_agent".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: "old answer".into(),
                     },
                     created_at: now,
@@ -6574,14 +6621,14 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
     assert!(
         matches!(
             &saved[0].items[0].payload,
-            ItemPayload::AgentMessage { text } if text == "old answer"
+            ItemPayload::AgentMessage { text, .. } if text == "old answer"
         ),
         "old turn keeps its own payload"
     );
     assert!(
         matches!(
             &saved[1].items[0].payload,
-            ItemPayload::AgentMessage { text } if text == "new answer"
+            ItemPayload::AgentMessage { text, .. } if text == "new answer"
         ),
         "new turn keeps its own payload"
     );
@@ -6853,8 +6900,10 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
@@ -6930,6 +6979,7 @@ async fn open_thread_normalization_reuses_live_handle() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
     let pid = ProjectId::new();
     state
@@ -6956,6 +7006,7 @@ async fn open_thread_normalization_reuses_live_handle() {
                 mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 current_model: giskard_core::turn::TurnModel::Known(stale_model.clone()),
                 context_window: 128_000,
+                context_window_override: None,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
@@ -7039,8 +7090,8 @@ async fn concurrent_cold_opens_install_one_native_owner() {
         model,
     );
     let (first, second) = tokio::join!(first, second);
-    assert_eq!(first.unwrap().handle().harness_thread_id, "native-thread");
-    assert_eq!(second.unwrap().handle().harness_thread_id, "native-thread");
+    assert_eq!(first.unwrap().harness_thread_id, "native-thread");
+    assert_eq!(second.unwrap().harness_thread_id, "native-thread");
     assert_eq!(
         open_calls(&harness.core),
         1,
@@ -7079,6 +7130,7 @@ async fn concurrent_subagent_cold_opens_install_one_native_owner() {
             mode: giskard_core::turn::TurnMode::Known(Mode::Build),
             current_model: giskard_core::turn::TurnModel::Unknown,
             context_window: 0,
+            context_window_override: None,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: Default::default(),
@@ -7112,8 +7164,8 @@ async fn concurrent_subagent_cold_opens_install_one_native_owner() {
     let first = state.registry.attach_subagent_thread(&config, &child);
     let second = state.registry.attach_subagent_thread(&config, &child);
     let (first, second) = tokio::join!(first, second);
-    assert_eq!(first.unwrap().handle().harness_thread_id, "native-child");
-    assert_eq!(second.unwrap().handle().harness_thread_id, "native-child");
+    assert_eq!(first.unwrap().harness_thread_id, "native-child");
+    assert_eq!(second.unwrap().harness_thread_id, "native-child");
     assert_eq!(open_calls(&harness.core), 0);
     assert_eq!(harness.script.new_claims.load(Ordering::SeqCst), 1);
 }
@@ -7178,6 +7230,7 @@ async fn start_thread_with_initial_message_uses_selected_provider_and_starts_tur
         provider: "proxy".into(),
         model: "glm-5.2-workers-ai".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
     let resp = client
         .post(format!("{base}/api/projects/{pid}/threads/start"))
@@ -7299,6 +7352,7 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
     state
         .store
@@ -7329,6 +7383,7 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
         provider: "proxy".into(),
         model: "glm-5.2-workers-ai".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::SelectModel {
@@ -7394,6 +7449,7 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
         provider: "openai".into(),
         model: "gpt-5.5".into(),
         reasoning_effort: None,
+        service_tier: None,
     };
     state
         .store
@@ -7425,6 +7481,7 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
                 provider: "proxy".into(),
                 model: "glm-5.2-workers-ai".into(),
                 reasoning_effort: None,
+                service_tier: None,
             });
         })
         .await
@@ -7692,4 +7749,94 @@ async fn browse_mkdir_creates_directory_and_rejects_escapes() {
         assert_eq!(resp.status(), 400, "name {bad:?} should be rejected");
     }
     assert!(!parent.path().parent().unwrap().join("evil").exists());
+}
+
+#[tokio::test]
+async fn goals_queue_http_rejects_invalid_input_and_managed_mutation() {
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let client = reqwest::Client::new();
+    let cookie = auth::login(&client, &server.base).await;
+    let (project, thread) =
+        create_project_and_thread(&server.state, &client, &server.base, &cookie).await;
+    let url = format!(
+        "{}/api/projects/{project}/threads/{thread}/goals-queue",
+        server.base
+    );
+    let invalid = client
+        .post(&url)
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"action":"set_goal","objective":"", "token_budget": -1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), 400);
+    server
+        .state
+        .store
+        .update_thread(project, thread, |t| {
+            t.kind = giskard_core::ThreadKind::Subagent
+        })
+        .await
+        .unwrap();
+    for action in [
+        serde_json::json!({"action":"clear_goal"}),
+        serde_json::json!({"action":"start","id":null}),
+        serde_json::json!({"action":"add","text":"test","client_message_id":"test-id"}),
+    ] {
+        let blocked = client
+            .post(&url)
+            .header("cookie", &cookie)
+            .json(&action)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), 409);
+        assert!(blocked.text().await.unwrap().contains("read-only"));
+    }
+}
+
+#[tokio::test]
+async fn goals_queue_rejects_metadata_provider_mismatch_before_launch() {
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let client = reqwest::Client::new();
+    let cookie = auth::login(&client, &server.base).await;
+    let (project, thread) =
+        create_project_and_thread(&server.state, &client, &server.base, &cookie).await;
+    assert!(
+        server
+            .state
+            .registry
+            .loaded_thread_binding(thread)
+            .await
+            .and_then(|b| b.native_model().cloned())
+            .is_some()
+    );
+    server
+        .state
+        .store
+        .update_thread(project, thread, |t| {
+            let mut model = t.current_model.as_known().unwrap().clone();
+            model.provider = "different-provider".into();
+            t.current_model = giskard_core::turn::TurnModel::Known(model);
+        })
+        .await
+        .unwrap();
+    for command in [
+        serde_json::json!({"action":"start"}),
+        serde_json::json!({"action":"set_goal","objective":"work"}),
+        serde_json::json!({"action":"add","text":"work","client_message_id":"provider-test"}),
+    ] {
+        let response = client
+            .post(format!(
+                "{}/api/projects/{project}/threads/{thread}/goals-queue",
+                server.base
+            ))
+            .header("cookie", &cookie)
+            .json(&command)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 409);
+        assert!(response.text().await.unwrap().contains("provider differs"));
+    }
 }

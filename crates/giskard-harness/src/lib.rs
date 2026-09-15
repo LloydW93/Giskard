@@ -24,6 +24,10 @@ use giskard_core::user_input::UserInput;
 /// the UI adapts accordingly (§13.5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HarnessCapabilities {
+    /// Native per-session raw context configuration can be applied before work starts.
+    pub context_window_configuration: bool,
+    /// Additional input can be delivered to a specific active turn.
+    pub turn_steering: bool,
     /// Server-initiated, per-action approval requests (accept/decline while a turn is live).
     pub live_approvals: bool,
     /// Distinct read-only (plan) vs read-write (build) sandbox modes switchable per turn.
@@ -50,8 +54,6 @@ pub struct HarnessCapabilities {
     pub mcp_oauth_login: bool,
     /// Manual context compaction can be requested for a thread.
     pub context_compaction: bool,
-    /// Additional text input can be sent to an acknowledged active turn.
-    pub turn_steering: bool,
 }
 
 /// A provider the harness is configured to route turns to (spec §8.2).
@@ -300,6 +302,8 @@ pub struct OpenThreadOptions {
     /// The model to open on. For a resume this is an explicit override; the harness reports the
     /// effective model in the returned handle so callers can detect a provider that ignored it.
     pub initial_model: ModelRef,
+    /// Raw native context cap for this session.
+    pub context_window: Option<u32>,
     /// Bounded, non-blocking destination for metadata discovered after open returns.
     pub updates: ThreadUpdateSink,
 }
@@ -488,8 +492,7 @@ impl DiscoveryStream {
 ///   `shutdown`;
 /// - thread, taking a `ThreadHandle`: `open_thread`, `claim_native_thread`, `subscribe`,
 ///   `set_thread_name`, `set_thread_archived`, `delete_thread`, `compact_thread`, `interrupt`;
-/// - turn: `start_turn`, `steer_turn`, `respond_approval`, `respond_server_request`,
-///   `terminate_command`.
+/// - turn: `start_turn`, `respond_approval`, `respond_server_request`, `terminate_command`.
 ///
 /// Three contracts follow from "one instance, any number of processes":
 /// - `subscribe` is synchronous and must return a stream for every handle this instance
@@ -627,6 +630,38 @@ pub trait AgentHarness: Send + Sync {
         )))
     }
 
+    /// Deliver input only if the expected turn is still active. Never starts a turn.
+    /// Providers echo `client_message_id` on the resulting user item for exact receipt correlation.
+    async fn steer_turn(
+        &self,
+        _thread: &ThreadHandle,
+        _expected_turn: TurnId,
+        _input: UserInput,
+        _client_message_id: Option<String>,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(
+            "turn steering is not supported".into(),
+        ))
+    }
+
+    fn goals_queue_supported(&self) -> bool {
+        false
+    }
+
+    /// Read or change harness-owned goals and queued input without creating a second state owner.
+    /// Goal set and queue add/start require selected settings, applied before initiating work.
+    /// Other commands do not change native settings, even if a caller supplies them.
+    async fn goals_queue(
+        &self,
+        _thread: &ThreadHandle,
+        _command: giskard_core::goals_queue::GoalsQueueCommand,
+        _settings: Option<TurnOverrides>,
+    ) -> Result<giskard_core::goals_queue::GoalsQueueSnapshot, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "goals and queue controls are not supported".into(),
+        ))
+    }
+
     /// Interrupt the active turn of a thread.
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
 
@@ -638,20 +673,6 @@ pub trait AgentHarness: Send + Sync {
         input: UserInput,
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError>;
-
-    /// Send additional text input to the exact acknowledged turn that is still active.
-    async fn steer_turn(
-        &self,
-        thread: &ThreadHandle,
-        expected_turn: TurnId,
-        text: String,
-    ) -> Result<(), HarnessError> {
-        let _ = text;
-        Err(HarnessError::Unsupported(format!(
-            "turn steering is not supported for thread {} turn {expected_turn}",
-            thread.thread
-        )))
-    }
 
     /// Respond to a pending approval request.
     ///

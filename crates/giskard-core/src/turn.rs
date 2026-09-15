@@ -125,6 +125,9 @@ impl PermissionPreset {
 /// can pass it to `turn/start`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnOverrides {
+    /// Selected raw session window; applied before native work is admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
     pub mode: Mode,
@@ -151,8 +154,7 @@ pub enum TurnStatusKind {
     Failed,
 }
 
-/// One unit of agent work initiated by user input and optionally steered while active
-/// (spec §4.5, B1, TS1).
+/// One unit of agent work initiated by a single user input (spec §4.5, B1).
 ///
 /// Persisted inside the thread file (§5.3) as an element of `Thread.turns`, and the unit the
 /// diff viewer / token gauge read from.
@@ -198,6 +200,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         };
         assert_eq!(
             serde_json::to_value(TurnModel::Known(model.clone())).unwrap(),
@@ -232,10 +235,12 @@ mod tests {
     #[test]
     fn turn_overrides_serde() {
         let overrides = TurnOverrides {
+            context_window: None,
             model: Some(ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: Some(Effort::new("high")),
+                service_tier: None,
             }),
             mode: Mode::Build,
             permission_preset: PermissionPreset::AskFirst,

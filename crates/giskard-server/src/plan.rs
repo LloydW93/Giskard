@@ -22,7 +22,7 @@ pub fn extract_plan_markdown(title: &str, turns: &[Turn]) -> Option<String> {
         .items
         .iter()
         .filter_map(|item| match &item.payload {
-            ItemPayload::AgentMessage { text } => Some(text.as_str()),
+            ItemPayload::AgentMessage { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -115,6 +115,7 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
+            service_tier: None,
         }
     }
 
@@ -122,7 +123,10 @@ mod tests {
         Item {
             id: giskard_core::ids::ItemId::new(),
             harness_item_id: String::new(),
-            payload: ItemPayload::AgentMessage { text: text.into() },
+            payload: ItemPayload::AgentMessage {
+                questions: vec![],
+                text: text.into(),
+            },
             created_at: Utc::now(),
         }
     }

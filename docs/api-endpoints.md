@@ -15,6 +15,7 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/tool-output`,
 `GET /api/projects/{id}/threads/{thread_id}/deletion-impact`,
 `GET /api/projects/{id}/models`,
+`GET/POST /api/projects/{id}/threads/{thread_id}/context-window`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
 `GET /api/projects/{id}/threads/{thread_id}/highlight|raw|image`, `POST
 /api/projects/{id}/threads/{thread_id}/linkify`, `POST
@@ -43,6 +44,30 @@ so a project-less list could only ever repeat `config.toml` back, which is why n
 `GET /api/models` nor `POST /api/models/refresh` exists. The thread picker's reload button re-runs
 this endpoint for the active project.
 
+Model descriptors preserve optional `service_tiers` (`id`, `name`, `description`),
+`default_service_tier`, `input_modalities`, and `multi_agent_version` from the native catalog.
+Unknown versus explicitly empty capability lists remain distinct. The optional `service_tier`
+field in `model_ref` is accepted by thread start and WebSocket `select_model`, persisted as part
+of model metadata, and passed to each turn. Nonempty selections must match an advertised tier
+and fit in 128 bytes; invalid selections return HTTP 400 or WebSocket `invalid_service_tier`.
+Sending with a tier that was removed from the catalog returns the same structured error.
+Absent/null selects the native thread default; model defaults are descriptive, never inferred.
+
+`GET /api/projects/{id}/threads/{thread_id}/context-window` returns the selected model together
+with its `advertised_maximum` (catalog metadata or retained natural gauge capacity), policy
+`default_window`, durable `override_window`, resulting
+`selected_window`, known `non_premium_window`, latest runtime `effective_window`, and
+`can_configure`. These values deliberately distinguish the raw session selection from the smaller
+effective window a harness may report after reserving headroom.
+
+`POST` on the same path accepts `{ "model": ModelRef, "context_window": number | null }`. A number
+must be between the policy default and the model's current advertised maximum; `null` resets to the
+default. The model reference is an optimistic concurrency guard and stale selections return 409.
+The preference is durable per primary session, is cleared by a provider/model change, and is
+preserved across effort or service-tier changes. It affects subsequent native launch boundaries
+without interrupting active work. Archived and agent-owned threads cannot change it; a harness
+without context configuration reports `can_configure: false` and rejects updates.
+
 `POST /api/projects/{id}/threads/start` takes `git_strategy`, which decides where the thread's
 working tree comes from: `shared` (the project's own checkout — the default, and what an omitted
 field means) or `worktree` (a linked Git worktree of its own, §7.1). It is an enum rather than a
@@ -52,11 +77,12 @@ tell.
 
 `POST /api/projects/{id}/threads/start` creates the durable thread from the first user message or
 attachment set, persists a deterministic title generated from the prompt or first attachment name,
-and returns the title with the new thread and turn identifiers. Both this response and the existing
-thread open response include `turn_steering`, sampled from the attached harness; a degraded
-read-only open reports `false`. The request accepts optional
+and returns the title with the new thread and turn identifiers. The request accepts optional
 transient attachment payloads; Giskard validates them and does not persist raw attachment bytes.
-Image MIME types must match PNG, JPEG, GIF, or WebP file signatures. Raw bytes are also redacted
+Attachment kind may be `image`, `audio`, or `file`. Image MIME types must match PNG, JPEG, GIF, or WebP file signatures.
+Audio MIME types must match WAV (`audio/wav`) or MP3 (`audio/mpeg`) signatures. An explicit
+model input-modality list that excludes audio rejects audio attachments before turn admission;
+unknown modality metadata defers to the harness. Raw bytes are also redacted
 before turns enter the parsed in-memory history cache. The Codex adapter transfers non-image files
 into a randomized per-turn directory under the harness host's temporary directory. It removes the
 directory after turn completion, upload/start failure, stream loss, channel closure, or shutdown;
@@ -141,15 +167,6 @@ server-request responses both include `thread_id` so the runtime registry can va
 the request atomically instead of consulting a global request-to-thread routing map.
 See [Sub-agent threads](subagents.md) for the full contract.
 
-The WebSocket distinguishes starting work from steering it. `SendInput { thread_id, text,
-attachments? }` starts a new turn and remains rejected with `thread_turn_active` if one already
-owns the thread. `SteerInput { thread_id, turn_id, text }` appends text to that exact acknowledged
-active user turn; it never creates a new turn or queues a follow-up. Steering rejects stale or
-unacknowledged IDs, manual compaction, persistence-blocked and read-only threads, and unsupported
-harnesses. Success appears through the ordinary same-turn `UserMessage` item. A direct steering
-error is sent only to the initiating client and does not clear the real active turn. Attachments
-are disabled while a turn is active because steering is text-only.
-
 `GET /api/projects/{id}/threads/{thread_id}/history` returns completed turns oldest-first as
 `{ thread_id, turns, has_more }`. `before=<TurnId>` selects the page immediately before that turn;
 without it the endpoint returns the newest page. `limit` is optional and is clamped to 1–100 turns;
@@ -172,8 +189,9 @@ Agent-owned sub-agent threads are independently and permanently read-only. Their
 model/mode/permission controls, rename, archive, direct delete, and workspace writes such as
 `SavePlan` are disabled or rejected with `thread_read_only` before harness I/O. This restriction is
 not recoverable through
-a provider switch. Matched approval/server-request responses, interrupting active work, command
-termination, transcript/history reads, and navigation remain supported.
+a provider switch. Matched approval/server-request responses, matched active asynchronous-question
+answers, interrupting active work, command termination, transcript/history reads, and navigation
+remain supported.
 
 `DELETE /api/projects/{id}/threads/{thread_id}` refuses with `409` when the thread — or any linked
 child it cascades to — has a Git worktree holding work that exists nowhere else: uncommitted
@@ -258,3 +276,60 @@ worktree, so a path that is both staged and modified again can be diffed one sid
 other value is rejected. The path is lexical workspace-relative only: absolute paths and `..`
 escapes are rejected, so deleted files can still be diffed without allowing access outside the
 workspace.
+
+### Steering an active turn
+
+On subscription, `thread_capabilities` reports `thread_id` and `turn_steering`.
+A browser may send `steer_input` with `thread_id`, `expected_turn_id`, `request_id`,
+and nonempty `text`. The expected ID comes from `turn_started` or `live_turn_snapshot`.
+The server checks the writable thread and existing live turn before delivery. Codex also
+checks the exact native `expectedTurnId`, so a turn ending during delivery cannot redirect
+input into a replacement turn. Steering does not admit or reserve a new turn.
+
+Success returns `steer_input_accepted` with the same `request_id`, `thread_id`, and `turn_id`.
+Failures return the usual `error` with `action: "steer_input"` and the same `request_id`.
+A timeout means delivery is unknown; clients must not retry automatically. Attachments are
+not accepted by this initial text steering operation. Agent-owned threads remain read-only
+for generic steering. A response to an active async question supplies optional
+`question_item_id`; the server verifies the item belongs to this exact thread and live turn
+and carries nonempty structured questions before permitting a child-thread response.
+Wrong or stale question identities are rejected on primary threads as well. Accepted input is
+recorded through provider user-message events. The server supplies native `clientUserMessageId`
+`giskard-steer:<request_id>` and preserves its `clientId` echo as `client_id` on wire user-message
+payloads. Clients can therefore confirm exact delivery without mistaking another identical message
+for a receipt. The namespace also distinguishes steering from initial input sent by other native
+clients, which may carry their own client IDs.
+
+### Goals and queue
+
+- `GET /api/projects/{id}/threads/{thread_id}/goals-queue?cursor=...` reads the harness-owned goal
+  and one queue page. Response: `{goal, queue, next_cursor}`. Goal fields are `objective`, `status`
+  (`active`, `paused`, `blocked`, `usage_limited`, `budget_limited`, `complete`), `token_budget`,
+  `tokens_used`, `time_used_seconds`, `created_at`, `updated_at`. Queue entries contain `id`,
+  `client_message_id`, `text`, and `has_other_input`.
+- `POST` to the same path accepts tagged actions: `read` (`cursor` optional), `set_goal` (`objective`,
+  `status`, `token_budget` optional), `clear_goal`, `add` (`text`, `client_message_id`), `update`
+  (`id`, `text`), `delete` (`id`), `reorder` (`ids`), `start` (`id` optional). Successful responses
+  contain a refreshed snapshot. Mutations require an opened, non-archived primary thread; managed
+  children and orphans are read-only. Empty text, invalid budgets, and duplicate order IDs fail
+  validation. Null/absent goal budget preserves the existing value. Queue mutations are never
+  automatically retried: timeouts may mean delivery occurred, and accepted mutations whose refresh
+  failed explicitly report that acceptance.
+- WebSocket `thread_capabilities` includes `goals_queue`; `goals_queue_changed` agent events
+  invalidate goal/queue snapshots. Reconnect reads fresh harness state rather than browser storage.
+### MCP form response validation
+
+The existing `server_request_response` WebSocket action validates accepted MCP form content
+against the complete pending request's JSON Schema before delivering it to the harness.
+Invalid content, malformed/unknown schema dialects, and unavailable external references return
+`harness_protocol_error` with action `server_request_response`; the request returns to Pending
+and can be corrected or declined. Decline/Cancel bypass content validation. Validation never
+retrieves remote or local-file schema references.
+
+Goal `set_goal` and queue `add`/`start` capture the current persisted model/effort/service tier,
+mode and permission preset, plus the loaded workspace, through native `thread/settings/update`
+before the action. A provider mismatch or settings failure rejects the action. The capture applies
+to subsequent native queued/goal work for the thread, not per queue entry or the already-running
+turn. Changing selectors alone does not reconfigure autonomous work; save/resume a goal or submit
+queue Add or Start to capture the changed preferences. The browser cannot supply arbitrary launch
+settings through this endpoint.

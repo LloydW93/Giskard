@@ -362,6 +362,8 @@ fn server_message_kind(msg: &ServerMessage) -> &'static str {
         ServerMessage::RunningTasks { .. } => "running_tasks",
         ServerMessage::Error { .. } => "error",
         ServerMessage::Pong => "pong",
+        ServerMessage::ThreadCapabilities { .. } => "thread_capabilities",
+        ServerMessage::SteerInputAccepted { .. } => "steer_input_accepted",
     }
 }
 
@@ -743,6 +745,7 @@ mod tests {
 
         let state = |revision| ThreadState {
             metadata: ThreadMetadata {
+                context_window_override: None,
                 thread_id,
                 revision,
                 title: format!("revision {revision}"),
@@ -751,6 +754,7 @@ mod tests {
                     provider: "test".into(),
                     model: "test".into(),
                     reasoning_effort: None,
+                    service_tier: None,
                 }),
                 context_window: 128_000,
                 permission_preset: PermissionPreset::AskFirst,
@@ -824,6 +828,7 @@ mod tests {
             thread_id,
             Outbound::Metadata(ThreadState {
                 metadata: ThreadMetadata {
+                    context_window_override: None,
                     thread_id,
                     revision: 2,
                     title: "Thread".into(),
@@ -832,6 +837,7 @@ mod tests {
                         provider: "test".into(),
                         model: "test".into(),
                         reasoning_effort: None,
+                        service_tier: None,
                     }),
                     context_window: 128_000,
                     permission_preset: PermissionPreset::AskFirst,

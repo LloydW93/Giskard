@@ -81,6 +81,10 @@ max_command_output_bytes = 134217728   # 128 MiB
 kind = "codex"
 # Terminate an idle project's harness process after N seconds (0 = keep alive while the app runs).
 idle_shutdown_secs = 0
+# Optional trusted host programs (absolute executable + literal argv), disabled by default.
+# See docs/native-service-providers.md for protocol, security, and upstream requirements.
+attestation_provider_command = []
+external_auth_provider_command = []
 
 # ---- Providers ----
 # This whole section is OPTIONAL, and most setups need none of it.
@@ -140,3 +144,18 @@ model_listing = false
   [[providers.cloudflare-litellm.models]]
   id = "@cf/z-ai/glm-4.7"
   context_window = 131072
+
+# Optional operator-installed client tools. These execute as the Giskard server user, outside
+# Codex's sandbox/approval policy. An absolute command and explicit absolute cwd are required.
+# See README "Client-executed tools" for the stdin/stdout contract and lifecycle limits.
+# [[harness.dynamic_tools]]
+# name = "local_tools"
+# description = "Tools installed by this server's operator"
+# [[harness.dynamic_tools.tools]]
+# name = "lookup"
+# description = "Look up a local reference"
+# input_schema = { type = "object", properties = { query = { type = "string" } }, required = ["query"], additionalProperties = false }
+# command = "/opt/giskard-tools/lookup"
+# cwd = "/opt/giskard-tools"
+# args = []
+# timeout_ms = 30000

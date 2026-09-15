@@ -52,7 +52,7 @@ struct WorkerQueueSnapshot {
 struct WorkerQueueState {
     next_id: u64,
     pending: HashMap<u64, WorkerQueueToken>,
-    active: HashMap<u64, WorkerQueueToken>,
+    active: Option<WorkerQueueToken>,
     closed: bool,
 }
 
@@ -67,7 +67,7 @@ impl WorkerQueueWatchdog {
             state: StdMutex::new(WorkerQueueState {
                 next_id: 1,
                 pending: HashMap::new(),
-                active: HashMap::new(),
+                active: None,
                 closed: false,
             }),
         }
@@ -101,12 +101,14 @@ impl WorkerQueueWatchdog {
     pub(crate) fn mark_started(&self, token: WorkerQueueToken) {
         let mut state = self.lock_state();
         state.pending.remove(&token.id);
-        state.active.insert(token.id, token);
+        state.active = Some(token);
     }
 
     pub(crate) fn mark_finished(&self, token: WorkerQueueToken) {
         let mut state = self.lock_state();
-        state.active.remove(&token.id);
+        if state.active.is_some_and(|active| active.id == token.id) {
+            state.active = None;
+        }
     }
 
     pub(crate) fn close(&self) {
@@ -129,13 +131,8 @@ impl WorkerQueueWatchdog {
             }
         }
 
-        let oldest_active = state
-            .active
-            .values()
-            .copied()
-            .min_by_key(|token| (token.enqueued_at, token.id));
         WorkerQueueSnapshot {
-            active: oldest_active.map(|token| snapshot_queue_token(token, now)),
+            active: state.active.map(|token| snapshot_queue_token(token, now)),
             oldest_pending: oldest_pending.map(|token| snapshot_queue_token(token, now)),
             command_pending,
             control_pending,
@@ -256,29 +253,5 @@ mod tests {
         assert_eq!(active.project_id, Some(project_id));
         assert_eq!(active.thread_id, Some(thread_id));
         assert_eq!(active.action, "open_thread");
-    }
-
-    #[test]
-    fn finishing_a_nested_control_preserves_an_older_in_flight_operation() {
-        let watchdog = WorkerQueueWatchdog::new();
-        let thread_id = ThreadId::new();
-        let steering = watchdog.enqueue(
-            WorkerQueueKind::Control,
-            "steer_turn",
-            None,
-            Some(thread_id),
-        );
-        watchdog.mark_started(steering);
-        let interrupt =
-            watchdog.enqueue(WorkerQueueKind::Control, "interrupt", None, Some(thread_id));
-        watchdog.mark_started(interrupt);
-        watchdog.mark_finished(interrupt);
-
-        let active = watchdog
-            .snapshot()
-            .active
-            .expect("steering remains observable while its response is pending");
-        assert_eq!(active.action, "steer_turn");
-        assert_eq!(active.thread_id, Some(thread_id));
     }
 }

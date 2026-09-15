@@ -237,11 +237,6 @@ impl ResolvedThreadRuntime {
         self.support.has_active_turn(&self.authority)
     }
 
-    /// Returns the exact acknowledged user turn that may accept steering.
-    pub(crate) fn steerable_turn_id(&self) -> Option<TurnId> {
-        self.support.steerable_turn_id(&self.authority)
-    }
-
     /// Reports whether the reconnect buffer contains an active turn.
     pub fn live_is_active(&self) -> bool {
         self.support.live_is_active(&self.authority)
@@ -960,13 +955,6 @@ impl ThreadRuntimeSupport {
             .is_active()
     }
 
-    pub(crate) fn steerable_turn_id(&self, authority: &Arc<ThreadAuthority>) -> Option<TurnId> {
-        let entry = self.existing_entry(authority)?;
-        lock_unpoison(&entry, "thread runtime entry")
-            .gate
-            .steerable_turn_id()
-    }
-
     fn acknowledge_turn(
         &self,
         authority: &Arc<ThreadAuthority>,
@@ -1600,6 +1588,7 @@ mod tests {
                         provider: "provider".into(),
                         model: "model".into(),
                         reasoning_effort: None,
+                        service_tier: None,
                     }),
                     context_kind: "test",
                 },
@@ -1813,6 +1802,7 @@ mod tests {
                     id: item_id,
                     harness_item_id: "replacement-item".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: "the item no longer represents a file change".into(),
                     },
                     created_at: chrono::Utc::now(),
@@ -2419,6 +2409,7 @@ mod tests {
                         provider: "provider".into(),
                         model: "model".into(),
                         reasoning_effort: None,
+                        service_tier: None,
                     }),
                     context_kind: "user",
                 },
@@ -2492,6 +2483,7 @@ mod tests {
                         provider: "provider".into(),
                         model: "model".into(),
                         reasoning_effort: None,
+                        service_tier: None,
                     }),
                     context_kind: "test",
                 },
@@ -2529,6 +2521,7 @@ mod tests {
                         provider: "provider".into(),
                         model: "model".into(),
                         reasoning_effort: None,
+                        service_tier: None,
                     }),
                     context_kind: "user",
                 },
@@ -2613,6 +2606,7 @@ mod tests {
                         provider: "provider".into(),
                         model: "model".into(),
                         reasoning_effort: None,
+                        service_tier: None,
                     }),
                     context_kind: "user",
                 },
@@ -2623,34 +2617,6 @@ mod tests {
         assert!(overview.threads.is_empty());
         assert!(!runtime.has_active_turn(&authority));
         assert!(lease.release().is_none());
-    }
-
-    #[test]
-    fn only_an_acknowledged_user_owner_is_steerable() {
-        let runtime = ThreadRuntimeSupport::new();
-        let authority = test_authority(ThreadId::new());
-        let reservation = |context_kind| TurnReservation {
-            project_id: ProjectId::new(),
-            harness_thread_id: "native".into(),
-            mode: TurnMode::Known(Mode::Build),
-            model: TurnModel::Unknown,
-            context_kind,
-        };
-
-        let mut user = runtime
-            .reserve_turn(&authority, reservation("user"))
-            .unwrap();
-        assert_eq!(runtime.steerable_turn_id(&authority), None);
-        let turn_id = TurnId::new();
-        let _ = user.acknowledge_turn(turn_id);
-        assert_eq!(runtime.steerable_turn_id(&authority), Some(turn_id));
-        let _ = user.release();
-
-        let mut compaction = runtime
-            .reserve_turn(&authority, reservation("manual_compaction"))
-            .unwrap();
-        let _ = compaction.acknowledge_turn(TurnId::new());
-        assert_eq!(runtime.steerable_turn_id(&authority), None);
     }
 
     #[tokio::test]
@@ -2666,6 +2632,7 @@ mod tests {
                 provider: "provider".into(),
                 model: "model".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }),
             context_kind: "user",
         };
@@ -2682,6 +2649,7 @@ mod tests {
                 provider: "provider".into(),
                 model: "model".into(),
                 reasoning_effort: None,
+                service_tier: None,
             }
             .into(),
             mode: TurnMode::Known(Mode::Build),
@@ -2754,7 +2722,6 @@ mod tests {
             runtime.current_overview().threads[0].turn_state,
             RuntimeTurnState::PersistenceBlocked { turn_id, .. } if turn_id == turn.id
         ));
-        assert_eq!(runtime.steerable_turn_id(&authority), None);
         assert!(
             runtime
                 .reserve_turn(&authority, reservation.clone())
@@ -3183,6 +3150,7 @@ mod tests {
                     id: item_id,
                     harness_item_id: "item-1".into(),
                     payload: ItemPayload::AgentMessage {
+                        questions: vec![],
                         text: "done".into(),
                     },
                     created_at: Utc::now(),
