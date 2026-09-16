@@ -150,11 +150,11 @@ pub fn configured_session_context_window(
     requested: Option<u32>,
 ) -> Option<u32> {
     let mut resolved = descriptor.clone();
-    if let Some(runtime) = runtime_model_context_window(model, runtime_windows) {
-        resolved.advertised_context_window = resolved
-            .advertised_context_window
-            .filter(|window| *window > 0)
-            .map_or(Some(runtime), |advertised| Some(advertised.min(runtime)));
+    if resolved
+        .advertised_context_window
+        .is_none_or(|window| window == 0)
+    {
+        resolved.advertised_context_window = runtime_model_context_window(model, runtime_windows);
     }
     resolved
         .advertised_context_window
