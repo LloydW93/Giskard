@@ -129,13 +129,15 @@ async fn defaults_and_overrides_reach_native_boundaries_and_stay_session_scoped(
         .store
         .update_thread(project.id, first, |tf| {
             let selected = tf.current_model.as_known().unwrap().clone();
-            tf.record_model_context_window(&selected, 800_000);
+            // A configured Astra session reports a smaller usable gauge than its raw limit. That
+            // effective value must not replace the catalog's authoritative selectable maximum.
+            tf.record_model_context_window(&selected, 258_400);
         })
         .await
         .unwrap();
     let settings = get(&server, &path).await;
     assert_eq!(settings["default_window"], 272_000);
-    assert_eq!(settings["advertised_maximum"], 800_000);
+    assert_eq!(settings["advertised_maximum"], 1_000_000);
     assert!(settings["override_window"].is_null());
     let response = server
         .client
@@ -194,7 +196,7 @@ async fn defaults_and_overrides_reach_native_boundaries_and_stay_session_scoped(
     .await
     .unwrap();
     assert!(launched.lock().unwrap().contains(&(first, Some(512_000))));
-    for invalid in [0, 271_999, 800_001] {
+    for invalid in [0, 271_999, 1_000_001] {
         let response = server
             .client
             .post(server.url(&path))
