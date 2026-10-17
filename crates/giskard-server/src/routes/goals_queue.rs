@@ -78,12 +78,10 @@ async fn execute(
                 "Thread binding belongs to a different project".into(),
             ));
         }
-        None if command.is_read() => {
-            (
-                giskard_harness::ThreadHandle::detached(thread_id, thread.harness_thread_id),
-                thread.harness.clone(),
-            )
-        }
+        None if command.is_read() => (
+            giskard_harness::ThreadHandle::detached(thread_id, thread.harness_thread_id),
+            thread.harness.clone(),
+        ),
         None => {
             return Err(ApiError::Conflict(
                 "Open the thread before changing its goal or queue".into(),

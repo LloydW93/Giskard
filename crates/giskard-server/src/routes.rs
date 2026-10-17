@@ -2356,6 +2356,7 @@ mod tests {
                 reasoning_effort: None,
             }),
             context_window: 128_000,
+            context_window_override: None,
             model_context_windows: Default::default(),
             permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
             model_efforts: Default::default(),

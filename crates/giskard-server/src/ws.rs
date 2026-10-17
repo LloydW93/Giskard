@@ -613,11 +613,8 @@ async fn handle_client_msg(
                 .thread(thread_id)
                 .action("send_input")
             })?;
-            let descriptor = crate::models::resolve_catalog_descriptor(
-                &catalog,
-                &app_config,
-                &effective_model,
-            );
+            let descriptor =
+                crate::models::resolve_catalog_descriptor(&catalog, &app_config, &effective_model);
 
             // Resolved snapshot the harness applies to `turn/start` (§7.5, §8.4/§8.5):
             //  - the thread's current model (carrying its reasoning effort), so a mid-thread

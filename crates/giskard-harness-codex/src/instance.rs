@@ -259,13 +259,9 @@ where
                 overrides,
                 response,
             } => {
-                if let Err(error) = context_policy::ensure(
-                    &mut self.client,
-                    &mut self.mapper,
-                    &thread,
-                    &overrides,
-                )
-                .await
+                if let Err(error) =
+                    context_policy::ensure(&mut self.client, &mut self.mapper, &thread, &overrides)
+                        .await
                 {
                     let _ = response.send(Err(error));
                     return;

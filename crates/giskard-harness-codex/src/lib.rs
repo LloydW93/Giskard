@@ -2908,6 +2908,7 @@ mod tests {
 
     fn turn_overrides(mode: Mode, effort: Option<Effort>) -> TurnOverrides {
         TurnOverrides {
+            context_window: None,
             model: Some(test_model(effort)),
             mode,
             permission_preset: PermissionPreset::AskFirst,
@@ -3461,6 +3462,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp"),
             resume: resume.map(str::to_owned),
             initial_model: test_model(None),
+            context_window: None,
             updates,
         }
     }
@@ -4649,6 +4651,7 @@ mod tests {
                 workspace_root: PathBuf::from("/tmp"),
                 resume: Some("native-existing".into()),
                 initial_model: test_model(None),
+                context_window: None,
                 updates,
             })
             .await

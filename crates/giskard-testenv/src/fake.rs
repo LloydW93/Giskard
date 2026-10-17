@@ -302,6 +302,9 @@ pub trait Script: Send + Sync + 'static {
     fn capabilities(&self) -> HarnessCapabilities {
         caps::TURNS
     }
+    fn context_window_configuration_supported(&self) -> bool {
+        false
+    }
     fn native_thread_id(&self, thread: ThreadId) -> String {
         format!("test_{thread}")
     }
@@ -422,6 +425,9 @@ impl<S: Script> FakeHarness<S> {
 impl<S: Script> AgentHarness for FakeHarness<S> {
     fn capabilities(&self) -> HarnessCapabilities {
         self.script.capabilities()
+    }
+    fn context_window_configuration_supported(&self) -> bool {
+        self.script.context_window_configuration_supported()
     }
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
         self.script.list_models().await

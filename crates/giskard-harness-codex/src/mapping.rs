@@ -763,6 +763,15 @@ impl CodexMapper {
                 })
             }
 
+            Notification::ThreadClosed(n) => {
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
+                if let Err(error) = self.routes.set_context_window(&n.thread_id, thread, None) {
+                    warn!(%error, %thread, native_thread_id = %n.thread_id,
+                        "failed to invalidate context configuration for closed native thread");
+                }
+                None
+            }
+
             Notification::ThreadGoalUpdated(n) => Some(AgentEvent::GoalsQueueChanged {
                 thread: self.resolve_thread(&n.thread_id, fallback_thread)?,
             }),
