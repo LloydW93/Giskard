@@ -26,9 +26,11 @@ struct ContextScript {
 
 #[async_trait]
 impl Script for ContextScript {
+    fn context_window_configuration_supported(&self) -> bool {
+        true
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
-            context_window_configuration: true,
             model_listing: true,
             provider_listing: true,
             ..giskard_testenv::fake::caps::TURNS
@@ -46,6 +48,8 @@ impl Script for ContextScript {
             name: None,
             base_url: None,
             auth: None,
+            http_headers: Default::default(),
+            env: Default::default(),
         }])
     }
     async fn open_thread(
@@ -230,7 +234,6 @@ async fn defaults_and_overrides_reach_native_boundaries_and_stay_session_scoped(
                 provider: "openai".into(),
                 model: "other".into(),
                 reasoning_effort: None,
-                service_tier: None,
             });
         })
         .await

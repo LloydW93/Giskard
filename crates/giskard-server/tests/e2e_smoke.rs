@@ -481,7 +481,6 @@ fn started_inputs(core: &FakeCore) -> Vec<String> {
 impl Script for UnsupportedCompactionScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
-            context_window_configuration: false,
             turn_steering: false,
             live_approvals: false,
             plan_build_modes: false,
@@ -1204,7 +1203,6 @@ impl Script for CountingScript {
 impl Script for NoMcpScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
-            context_window_configuration: false,
             turn_steering: false,
             live_approvals: false,
             plan_build_modes: false,

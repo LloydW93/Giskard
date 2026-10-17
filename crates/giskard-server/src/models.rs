@@ -1666,7 +1666,6 @@ model_listing = true
             provider: "provider".into(),
             model: "gpt-6-astra".into(),
             reasoning_effort: None,
-            service_tier: None,
         };
         let descriptor = resolve_catalog_descriptor(&merged, &config, &model);
         assert_eq!(descriptor.context_window, 100_000);

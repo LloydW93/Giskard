@@ -300,6 +300,10 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl CodexTransport for Native {
+        fn start_request_json(&mut self, _: &str, _: Value) -> crate::CodexRequestFuture {
+            Box::pin(async { panic!("context policy tests use ordered requests") })
+        }
+
         async fn request_json(
             &mut self,
             method: &str,
@@ -387,7 +391,6 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-6-astra".into(),
                 reasoning_effort: Some(Effort::new("high")),
-                service_tier: None,
             }),
             mode: Mode::Build,
             permission_preset: PermissionPreset::AskFirst,
