@@ -2449,6 +2449,7 @@ mod tests {
     ) -> (OpenThreadOptions, ThreadUpdateStream) {
         let (updates, stream) = thread_update_channel();
         let options = OpenThreadOptions {
+            context_window: None,
             project: giskard_core::ids::ProjectId::new(),
             thread,
             workspace_root: PathBuf::from(WORKSPACE),
@@ -2461,6 +2462,7 @@ mod tests {
 
     fn overrides() -> TurnOverrides {
         TurnOverrides {
+            context_window: None,
             model: None,
             mode: Mode::Build,
             permission_preset: PermissionPreset::AskFirst,
@@ -3539,6 +3541,7 @@ mod tests {
         model: Option<ModelRef>,
     ) -> TurnOverrides {
         TurnOverrides {
+            context_window: None,
             model,
             mode,
             permission_preset: preset,
