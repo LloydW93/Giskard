@@ -513,7 +513,7 @@ where
                         )
                         .await;
                         self.active_turns.remove(&thread);
-                        self.mapper.clear_active_turn(thread);
+                        self.mapper.clear_active_turn_if_matches(thread, turn);
                         debug!(
                             %thread,
                             %turn,

@@ -222,6 +222,22 @@ impl CodexMapper {
             .retain(|key, _| key.thread_id != thread);
     }
 
+    /// Clear adapter state only when it still belongs to the completed Giskard turn.
+    ///
+    /// Goal mode may announce its next native turn before the worker finishes cleaning up the
+    /// preceding requested turn. That newer mapping must survive the older turn's cleanup.
+    pub fn clear_active_turn_if_matches(&mut self, thread: ThreadId, completed: TurnId) {
+        let matches = self
+            .active_turns
+            .get(&thread)
+            .map(|native| NativeTurnKey::new(thread, native.clone()))
+            .and_then(|key| self.turn_ids.get(&key))
+            .is_some_and(|turn| *turn == completed);
+        if matches {
+            self.clear_active_turn(thread);
+        }
+    }
+
     /// Register the native turn id returned by `turn/start` before notifications start streaming.
     ///
     /// Codex returns the native turn id in the `turn/start` response, then repeats it on
@@ -6158,6 +6174,27 @@ mod tests {
         mapper.clear_active_turn(thread);
 
         assert_eq!(mapper.active_native_turn_for_thread(thread), None);
+    }
+
+    #[test]
+    fn completed_turn_cleanup_preserves_a_newer_goal_turn() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        let completed = mapper
+            .register_active_turn(thread, "native_turn_1")
+            .expect("requested turn registers");
+        let autonomous = match mapper.map_notification(&turn_started("native_turn_2"), thread) {
+            Some(AgentEvent::TurnStarted { turn, .. }) => turn,
+            other => panic!("expected autonomous TurnStarted, got {other:?}"),
+        };
+
+        mapper.clear_active_turn_if_matches(thread, completed);
+
+        assert_ne!(autonomous, completed);
+        assert_eq!(
+            mapper.active_native_turn_for_thread(thread),
+            Some("native_turn_2")
+        );
     }
 
     #[test]
