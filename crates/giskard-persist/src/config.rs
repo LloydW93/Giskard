@@ -460,6 +460,10 @@ pub struct ProviderConfig {
     /// work is worth a warning, while a defaulted-on provider with nothing to query is not.
     #[serde(default)]
     pub model_listing: Option<bool>,
+    /// Model-id prefixes to omit from this provider's picker entries, regardless of whether the
+    /// entry came from static config, provider discovery, or the harness catalog.
+    #[serde(default)]
+    pub exclude_model_prefixes: Vec<String>,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
 }
@@ -523,6 +527,7 @@ cost_estimation = false
 
 [providers.openai]
 model_listing = false
+exclude_model_prefixes = ["claude-", "legacy-"]
 
   [[providers.openai.models]]
   id = "gpt-5.5"
@@ -555,6 +560,7 @@ model_listing = true
         );
         let openai = &config.providers["openai"];
         assert_eq!(openai.models.len(), 2);
+        assert_eq!(openai.exclude_model_prefixes, ["claude-", "legacy-"]);
         assert_eq!(openai.models[0].context_window, 262144);
         assert!(openai.models[0].supports_reasoning_effort);
         let litellm = &config.providers["cloudflare-litellm"];

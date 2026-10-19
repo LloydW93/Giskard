@@ -301,7 +301,7 @@ service does not silently run with an empty provider list.
 | | `env` | `{}` | `[harnesses.<name>.env]`: variables applied over Giskard's environment for the instance's processes and for discovery on its behalf. Values are never logged. |
 | | `profile` | Codex's own | **Codex only.** Passed as `-c profile=<name>`. Any other Codex key is a startup error. |
 | | `idle_shutdown_secs` | `600` | **Claude Code only.** Seconds a thread's `claude` process may sit idle (no turn, no pending approval or question, no running sub-agent or background command) before it is stopped; the thread stays open and its next message resumes the session. `0` keeps every process until its thread is archived, deleted or the server stops. Any other kind-specific key is a startup error. |
-| `[providers.<id>]` | `model_listing`, `[[providers.<id>.models]]` | — | **Optional.** Models are found without it: every provider Codex has a `base_url` for is discovered from `GET {base_url}/models` with the key Codex holds for it, and the provider Codex routes to also contributes its `model/list` catalog. A built-in Codex has no endpoint for and does not route to — `ollama` or `lmstudio` when you use neither — has nothing to contribute and is not offered; declare models for it if you want it in the picker. Declare a provider only to turn discovery off (`model_listing = false`), to add models by hand for an endpoint with no `/models` route, to override metadata, or to pin picker order — declared providers come first in the order written, the rest by id. Keyed by routing id, the same way Codex keys `[model_providers.<id>]`; the id must name a provider Codex knows (see below). |
+| `[providers.<id>]` | `model_listing`, `exclude_model_prefixes`, `[[providers.<id>.models]]` | — | **Optional.** Models are found without it: every provider Codex has a `base_url` for is discovered from `GET {base_url}/models` with the key Codex holds for it, and the provider Codex routes to also contributes its `model/list` catalog. A built-in Codex has no endpoint for and does not route to — `ollama` or `lmstudio` when you use neither — has nothing to contribute and is not offered; declare models for it if you want it in the picker. Declare a provider only to turn discovery off (`model_listing = false`), omit model families returned by a shared gateway (`exclude_model_prefixes = ["claude-"]`), add models by hand for an endpoint with no `/models` route, override metadata, or pin picker order — declared providers come first in the order written, the rest by id. Keyed by routing id, the same way Codex keys `[model_providers.<id>]`; the id must name a provider Codex knows (see below). |
 
 Harness declarations are read once at startup and validated before the server listens: a blank
 name (`[harnesses.""]`), an unknown `kind`, two `default = true` entries, a blank `command` or
@@ -344,7 +344,8 @@ actually reach.
 Because Codex already owns that file, Giskard does not ask you to restate any of it. A provider's
 display name, `base_url`, request headers, and where its key comes from are read back from Codex,
 so a
-`[providers.<id>]` table declares only whether to run discovery and which models to offer — the id
+`[providers.<id>]` table declares only whether to run discovery, which model-id prefixes to
+exclude, and which models to offer — the id
 is the table key, quoted if it is not a bare TOML key (`[providers."openrouter.ai"]`, since the
 unquoted form would read as a provider `openrouter` with a sub-table). Keys Giskard does not
 recognise are rejected rather than ignored. The id must match a provider Codex knows: a built-in

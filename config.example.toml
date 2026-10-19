@@ -185,6 +185,9 @@ max_command_output_bytes = 134217728   # 128 MiB
 # what you want for an endpoint that serves turns but has no /v1/models route.
 [providers.openai]
 model_listing = false
+# Optional: omit whole model families returned by a shared gateway. Applied to
+# declared, dynamically discovered, and harness-catalog models alike.
+# exclude_model_prefixes = ["claude-"]
   [[providers.openai.models]]
   id = "gpt-5.5"
   context_window = 262144

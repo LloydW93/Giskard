@@ -306,6 +306,17 @@ pub fn apply_harness_metadata(
         .cloned()
         .collect();
     base.append(&mut from_catalog);
+    base.retain(|descriptor| {
+        config
+            .providers
+            .get(&descriptor.provider)
+            .is_none_or(|provider| {
+                !provider
+                    .exclude_model_prefixes
+                    .iter()
+                    .any(|prefix| descriptor.model.starts_with(prefix))
+            })
+    });
     base
 }
 
@@ -2176,6 +2187,33 @@ model_listing = true
         assert!(glm.reasoning_efforts.is_empty());
     }
 
+    #[test]
+    fn provider_prefix_exclusions_apply_to_every_catalog_source() {
+        let config: Config = toml::from_str(
+            r#"
+[providers.proxy]
+exclude_model_prefixes = ["claude-"]
+  [[providers.proxy.models]]
+  id = "claude-static"
+  context_window = 200000
+"#,
+        )
+        .unwrap();
+        let base = vec![
+            ModelDescriptor::conservative("proxy", "claude-static"),
+            ModelDescriptor::conservative("proxy", "claude-discovered"),
+            ModelDescriptor::conservative("proxy", "gpt-5.6-sol"),
+        ];
+        let harness = vec![
+            ModelDescriptor::conservative("proxy", "claude-harness"),
+            ModelDescriptor::conservative("proxy", "gpt-6-astra"),
+        ];
+
+        let merged = apply_harness_metadata(base, &harness, &config, &HashSet::new());
+        let ids: Vec<&str> = merged.iter().map(|model| model.model.as_str()).collect();
+        assert_eq!(ids, ["gpt-5.6-sol", "gpt-6-astra"]);
+    }
+
     /// Declaring a provider is how a user pins it first (§8.3). That has to hold for a provider
     /// whose models come only from the harness catalog — a stock `openai` has no `base_url`, so
     /// nothing else supplies it, and appending the catalog last would park the pinned provider
@@ -2687,6 +2725,7 @@ model_listing = true
             "other".into(),
             giskard_persist::ProviderConfig {
                 model_listing: Some(false),
+                exclude_model_prefixes: Vec::new(),
                 models: vec![giskard_persist::ModelConfig {
                     id: "@cf/z-ai/glm-4.7".into(),
                     display_name: None,

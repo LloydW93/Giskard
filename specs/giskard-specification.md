@@ -3426,6 +3426,11 @@ that the ids are wrong.
   right slug at all. `model_listing = false` turns it off for one provider, which is what an
   endpoint that serves turns but has no `/models` route needs.
 
+  A shared gateway can expose model families intended for different harness protocols in one
+  catalog. `exclude_model_prefixes` removes matching ids from that provider after all catalog
+  sources are composed, so the exclusion applies equally to declared, discovered, and
+  harness-reported entries.
+
   The setting is **tri-state**, and the third state is load-bearing: unset means on, `true` means
   on *and* asked for, `false` means off. Only a provider explicitly asked for is worth a warning
   when it cannot be discovered — a harness reports providers with no `base_url` at all (Codex's
@@ -4748,6 +4753,7 @@ profile = "nightly"             # Codex-only: `-c profile=<name>`
 # restated here. Declared providers lead the picker in this order; the rest follow by id.
 [providers.openai]
 model_listing = false           # opt out — e.g. an endpoint with no /models route
+# exclude_model_prefixes = ["claude-"] # omit families routed by another harness
   # typed model entries supply what no harness reports (§8.3):
   [[providers.openai.models]]
   id = "gpt-5.5"
