@@ -3699,6 +3699,7 @@ async fn a_subagent_thread_adopts_the_model_its_turn_reports() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
+                context_window: None,
                 model: Some(parent_model.clone()),
                 mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
