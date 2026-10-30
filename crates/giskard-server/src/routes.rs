@@ -1855,15 +1855,53 @@ async fn archive_thread(
             &project_config,
             thread_id,
             &thread_file.harness,
-            thread_file.harness_thread_id,
+            thread_file.harness_thread_id.clone(),
             req.archived,
         )
         .await
         .map_err(harness_api_error)?;
+
+    // Archiving invalidates the harness-side live session. Do not retain a loaded binding that
+    // can route the next turn to a native thread the provider has already unloaded. Conversely,
+    // unarchive is not complete until the native thread has been reopened: Codex accepts
+    // `thread/unarchive` without loading that thread into the current app-server process.
+    let reopened_harness_thread_id = if req.archived {
+        state.registry.forget_thread(thread_id).await;
+        None
+    } else {
+        state.registry.forget_thread(thread_id).await;
+        let current_model = thread_file
+            .current_model
+            .as_known()
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::Internal(format!(
+                    "primary thread {thread_id} has no authoritative model"
+                ))
+            })?;
+        let workspace_root =
+            effective_workspace_root(&state.store, &project_config, &thread_file).await?;
+        let binding = state
+            .registry
+            .open_thread(
+                &project_config,
+                &thread_file.harness,
+                &workspace_root,
+                thread_id,
+                Some(thread_file.harness_thread_id.clone()),
+                current_model,
+            )
+            .await
+            .map_err(harness_api_error)?;
+        Some(binding.handle().harness_thread_id.clone())
+    };
     let tf = state
         .thread_metadata
         .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
-            tf.archived = req.archived
+            tf.archived = req.archived;
+            if let Some(harness_thread_id) = &reopened_harness_thread_id {
+                tf.harness_thread_id = harness_thread_id.clone();
+            }
         })
         .await?
         .into_current()

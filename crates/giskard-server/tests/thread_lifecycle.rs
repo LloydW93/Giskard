@@ -7,7 +7,9 @@ use giskard_core::HarnessError;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::ModelRef;
 use giskard_core::turn::{Mode, PermissionPreset};
+use giskard_core::user_input::UserInput;
 use giskard_persist::store::ThreadFile;
+use giskard_testenv::fake::{self, Call, FakeHarness};
 use giskard_testenv::{TestProject, TestServer, factory, fixtures};
 
 struct Fixture {
@@ -125,6 +127,120 @@ async fn thread_lifecycle_native_failure_preserves_local_thread() {
         .unwrap();
     assert_eq!(delete.status(), 500);
     assert!(state.store.load_thread(pid, tid).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn unarchive_reopens_the_native_thread_before_accepting_another_turn() {
+    let harness = FakeHarness::new(());
+    let server = TestServer::spawn(fake::factory(harness.clone())).await;
+    let project = server.create_project("unarchive-reopen").await;
+    let pid = project.id;
+    let tid = ThreadId::new();
+    let now = Utc::now();
+    let model = ModelRef {
+        provider: "openai".into(),
+        model: "gpt-5.5".into(),
+        reasoning_effort: None,
+    };
+    server
+        .state
+        .store
+        .save_thread(
+            pid,
+            &ThreadFile {
+                revision: 0,
+                version: 1,
+                id: tid,
+                project_id: pid,
+                title: "Archived thread".into(),
+                harness_thread_id: "native-thread".into(),
+                harness: "codex".into(),
+                parent_thread_id: None,
+                spawned_by_turn_id: None,
+                kind: giskard_core::ThreadKind::Primary,
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                current_model: giskard_core::turn::TurnModel::Known(model.clone()),
+                context_window: 262_144,
+                context_window_override: None,
+                model_context_windows: Default::default(),
+                permission_preset: PermissionPreset::AskFirst,
+                model_efforts: Default::default(),
+                tokens: Default::default(),
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                git_workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let open = server
+        .client
+        .post(server.url(&format!("/api/projects/{pid}/threads")))
+        .header("cookie", &server.cookie)
+        .json(&serde_json::json!({"thread_id": tid}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(open.status(), 200);
+
+    for archived in [true, false] {
+        let response = server
+            .client
+            .post(server.url(&format!("/api/projects/{pid}/threads/{tid}/archive")))
+            .header("cookie", &server.cookie)
+            .json(&serde_json::json!({"archived": archived}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
+
+    assert_eq!(
+        harness
+            .core
+            .count(|call| matches!(call, Call::Open { thread, .. } if *thread == tid)),
+        2,
+        "unarchive must reopen instead of retaining the archived native binding"
+    );
+    let archived_calls: Vec<bool> = harness
+        .core
+        .calls()
+        .iter()
+        .filter_map(|call| match call {
+            Call::SetThreadArchived {
+                thread, archived, ..
+            } if *thread == tid => Some(*archived),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(archived_calls, [true, false]);
+
+    let saved = server
+        .state
+        .store
+        .load_thread(pid, tid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!saved.archived);
+    server
+        .state
+        .registry
+        .start_turn(
+            tid,
+            UserInput::text("continue"),
+            giskard_core::turn::TurnOverrides {
+                context_window: None,
+                model: Some(model.clone()),
+                mode: Mode::Build,
+                permission_preset: PermissionPreset::AskFirst,
+            },
+            model,
+        )
+        .await
+        .expect("the reopened binding accepts the next turn");
 }
 
 /// A server declaring `stable` (the default) and `nightly`, both constructing replay harnesses,

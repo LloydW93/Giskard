@@ -1435,6 +1435,10 @@ authoritative replacement runtime overview.
   Codex) and only then updates the local thread metadata. Delete calls the harness first
   (`thread/delete` for Codex) and only then removes local metadata/history. Giskard rejects
   archive/delete while a turn or command is active.
+- **TD4:** A successful archive retires the loaded harness binding. Unarchive reopens the native
+  thread before clearing the local archived flag and persists a replacement native identifier if
+  resume recovery starts a fresh session. This prevents the next turn from using a provider
+  session invalidated by archive.
 
 **Changelog (1.17 → 1.18), Codex collaboration mode alignment:**
 - **CM1:** Giskard Plan/Build mode maps to Codex `collaborationMode` on `turn/start`: Plan sends
