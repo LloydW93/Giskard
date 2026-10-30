@@ -71,6 +71,11 @@ pub enum Call {
     CompactThread {
         thread: ThreadId,
     },
+    SetThreadArchived {
+        thread: ThreadId,
+        harness_thread_id: String,
+        archived: bool,
+    },
     DeleteThread {
         thread: ThreadId,
         harness_thread_id: String,
@@ -381,6 +386,17 @@ pub trait Script: Send + Sync + 'static {
         core.remove_log(thread.thread);
         Ok(())
     }
+    async fn set_thread_archived(
+        &self,
+        core: &FakeCore,
+        thread: &ThreadHandle,
+        archived: bool,
+    ) -> Result<(), HarnessError> {
+        if archived {
+            core.remove_log(thread.thread);
+        }
+        Ok(())
+    }
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
         Ok(Vec::new())
     }
@@ -574,6 +590,20 @@ impl<S: Script> AgentHarness for FakeHarness<S> {
             harness_thread_id: thread.harness_thread_id.clone(),
         });
         self.script.delete_thread(&self.core, thread).await
+    }
+    async fn set_thread_archived(
+        &self,
+        thread: &ThreadHandle,
+        archived: bool,
+    ) -> Result<(), HarnessError> {
+        self.core.record(Call::SetThreadArchived {
+            thread: thread.thread,
+            harness_thread_id: thread.harness_thread_id.clone(),
+            archived,
+        });
+        self.script
+            .set_thread_archived(&self.core, thread, archived)
+            .await
     }
     async fn shutdown(&self) -> Result<(), HarnessError> {
         self.core.record(Call::Shutdown);
