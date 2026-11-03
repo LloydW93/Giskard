@@ -2831,12 +2831,12 @@ async fn handle_delete_thread(
     .await;
     match result {
         Ok(_) => Ok(()),
-        Err(error) if codex_reports_missing_rollout(&error, &thread.harness_thread_id) => {
+        Err(error) if codex_reports_irrecoverable_rollout(&error, &thread.harness_thread_id) => {
             warn!(
                 thread_id = %thread.thread,
                 harness_thread_id = %thread.harness_thread_id,
                 action = "delete_thread",
-                "native Codex rollout is already absent; completing thread deletion idempotently"
+                "native Codex rollout is absent or empty; completing thread deletion idempotently"
             );
             Ok(())
         }
@@ -2844,7 +2844,7 @@ async fn handle_delete_thread(
     }
 }
 
-fn codex_reports_missing_rollout(error: &HarnessError, harness_thread_id: &str) -> bool {
+fn codex_reports_irrecoverable_rollout(error: &HarnessError, harness_thread_id: &str) -> bool {
     // This is intentionally coupled to the pinned Codex/codex-codes protocol chain: Codex emits
     // `InvalidRequest("no rollout found for thread id …")`, app-server preserves it as JSON-RPC
     // -32600, and codex-codes formats that response with this prefix. Keep the match fail-closed if
@@ -2853,9 +2853,23 @@ fn codex_reports_missing_rollout(error: &HarnessError, harness_thread_id: &str) 
     let HarnessError::Transport(message) = error else {
         return false;
     };
-    message
+    let missing = message
         .strip_prefix(PREFIX)
-        .is_some_and(|missing_id| missing_id == harness_thread_id)
+        .is_some_and(|missing_id| missing_id == harness_thread_id);
+    if missing {
+        return true;
+    }
+
+    // Codex can leave a zero-byte rollout behind when thread creation is interrupted before the
+    // session metadata record is written. `thread/delete` cannot parse that file and reports an
+    // internal thread-store error, but there is no native thread state left to preserve. Match the
+    // pinned error shape and requested native id so unrelated corruption remains fail-closed.
+    const EMPTY_PREFIX: &str = "JSON-RPC error (-32603): failed to delete thread: thread-store \
+internal error: failed to read session metadata ";
+    message.starts_with(EMPTY_PREFIX)
+        && message.contains("/rollout-")
+        && message.contains(harness_thread_id)
+        && message.ends_with(".jsonl is empty")
 }
 
 async fn handle_interrupt_turn(
@@ -5135,6 +5149,55 @@ mod tests {
             request.method == codex_codes::protocol::methods::THREAD_DELETE
                 && request.params["threadId"] == thread.harness_thread_id
         }));
+    }
+
+    #[tokio::test]
+    async fn codex_delete_is_idempotent_when_matching_rollout_is_empty() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        controller
+            .fail_thread_delete(&format!(
+                "JSON-RPC error (-32603): failed to delete thread: thread-store internal error: \
+failed to read session metadata /home/user/.codex/sessions/2026/10/30/\
+rollout-2026-10-30T12-56-10-{}.jsonl: rollout at /home/user/.codex/sessions/2026/10/30/\
+rollout-2026-10-30T12-56-10-{}.jsonl is empty",
+                thread.harness_thread_id, thread.harness_thread_id
+            ))
+            .await;
+
+        timeout(Duration::from_secs(1), harness.delete_thread(&thread))
+            .await
+            .expect("delete_thread should complete")
+            .expect("a matching empty rollout should be idempotent success");
+    }
+
+    #[tokio::test]
+    async fn codex_delete_preserves_nonmatching_empty_rollout_failure() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        controller
+            .fail_thread_delete(
+                "JSON-RPC error (-32603): failed to delete thread: thread-store internal error: \
+failed to read session metadata /home/user/.codex/sessions/2026/10/30/\
+rollout-2026-10-30T12-56-10-different-thread.jsonl: rollout at \
+/home/user/.codex/sessions/2026/10/30/\
+rollout-2026-10-30T12-56-10-different-thread.jsonl is empty",
+            )
+            .await;
+
+        let error = timeout(Duration::from_secs(1), harness.delete_thread(&thread))
+            .await
+            .expect("delete_thread should complete")
+            .expect_err("a nonmatching empty-rollout error must remain fatal");
+        assert!(
+            matches!(error, HarnessError::Transport(message) if message.contains("different-thread"))
+        );
     }
 
     #[tokio::test]
