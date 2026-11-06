@@ -478,6 +478,10 @@ impl AgentHarness for ScriptedHarness {
         self.capabilities
     }
 
+    fn context_window_configuration_supported(&self) -> bool {
+        true
+    }
+
     fn goals_queue_supported(&self) -> bool {
         true
     }
@@ -604,7 +608,7 @@ impl AgentHarness for ScriptedHarness {
         &self,
         thread: &ThreadHandle,
         input: UserInput,
-        _overrides: TurnOverrides,
+        overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
         let turn = TurnId::new();
         let thread_id = thread.thread;
@@ -613,6 +617,7 @@ impl AgentHarness for ScriptedHarness {
         };
 
         let input_text = input.as_text();
+        let input_echo = input_text.map(str::to_owned);
         let subagent_native_thread_id = match input_text {
             Some(SCRIPTED_SUBAGENT_TRIGGER | SCRIPTED_BACKGROUND_SUBAGENT_TRIGGER) => {
                 Some(format!(
@@ -986,7 +991,51 @@ impl AgentHarness for ScriptedHarness {
                 thread: thread_id,
                 turn,
             });
+            let _ = sender.append(AgentEvent::TurnUsageUpdated {
+                thread: thread_id,
+                turn,
+                usage: TokenUsage::new(0, 0),
+                context_window: Some(overrides.context_window.unwrap_or(131_072)),
+                model: Some(
+                    overrides
+                        .model
+                        .unwrap_or_else(|| giskard_core::model::ModelRef {
+                            provider: "replay".into(),
+                            model: "replay-model".into(),
+                            reasoning_effort: None,
+                        }),
+                ),
+            });
             tokio::task::yield_now().await;
+            // Codex emits the initiating userMessage item even for a native queued turn that
+            // Giskard did not start. Replaying that echo is what gives an externally started
+            // queued prompt its real text instead of the primary-thread fallback's empty label.
+            if let Some(text) = input_echo {
+                let user_item_id = ItemId::new();
+                let harness_item_id = format!("scripted_user_{turn}");
+                let _ = sender.append(AgentEvent::ItemStarted {
+                    thread: thread_id,
+                    turn,
+                    item: ItemStart {
+                        id: user_item_id,
+                        harness_item_id: harness_item_id.clone(),
+                        kind: ItemKind::UserMessage,
+                        command: None,
+                        tool: None,
+                    },
+                });
+                let _ = sender.append(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item: Item {
+                        id: user_item_id,
+                        harness_item_id,
+                        payload: ItemPayload::UserMessage { text },
+                        created_at: chrono::Utc::now(),
+                    },
+                });
+                tokio::task::yield_now().await;
+            }
             if stream_reasoning {
                 // Stream the note the way a real harness does — start, text deltas, completion — so
                 // the browser exercises both the live "thinking" row and its persisted form.

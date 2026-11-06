@@ -119,6 +119,7 @@ pub async fn persist_subagent_thread(
                 mode: TurnMode::Known(Mode::Build),
                 current_model: TurnModel::Known(fake_native_model()),
                 context_window: 0,
+                context_window_override: None,
                 model_context_windows: HashMap::new(),
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: HashMap::new(),

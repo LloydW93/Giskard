@@ -10,8 +10,8 @@ use giskard_core::turn::{Mode, PermissionPreset};
 use giskard_core::user_input::UserInput;
 use giskard_persist::store::ThreadFile;
 use giskard_proto::ThreadDeletionState;
-use giskard_testenv::server::wait_for_thread_deletion;
 use giskard_testenv::fake::{self, Call, FakeHarness};
+use giskard_testenv::server::wait_for_thread_deletion;
 use giskard_testenv::{TestProject, TestServer, factory, fixtures};
 
 struct Fixture {

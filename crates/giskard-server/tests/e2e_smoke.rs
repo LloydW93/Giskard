@@ -8550,6 +8550,8 @@ async fn thread_delete_batches_catalog_invalidations_across_the_cascade() {
             .unwrap()
             .is_empty()
     );
+}
+
 #[tokio::test]
 async fn goals_queue_http_rejects_invalid_input_and_managed_mutation() {
     let server = start_server_with_extra_config_on_available_port("").await;
